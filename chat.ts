@@ -1025,14 +1025,14 @@ class Composer {
     const visible = rows.slice(start, start + maxVisible)
     const input: string[] = visible.map((row, index) => {
       const absolute = start + index
-      const prefix = absolute === 0 ? `${bold('>')} ` : '  '
+      const prefix = absolute === 0 ? `${paint('7', '>')} ` : '  '
       return `${prefix}${row.text}`
     })
-    if (this.value.length === 0) input[0] = `${bold('>')} ${dim('Ask z1…')}`
+    if (this.value.length === 0) input[0] = `${paint('7', '>')} ${dim('Ask z1…')}`
     // A brighter rule marks the composer as the active input field; the rest
     // of the UI stays dim. No cursor-shape tricks are needed.
     const rule = (left: string, right: string): string =>
-      paint('38;5;245', `${left}${'─'.repeat(Math.max(0, width - 2))}${right}`)
+      paint('38;5;75', `${left}${'─'.repeat(Math.max(0, width - 2))}${right}`)
     const header = rule('┌', '┐')
     const footerRule = rule('└', '┘')
     const hint = this.hint(menu.open)
