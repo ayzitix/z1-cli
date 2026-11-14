@@ -124,6 +124,8 @@ const cyan = (text: string): string => paint('36', text)
 const green = (text: string): string => paint('32', text)
 const red = (text: string): string => paint('31', text)
 const yellow = (text: string): string => paint('33', text)
+const italic = (text: string): string => paint('3', text)
+const underline = (text: string): string => paint('4', text)
 
 /** Printable width, ignoring the SGR sequences the accents add. */
 const visibleLength = (text: string): number => text.replace(/\x1b\[[0-9;]*m/g, '').length
@@ -1805,6 +1807,231 @@ interface Progress {
   closeLine(): void
 }
 
+
+/**
+ * Line-oriented Markdown for assistant text. Claude Code uses `marked` and a
+ * token renderer; this is the terminal-sized subset that matters here: headings,
+ * inline accents, lists, quotes, rules, fenced code and tables.
+ *
+ * It commits complete rows through `emit`, so streaming still works and the
+ * tail/pinned renderer sees ordinary ANSI lines.
+ */
+interface MarkdownPrinter {
+  push(text: string): void
+  flush(): void
+}
+
+const createMarkdownPrinter = (emit: (line: string) => void): MarkdownPrinter => {
+  let buffer = ''
+  let inFence = false
+  let fenceLang = ''
+  let table: string[] = []
+  let listIndent: number | undefined
+  let lastBlank = false
+
+  const blank = (): void => {
+    if (lastBlank) return
+    emit('')
+    lastBlank = true
+  }
+
+  const write = (line: string): void => {
+    emit(line)
+    lastBlank = line === ''
+  }
+
+  const INLINE = /(`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|~~[^~\n]+~~|\[[^\]\n]+\]\([^)\n]+\)|\*[^*\n]+\*|_[^_\n]+_)/g
+  const inline = (text: string): string =>
+    text.replace(INLINE, (token) => {
+      if (token.startsWith('`')) return cyan(token.slice(1, -1))
+      if (token.startsWith('**') || token.startsWith('__')) return bold(token.slice(2, -2))
+      if (token.startsWith('~~')) return paint('9', token.slice(2, -2))
+      if (token.startsWith('[')) {
+        const match = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(token)
+        if (match !== null) return `${bold(match[1]!)} ${dim(`(${match[2]!})`)}`
+      }
+      return italic(token.slice(1, -1))
+    })
+
+  const cellText = (text: string): string => inline(text.trim())
+
+  const pad = (text: string, width: number, align: 'left' | 'right' | 'center'): string => {
+    const size = displayCells(text)
+    const gap = width - size
+    if (gap <= 0) return text
+    if (align === 'right') return `${' '.repeat(gap)}${text}`
+    if (align === 'center') {
+      const left = Math.floor(gap / 2)
+      return `${' '.repeat(left)}${text}${' '.repeat(gap - left)}`
+    }
+    return `${text}${' '.repeat(gap)}`
+  }
+
+  const tableRows = (raw: readonly string[]): string[][] => {
+    const rows = raw.map((line) =>
+      line
+        .trim()
+        .replace(/^\|/, '')
+        .replace(/\|$/, '')
+        .split('|')
+        .map((cell) => cell.trim()),
+    )
+    return rows
+  }
+
+  const flushTable = (): void => {
+    if (table.length === 0) return
+    const raw = table
+    table = []
+    const rows = tableRows(raw)
+    const separator = rows.findIndex((cells, index) => index > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell)))
+    if (separator < 1) {
+      for (const line of raw) write(cellText(line))
+      return
+    }
+    const header = rows[0]!
+    const body = rows.slice(separator + 1)
+    const columns = Math.max(header.length, ...body.map((row) => row.length))
+    if (columns === 0) return
+    const cells = [header, ...body].map((row) => Array.from({ length: columns }, (_, index) => row[index] ?? ''))
+    const widths = Array.from({ length: columns }, (_, index) =>
+      Math.max(3, ...cells.map((row) => displayCells(cellText(row[index]!)))),
+    )
+    const total = widths.reduce((sum, width) => sum + width + 3, 0) + 1
+    if (total > terminalColumns() - 2) {
+      // Claude Code falls back to a vertical key/value list when the table
+      // cannot fit; it stays readable on a narrow terminal.
+      blank()
+      body.forEach((row, rowIndex) => {
+        for (let index = 0; index < columns; index += 1) {
+          const label = header[index] || `col ${String(index + 1)}`
+          write(`${bold(label)}: ${cellText(row[index] ?? '')}`)
+        }
+        if (rowIndex < body.length - 1) write(dim('─'.repeat(Math.min(40, terminalColumns()))))
+      })
+      blank()
+      return
+    }
+    const rule = (left: string, middle: string, right: string): string =>
+      dim(`${left}${widths.map((width) => '─'.repeat(width + 2)).join(middle)}${right}`)
+    const rowLine = (row: readonly string[], aligns: readonly ('left' | 'right' | 'center')[]): string =>
+      `${dim('│')} ${row.map((cell, index) => pad(cellText(cell), widths[index]!, aligns[index] ?? 'left')).join(` ${dim('│')} `)} ${dim('│')}`
+    const numeric = Array.from({ length: columns }, (_, index) =>
+      body.length > 0 && body.every((row) => /^-?[\d.,%]+$/.test((row[index] ?? '').trim())),
+    )
+    blank()
+    write(rule('┌', '┬', '┐'))
+    write(rowLine(header, Array.from({ length: columns }, () => 'center' as const)))
+    write(rule('├', '┼', '┤'))
+    const shown = body.slice(0, 200)
+    for (const row of shown) {
+      write(rowLine(row, numeric.map((value) => (value ? 'right' : 'left')) as ('left' | 'right')[]))
+    }
+    write(rule('└', '┴', '┘'))
+    if (body.length > shown.length) write(dim(`… ${String(body.length - shown.length)} more rows`))
+    blank()
+  }
+
+  const handle = (raw: string): void => {
+    const line = raw.replace(/\r$/, '')
+    const fence = /^\s*```\s*([^\s]*)\s*$/.exec(line)
+    if (fence !== null) {
+      if (!inFence) {
+        if (table.length > 0) flushTable()
+        inFence = true
+        fenceLang = fence[1] ?? ''
+        blank()
+        write(dim(`┌ ${fenceLang.length > 0 ? fenceLang : 'code'}`))
+      } else {
+        write(dim('└'))
+        inFence = false
+        fenceLang = ''
+        blank()
+      }
+      return
+    }
+    if (inFence) {
+      write(`${dim('▏')} ${line.length > 0 ? cyan(line) : ''}`)
+      return
+    }
+    if (line.trim().startsWith('|')) {
+      table.push(line)
+      return
+    }
+    if (table.length > 0) flushTable()
+
+    if (line.trim() === '') {
+      listIndent = undefined
+      blank()
+      return
+    }
+    const heading = /^(#{1,6})\s+(.*?)\s*#*\s*$/.exec(line)
+    if (heading !== null) {
+      const depth = heading[1]!.length
+      const text = inline(heading[2]!)
+      blank()
+      write(depth === 1 ? bold(underline(text)) : depth === 2 ? bold(text) : bold(cyan(text)))
+      blank()
+      listIndent = undefined
+      return
+    }
+    if (/^\s*((\*\s*){3,}|(-\s*){3,}|(_\s*){3,})$/.test(line)) {
+      blank()
+      write(dim('─'.repeat(Math.min(40, terminalColumns()))))
+      blank()
+      listIndent = undefined
+      return
+    }
+    if (/^\s*>/.test(line)) {
+      const text = line.replace(/^\s*(>\s*)+/, '')
+      write(`${dim('▏')} ${paint('2;3', inline(text))}`)
+      listIndent = undefined
+      return
+    }
+    const list = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/.exec(line)
+    if (list !== null) {
+      const indent = Math.min(6, Math.floor(list[1]!.length / 2))
+      const marker = /^[-*+]$/.test(list[2]!) ? '•' : list[2]!
+      write(`${'  '.repeat(indent)}${dim(marker)} ${inline(list[3]!)}`)
+      listIndent = indent
+      return
+    }
+    if (listIndent !== undefined && /^\s+/.test(line)) {
+      write(`${'  '.repeat(listIndent + 1)}${inline(line.trim())}`)
+      return
+    }
+    listIndent = undefined
+    write(inline(line))
+  }
+
+  return {
+    push(text: string): void {
+      if (text.length === 0) return
+      buffer += text
+      for (;;) {
+        const cut = buffer.indexOf('\n')
+        if (cut < 0) break
+        const line = buffer.slice(0, cut)
+        buffer = buffer.slice(cut + 1)
+        handle(line)
+      }
+    },
+    flush(): void {
+      if (inFence) {
+        write(dim('└'))
+        inFence = false
+        fenceLang = ''
+      }
+      if (table.length > 0) flushTable()
+      if (buffer.length > 0) {
+        handle(buffer)
+        buffer = ''
+      }
+      listIndent = undefined
+    },
+  }
+}
+
 const createProgress = (tail: Tail): Progress => {
   const startedAt = Date.now()
   const calls = new Map<string, { name: string; args: string }>()
@@ -1837,21 +2064,33 @@ const createProgress = (tail: Tail): Progress => {
     spinner.unref?.()
   }
 
+  let markdown: MarkdownPrinter | undefined
+
+  const emit = (line: string): void => {
+    if (!assistantStarted && stripAnsi(line).trim() === '') return
+    if (spinner !== undefined) stopSpinner()
+    if (!assistantStarted) {
+      assistantStarted = true
+      tail.print(`${bold('⬢')} ${line}`)
+    } else {
+      tail.print(line)
+    }
+  }
+  markdown = createMarkdownPrinter(emit)
+
   const print = (line: string): void => {
+    markdown?.flush()
     stopSpinner()
     tail.print(line)
   }
 
   const stream = (text: string): void => {
-    if (spinner !== undefined) stopSpinner()
-    if (!assistantStarted) {
-      assistantStarted = true
-      tail.stream(`${bold('⬢')} `)
-    }
-    tail.stream(text)
+    if (text.length === 0) return
+    markdown?.push(text)
   }
 
   const closeLine = (): void => {
+    markdown?.flush()
     stopSpinner()
     tail.breakLine()
   }
@@ -1863,6 +2102,7 @@ const createProgress = (tail: Tail): Progress => {
         // A new model turn starts a new `⬢` block. The turn number itself is
         // not shown: the tool lines already mark progress.
         if (!/^loop\/\d+\/chat$/.test(incoming.path)) return
+        markdown?.flush()
         assistantStarted = false
         // The previous block may have ended without a newline.
         tail.breakLine()
