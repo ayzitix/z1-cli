@@ -1,7 +1,7 @@
 # z1-cli
 
 A local terminal UI for the **z1 graph agent**. It is a thin console around
-[`z1-sdk`](../z1-sdk): the SDK provides the agent graph, runtime, tools and
+[`z1-sdk`](https://github.com/ayzitix/z1-sdk): the SDK provides the agent graph, runtime, tools and
 storage; this repository provides the interactive terminal experience — a pinned
 composer, streamed markdown, slash commands, approvals and a pipeable one-shot
 mode.
@@ -24,6 +24,16 @@ this repository. By default it lives in `~/.local/share/z1/`.
 
 Working and used daily, but the UI is still under active iteration. See
 [What works](#what-works) and [Still raw](#still-raw) for the honest split.
+
+## Clone
+
+```bash
+git clone https://github.com/ayzitix/z1-sdk ~/Projects/z1-sdk
+git clone https://github.com/ayzitix/z1-cli ~/Projects/z1-cli
+```
+
+The CLI imports the SDK by absolute path; keep the SDK at
+`~/Projects/z1-sdk` (the default) or edit the imports.
 
 ## Requirements
 
