@@ -2604,7 +2604,11 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       const parts = line.split('\n')
       if (composer !== undefined || rl?.terminal !== true) {
         parts.forEach((part, index) => {
-          say(`${index === 0 ? `${dim('│')} ` : '  '}${part}`)
+          const line = `${index === 0 ? '│ ' : '  '}${part}`
+          // A full-width, one-cell-short bar stays a single row and makes the
+          // user's turn easy to spot between assistant blocks.
+          const bar = colorEnabled ? padTo(line, Math.max(1, terminalColumns() - 1)) : line
+          say(paint('48;5;237', bar))
         })
       }
 
