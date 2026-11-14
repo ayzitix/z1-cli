@@ -171,100 +171,6 @@ const fit = (text: string, width: number): string =>
 const padTo = (text: string, width: number): string =>
   `${text}${' '.repeat(Math.max(0, width - visibleLength(text)))}`
 
-/** 17×17 source mark from ~/Downloads/logo.mjs. */
-const LOGO_SOURCE = [
-  '........WW.......',
-  '......WWWWWW.....',
-  '...WWWWWWWWWWWW..',
-  '..SWWWWWWWWEEWW..',
-  '..SWWWEEWWEEEEW..',
-  '..WWWEEEEWEEEEWW.',
-  '.SWWWEEEEWEEEEWW.',
-  '.WWWWEEEEWWEEWWWW',
-  'SWWWWWEEWWWWWWWWW',
-  'SSWWWWWWWWWWWWWW.',
-  '.SWWWWWWWWWWWWWW.',
-  '.SSWWWWWWWWWWWW..',
-  '..SWWWWWWWWWWWW..',
-  '..SWWWWWWWWWWWW..',
-  '..SSSSWWWWWWSS...',
-  '.....SSSWWS......',
-  '.......SS........',
-] as const
-const LOGO_RGB: Record<string, readonly [number, number, number]> = {
-  W: [255, 255, 255],
-  E: [43, 43, 43],
-  S: [74, 74, 74],
-}
-
-/** Halve the 17×17 grid to 9×9; the half-block renderer then draws 9×5. */
-const LOGO_GRID: readonly string[] = (() => {
-  const size = Math.ceil(LOGO_SOURCE.length / 2)
-  const out: string[] = []
-  for (let y = 0; y < size; y += 1) {
-    let row = ''
-    for (let x = 0; x < size; x += 1) {
-      const cells: string[] = []
-      for (let dy = 0; dy < 2; dy += 1) {
-        for (let dx = 0; dx < 2; dx += 1) {
-          cells.push(LOGO_SOURCE[y * 2 + dy]?.[x * 2 + dx] ?? '.')
-        }
-      }
-      const count = (key: string): number => cells.filter((cell) => cell === key).length
-      // Keep the eyes; body wins otherwise; shadow only on empty samples.
-      row += count('E') >= 2 ? 'E' : count('W') > 0 ? 'W' : count('S') > 0 ? 'S' : '.'
-    }
-    out.push(row)
-  }
-  return out
-})()
-const LOGO_256: Record<string, number> = { W: 231, E: 235, S: 239 }
-
-/** Render the 17×17 grid as 9 rows; plain text when colour is off. */
-const logoLines = (): string[] => {
-  const trueColor =
-    /truecolor|24bit/i.test(process.env['COLORTERM'] ?? '') || Boolean(process.env['WT_SESSION'])
-  const fg = (key: string): string => {
-    if (!colorEnabled) return ''
-    const rgb = LOGO_RGB[key] ?? LOGO_RGB['W']!
-    return trueColor
-      ? `\x1b[38;2;${String(rgb[0])};${String(rgb[1])};${String(rgb[2])}m`
-      : `\x1b[38;5;${String(LOGO_256[key] ?? 231)}m`
-  }
-  const bg = (key: string): string => {
-    if (!colorEnabled) return ''
-    const rgb = LOGO_RGB[key] ?? LOGO_RGB['W']!
-    return trueColor
-      ? `\x1b[48;2;${String(rgb[0])};${String(rgb[1])};${String(rgb[2])}m`
-      : `\x1b[48;5;${String(LOGO_256[key] ?? 231)}m`
-  }
-  const rows =
-    LOGO_GRID.length % 2 === 0 ? LOGO_GRID : [...LOGO_GRID, '.'.repeat(LOGO_GRID[0]!.length)]
-  const lines: string[] = []
-  for (let y = 0; y < rows.length; y += 2) {
-    let line = ''
-    let style = ''
-    const put = (next: string, char: string): void => {
-      if (next !== style) {
-        if (colorEnabled) line += `\x1b[0m${next}`
-        style = next
-      }
-      line += char
-    }
-    for (let x = 0; x < LOGO_GRID[0]!.length; x += 1) {
-      const top = rows[y]![x] ?? '.'
-      const bottom = rows[y + 1]![x] ?? '.'
-      if (top === '.' && bottom === '.') put('', ' ')
-      else if (bottom === '.') put(fg(top), '▀')
-      else if (top === '.') put(fg(bottom), '▄')
-      else if (top === bottom) put(fg(top), '█')
-      else put(fg(top) + bg(bottom), '▀')
-    }
-    lines.push(colorEnabled && style.length > 0 ? `${line}\x1b[0m` : line)
-  }
-  return lines
-}
-
 /** Rounded box, the way a terminal agent introduces itself. */
 const box = (lines: readonly string[], width: number): string => {
   const inner = Math.max(4, width)
@@ -1119,12 +1025,14 @@ class Composer {
     const visible = rows.slice(start, start + maxVisible)
     const input: string[] = visible.map((row, index) => {
       const absolute = start + index
-      const prefix = absolute === 0 ? `${dim('>')} ` : '  '
+      const prefix = absolute === 0 ? `${bold('>')} ` : '  '
       return `${prefix}${row.text}`
     })
-    if (this.value.length === 0) input[0] = `${dim('>')} ${dim('Ask z1…')}`
+    if (this.value.length === 0) input[0] = `${bold('>')} ${dim('Ask z1…')}`
+    // A brighter rule marks the composer as the active input field; the rest
+    // of the UI stays dim. No cursor-shape tricks are needed.
     const rule = (left: string, right: string): string =>
-      dim(`${left}${'─'.repeat(Math.max(0, width - 2))}${right}`)
+      paint('38;5;245', `${left}${'─'.repeat(Math.max(0, width - 2))}${right}`)
     const header = rule('┌', '┐')
     const footerRule = rule('└', '┘')
     const hint = this.hint(menu.open)
@@ -2556,32 +2464,17 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   // The model, directory and limits live in the composer footer, so the welcome
   // box only has to greet and point at the commands.
   // The welcome box spans the terminal; its width follows the terminal so a
-  // resize can reprint it at the new size. On wide terminals the pixel mark
-  // sits on the left and the text on the right; below 60 columns the mark is
-  // dropped so the text stays readable.
-  const buildBanner = (): string => {
-    const columns = Math.max(20, terminalColumns())
-    const inner = Math.max(4, columns - 4)
-    const logo = stdout.isTTY && columns >= 50 ? logoLines() : []
-    const logoWidth = logo.length > 0 ? Math.max(...logo.map((line) => displayCells(line))) : 0
-    const gap = logoWidth > 0 ? 2 : 0
-    const textWidth = Math.max(8, inner - logoWidth - gap)
-    const text = [
-      `${bold('✻')} z1`,
-      dim(`${shortPath(config.cwd)}${branch === undefined ? '' : ` · ${branch}`}`),
-      '',
-      `${dim('/help')} for commands · ${dim('/exit')} to quit`,
-    ].map((line) => fit(line, textWidth))
-    const height = Math.max(logo.length, text.length)
-    const textOffset = logo.length > 0 ? Math.max(0, Math.floor((logo.length - text.length) / 2)) : 0
-    const body: string[] = []
-    for (let index = 0; index < height; index += 1) {
-      const left = padTo(logo[index] ?? '', logoWidth)
-      const right = text[index - textOffset] ?? ''
-      body.push(`${left}${gap > 0 ? ' '.repeat(gap) : ''}${right}`)
-    }
-    return box(body, inner)
-  }
+  // resize can reprint it at the new size.
+  const buildBanner = (): string =>
+    box(
+      [
+        `${bold('✻')} z1`,
+        dim(`${shortPath(config.cwd)}${branch === undefined ? '' : ` · ${branch}`}`),
+        '',
+        `${dim('/help')} for commands · ${dim('/exit')} to quit`,
+      ],
+      Math.max(4, terminalColumns() - 4),
+    )
   // The shell line that launched z1 is exactly one row above the cursor.
   // Erase that line only; in pinned mode the banner lives on the alternate
   // screen, so the normal buffer stays clean for the shell after exit.
