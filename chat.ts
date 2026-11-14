@@ -1017,7 +1017,7 @@ class Composer {
     // It is accented only while the field is active (idle, asking, or a draft
     // is being edited); during a run with an empty draft it stays dim.
     const active = this.asking !== undefined || !this.busy || this.value.length > 0
-    const edge = (text: string): string => (active ? text : dim(text))
+    const edge = (text: string): string => (active ? paint('0', text) : dim(text))
     const textWidth = Math.max(1, width - 4)
     const rows = layoutRows(this.value, textWidth)
     const position = cursorPosition(rows, this.cursor)
