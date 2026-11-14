@@ -1809,7 +1809,7 @@ const createProgress = (tail: Tail): Progress => {
   let runError: string | undefined
   let assistantStarted = false
   let spinner: NodeJS.Timeout | undefined
-  const frames = ['✻', '✳', '✶', '✢']
+  const frames = ['⬡', '⬢', '⬡', '⬢']
   let frame = 0
 
   const stopSpinner = (): void => {
@@ -1823,13 +1823,13 @@ const createProgress = (tail: Tail): Progress => {
     stopSpinner()
     if (!tail.live) {
       // No cursor tricks without the tail: the label is just a line.
-      tail.print(`${dim('✻')} ${label}`)
+      tail.print(`${paint('0', '⬡')} ${label}`)
       return
     }
-    tail.activity(`${dim(frames[0] ?? '✻')} ${dim(label)}`)
+    tail.activity(`${paint('0', frames[0] ?? '⬡')} ${dim(label)}`)
     spinner = setInterval(() => {
       frame = (frame + 1) % frames.length
-      tail.activity(`${dim(frames[frame] ?? '✻')} ${dim(label)}`)
+      tail.activity(`${paint('0', frames[frame] ?? '⬡')} ${dim(label)}`)
     }, 90)
     spinner.unref?.()
   }
@@ -1918,14 +1918,14 @@ const createProgress = (tail: Tail): Progress => {
   const settle = (status: string, error: string | undefined): void => {
     const elapsed = elapsedLabel(Date.now() - startedAt)
     if (status === 'completed') {
-      print(dim(`✻ done · ${elapsed}`))
+      print(green(`⬡ done · ${elapsed}`))
       return
     }
     if (status === 'cancelled') {
-      print(dim(`✻ cancelled · ${elapsed}`))
+      print(dim(`⬡ cancelled · ${elapsed}`))
       return
     }
-    print(red(`✻ failed · ${elapsed}`))
+    print(red(`⬡ failed · ${elapsed}`))
     const message = error ?? runError
     if (message !== undefined && message.length > 0) {
       if (!shown.has(message)) print(`  ${dim('⎿')}  ${red(message)}`)
@@ -2369,7 +2369,7 @@ const oneShot = async (prompt: string, explicitModel: string | undefined): Promi
     if (outcome.context !== undefined) {
       progress.print(
         dim(
-          `✻ ctx ${formatTokens(outcome.context.tokens)}/${formatTokens(outcome.context.window)} · ${String(Math.round(outcome.context.ratio * 100))}%`,
+          `⬡ ctx ${formatTokens(outcome.context.tokens)}/${formatTokens(outcome.context.window)} · ${String(Math.round(outcome.context.ratio * 100))}%`,
         ),
       )
     }
@@ -2468,7 +2468,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   const buildBanner = (): string =>
     box(
       [
-        `${bold('✻')} z1`,
+        `${bold('⬡')} z1`,
         dim(`${shortPath(config.cwd)}${branch === undefined ? '' : ` · ${branch}`}`),
         '',
         `${dim('/help')} for commands · ${dim('/exit')} to quit`,
@@ -2711,11 +2711,11 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
           // The footer shows the percentage on every prompt; only a compaction
           // is worth its own line.
           if (outcome.context.compactedTurns > 0) {
-            progress.print(dim(`✻ compacted ${outcome.context.compactedTurns} turns`))
+            progress.print(dim(`⬡ compacted ${outcome.context.compactedTurns} turns`))
           } else if (!colorEnabled) {
             progress.print(
               dim(
-                `✻ ctx ${formatTokens(outcome.context.tokens)}/${formatTokens(outcome.context.window)} · ${String(Math.round(outcome.context.ratio * 100))}%`,
+                `⬡ ctx ${formatTokens(outcome.context.tokens)}/${formatTokens(outcome.context.window)} · ${String(Math.round(outcome.context.ratio * 100))}%`,
               ),
             )
           }
