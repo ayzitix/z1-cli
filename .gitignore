@@ -1,4 +1,15 @@
+# runtime data
 runs.db*
 modules/
 proposals/
 *.log
+
+# secrets and local config
+.env
+.env.*
+!.env.example
+
+# dependencies and build output
+node_modules/
+dist/
+*.tsbuildinfo
