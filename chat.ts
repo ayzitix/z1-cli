@@ -1016,10 +1016,9 @@ class Composer {
     // The composer is a full sharp box: top/bottom rules and vertical sides.
     // It is accented only while the field is active (idle, asking, or a draft
     // is being edited); during a run with an empty draft it stays dim.
-    const active = this.asking !== undefined || !this.busy || this.value.length > 0
-    // The box stays as light as the banner; only the left wall turns white
-    // while the field is active, so the composer is not visually "bolder".
-    const leftEdge = active ? paint('0', '│') : dim('│')
+    // The composer is a plain, uniformly dim box; no prompt chevron and no
+    // brighter edge that would read as a bold outline.
+    const leftEdge = dim('│')
     const rightEdge = dim('│')
     const textWidth = Math.max(1, width - 4)
     const rows = layoutRows(this.value, textWidth)
@@ -1032,7 +1031,9 @@ class Composer {
     }
     const visible = rows.slice(start, start + maxVisible)
     const input: string[] = visible.map((row) => `${leftEdge} ${padTo(row.text, textWidth)} ${rightEdge}`)
-    if (this.value.length === 0) input[0] = `${leftEdge} ${padTo(dim('Ask z1…'), textWidth)} ${rightEdge}`
+    if (this.value.length === 0) {
+      input[0] = `${leftEdge} ${padTo(dim('Ask z1…'), textWidth)} ${rightEdge}`
+    }
     const rule = (left: string, right: string): string =>
       dim(`${left}${'─'.repeat(Math.max(0, width - 2))}${right}`)
     const header = rule('┌', '┐')
@@ -1832,7 +1833,7 @@ const createProgress = (tail: Tail): Progress => {
     spinner = setInterval(() => {
       frame = (frame + 1) % frames.length
       tail.activity(`${paint('0', frames[frame] ?? '⬡')} ${dim(label)}`)
-    }, 90)
+    }, 220)
     spinner.unref?.()
   }
 
