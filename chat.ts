@@ -171,8 +171,8 @@ const fit = (text: string, width: number): string =>
 const padTo = (text: string, width: number): string =>
   `${text}${' '.repeat(Math.max(0, width - visibleLength(text)))}`
 
-/** 17×9 pixel mark from ~/Downloads/logo.mjs, drawn with half blocks. */
-const LOGO_GRID = [
+/** 17×17 source mark from ~/Downloads/logo.mjs. */
+const LOGO_SOURCE = [
   '........WW.......',
   '......WWWWWW.....',
   '...WWWWWWWWWWWW..',
@@ -196,6 +196,28 @@ const LOGO_RGB: Record<string, readonly [number, number, number]> = {
   E: [43, 43, 43],
   S: [74, 74, 74],
 }
+
+/** Halve the 17×17 grid to 9×9; the half-block renderer then draws 9×5. */
+const LOGO_GRID: readonly string[] = (() => {
+  const size = Math.ceil(LOGO_SOURCE.length / 2)
+  const out: string[] = []
+  for (let y = 0; y < size; y += 1) {
+    let row = ''
+    for (let x = 0; x < size; x += 1) {
+      const cells: string[] = []
+      for (let dy = 0; dy < 2; dy += 1) {
+        for (let dx = 0; dx < 2; dx += 1) {
+          cells.push(LOGO_SOURCE[y * 2 + dy]?.[x * 2 + dx] ?? '.')
+        }
+      }
+      const count = (key: string): number => cells.filter((cell) => cell === key).length
+      // Keep the eyes; body wins otherwise; shadow only on empty samples.
+      row += count('E') >= 2 ? 'E' : count('W') > 0 ? 'W' : count('S') > 0 ? 'S' : '.'
+    }
+    out.push(row)
+  }
+  return out
+})()
 const LOGO_256: Record<string, number> = { W: 231, E: 235, S: 239 }
 
 /** Render the 17×17 grid as 9 rows; plain text when colour is off. */
@@ -2540,7 +2562,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   const buildBanner = (): string => {
     const columns = Math.max(20, terminalColumns())
     const inner = Math.max(4, columns - 4)
-    const logo = stdout.isTTY && columns >= 60 ? logoLines() : []
+    const logo = stdout.isTTY && columns >= 50 ? logoLines() : []
     const logoWidth = logo.length > 0 ? Math.max(...logo.map((line) => displayCells(line))) : 0
     const gap = logoWidth > 0 ? 2 : 0
     const textWidth = Math.max(8, inner - logoWidth - gap)
