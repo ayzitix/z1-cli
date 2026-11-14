@@ -2601,7 +2601,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       const parts = line.split('\n')
       if (composer !== undefined || rl?.terminal !== true) {
         parts.forEach((part, index) => {
-          say(`${index === 0 ? `${dim('>')} ` : '  '}${part}`)
+          say(`${index === 0 ? `${dim('│')} ` : '  '}${part}`)
         })
       }
 
