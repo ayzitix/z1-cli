@@ -1812,7 +1812,7 @@ const createProgress = (tail: Tail): Progress => {
   let runError: string | undefined
   let assistantStarted = false
   let spinner: NodeJS.Timeout | undefined
-  const frames = ['⬡', '⬢', '⬡', '⬢']
+  const frames = [paint('0', '⬡'), dim('⬡')]
   let frame = 0
 
   const stopSpinner = (): void => {
@@ -1826,13 +1826,13 @@ const createProgress = (tail: Tail): Progress => {
     stopSpinner()
     if (!tail.live) {
       // No cursor tricks without the tail: the label is just a line.
-      tail.print(`${paint('0', '⬡')} ${label}`)
+      tail.print(`${frames[0]} ${label}`)
       return
     }
-    tail.activity(`${paint('0', frames[0] ?? '⬡')} ${dim(label)}`)
+    tail.activity(`${frames[0]} ${dim(label)}`)
     spinner = setInterval(() => {
       frame = (frame + 1) % frames.length
-      tail.activity(`${paint('0', frames[frame] ?? '⬡')} ${dim(label)}`)
+      tail.activity(`${frames[frame]} ${dim(label)}`)
     }, 220)
     spinner.unref?.()
   }
@@ -1921,14 +1921,14 @@ const createProgress = (tail: Tail): Progress => {
   const settle = (status: string, error: string | undefined): void => {
     const elapsed = elapsedLabel(Date.now() - startedAt)
     if (status === 'completed') {
-      print(green(`⬡ done · ${elapsed}`))
+      print(green(`⬢ done · ${elapsed}`))
       return
     }
     if (status === 'cancelled') {
       print(dim(`⬡ cancelled · ${elapsed}`))
       return
     }
-    print(red(`⬡ failed · ${elapsed}`))
+    print(red(`⬢ failed · ${elapsed}`))
     const message = error ?? runError
     if (message !== undefined && message.length > 0) {
       if (!shown.has(message)) print(`  ${dim('⎿')}  ${red(message)}`)
