@@ -1013,7 +1013,12 @@ class Composer {
     const width = Math.max(8, columns)
     const menu = this.menu()
     const menuLines = this.renderMenu(width, menu)
-    const textWidth = Math.max(1, width - 2)
+    // The composer is a full sharp box: top/bottom rules and vertical sides.
+    // It is accented only while the field is active (idle, asking, or a draft
+    // is being edited); during a run with an empty draft it stays dim.
+    const active = this.asking !== undefined || !this.busy || this.value.length > 0
+    const edge = (text: string): string => (active ? paint('38;5;75', text) : dim(text))
+    const textWidth = Math.max(1, width - 4)
     const rows = layoutRows(this.value, textWidth)
     const position = cursorPosition(rows, this.cursor)
     const maxVisible = Math.max(3, Math.min(12, terminalRows() - 8))
@@ -1023,16 +1028,11 @@ class Composer {
       start = Math.max(0, Math.min(rows.length - maxVisible, position.row - half))
     }
     const visible = rows.slice(start, start + maxVisible)
-    const input: string[] = visible.map((row, index) => {
-      const absolute = start + index
-      const prefix = absolute === 0 ? `${paint('7', '>')} ` : '  '
-      return `${prefix}${row.text}`
-    })
-    if (this.value.length === 0) input[0] = `${paint('7', '>')} ${dim('Ask z1…')}`
-    // A brighter rule marks the composer as the active input field; the rest
-    // of the UI stays dim. No cursor-shape tricks are needed.
+    const side = edge('│')
+    const input: string[] = visible.map((row) => `${side} ${padTo(row.text, textWidth)} ${side}`)
+    if (this.value.length === 0) input[0] = `${side} ${padTo(dim('Ask z1…'), textWidth)} ${side}`
     const rule = (left: string, right: string): string =>
-      paint('38;5;75', `${left}${'─'.repeat(Math.max(0, width - 2))}${right}`)
+      edge(`${left}${'─'.repeat(Math.max(0, width - 2))}${right}`)
     const header = rule('┌', '┐')
     const footerRule = rule('└', '┘')
     const hint = this.hint(menu.open)
