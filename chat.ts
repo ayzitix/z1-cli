@@ -1017,7 +1017,10 @@ class Composer {
     // It is accented only while the field is active (idle, asking, or a draft
     // is being edited); during a run with an empty draft it stays dim.
     const active = this.asking !== undefined || !this.busy || this.value.length > 0
-    const edge = (text: string): string => (active ? paint('0', text) : dim(text))
+    // The box stays as light as the banner; only the left wall turns white
+    // while the field is active, so the composer is not visually "bolder".
+    const leftEdge = active ? paint('0', '│') : dim('│')
+    const rightEdge = dim('│')
     const textWidth = Math.max(1, width - 4)
     const rows = layoutRows(this.value, textWidth)
     const position = cursorPosition(rows, this.cursor)
@@ -1028,11 +1031,10 @@ class Composer {
       start = Math.max(0, Math.min(rows.length - maxVisible, position.row - half))
     }
     const visible = rows.slice(start, start + maxVisible)
-    const side = edge('│')
-    const input: string[] = visible.map((row) => `${side} ${padTo(row.text, textWidth)} ${side}`)
-    if (this.value.length === 0) input[0] = `${side} ${padTo(dim('Ask z1…'), textWidth)} ${side}`
+    const input: string[] = visible.map((row) => `${leftEdge} ${padTo(row.text, textWidth)} ${rightEdge}`)
+    if (this.value.length === 0) input[0] = `${leftEdge} ${padTo(dim('Ask z1…'), textWidth)} ${rightEdge}`
     const rule = (left: string, right: string): string =>
-      edge(`${left}${'─'.repeat(Math.max(0, width - 2))}${right}`)
+      dim(`${left}${'─'.repeat(Math.max(0, width - 2))}${right}`)
     const header = rule('┌', '┐')
     const footerRule = rule('└', '┘')
     const hint = this.hint(menu.open)
@@ -1843,7 +1845,7 @@ const createProgress = (tail: Tail): Progress => {
     if (spinner !== undefined) stopSpinner()
     if (!assistantStarted) {
       assistantStarted = true
-      tail.stream(`${bold('⏺')} `)
+      tail.stream(`${bold('⬢')} `)
     }
     tail.stream(text)
   }
@@ -1857,7 +1859,7 @@ const createProgress = (tail: Tail): Progress => {
     switch (incoming.type) {
       // One `· step N` per loop iteration: `loop/<n>/chat` is the model call.
       case 'node.started': {
-        // A new model turn starts a new `⏺` block. The turn number itself is
+        // A new model turn starts a new `⬢` block. The turn number itself is
         // not shown: the tool lines already mark progress.
         if (!/^loop\/\d+\/chat$/.test(incoming.path)) return
         assistantStarted = false
@@ -1881,7 +1883,7 @@ const createProgress = (tail: Tail): Progress => {
           const name = typeof item.name === 'string' && item.name.length > 0 ? item.name : 'tool'
           const args = compactArgs(item.arguments)
           calls.set(input[1] as string, { name, args })
-          print(`${bold('⏺')} ${cyan(name)}${args.length === 0 ? '' : dim(`(${args})`)}`)
+          print(`${bold('⬢')} ${cyan(name)}${args.length === 0 ? '' : dim(`(${args})`)}`)
           return
         }
         // `mapCall` publishes the tool result; `isError` picks the symbol.
