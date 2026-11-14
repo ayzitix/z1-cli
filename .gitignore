@@ -1,0 +1,4 @@
+runs.db*
+modules/
+proposals/
+*.log
