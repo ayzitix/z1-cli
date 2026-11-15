@@ -260,6 +260,8 @@ interface Tail {
   idle(): void
   /** Forget the cached frame, e.g. after a status change. */
   repaint(): void
+  /** Clear the retained transcript in pinned mode; a no-op in native scrollback. */
+  clear(): void
   /** Banner builder, rerun at the new width after a resize clears the view. */
   setHeader(build: () => string): void
   /** The terminal changed size: clear the view and repaint header + history. */
@@ -2032,6 +2034,20 @@ const createTail = (options: { live?: boolean; pinned?: boolean } = {}): Tail =>
     paint()
   }
 
+  /**
+   * Opening another session should replace the visible transcript, not append
+   * a second copy of it. The alternate screen owns its history, so it can be
+   * cleared and repainted; the normal buffer's scrollback is the terminal's and
+   * is deliberately left alone.
+   */
+  const clear = (): void => {
+    if (!live || !pinned) return
+    history = []
+    viewOffset = 0
+    frame = ''
+    paint()
+  }
+
   const reflow = (): void => {
     if (!live) return
     const columns = terminalColumns()
@@ -2207,6 +2223,7 @@ const createTail = (options: { live?: boolean; pinned?: boolean } = {}): Tail =>
     flush,
     idle,
     repaint,
+    clear,
     reflow,
     observeResize,
     scroll,
@@ -3612,6 +3629,15 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       say(dim('  this process is bound to the directory it started in'))
       return
     }
+    if (currentSession?.meta.id === loaded.meta.id) {
+      // Selecting the row you are already in must not append a second copy of
+      // the same transcript. The picker stays closed and the screen is untouched.
+      say(`session · ${loaded.meta.name} is already open`)
+      return
+    }
+    // Pinned mode owns its transcript; opening another chat replaces it. In
+    // native mode this is a no-op and the terminal's scrollback is left intact.
+    tail.clear()
     currentSession = loaded
     history = [...loaded.messages]
     lastContext = undefined

@@ -177,7 +177,9 @@ numbered text list instead. The first `z1` turn asks the current model for a
 the readable first-line fallback. Titles are stored in `meta.json`, so they
 survive a restart. Switching a session replays its user and assistant messages
 into the visible transcript (tool results stay in the JSONL), so the opened
-conversation is readable instead of a blank screen.
+conversation is readable instead of a blank screen. Selecting the session that
+is already open is a no-op — it does not append a second copy — and opening a
+different session replaces the pinned transcript instead of stacking both.
 
 ## Still raw
 
