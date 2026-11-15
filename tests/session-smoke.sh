@@ -86,6 +86,124 @@ if [ -n "$(git -C "$repo" status --porcelain)" ]; then
   exit 1
 fi
 
+# Remember the session before /clear: the command must keep its directory and
+# its name, and only the turns may go.
+python3 - "$repo" "$tmp/before.json" <<'PY'
+import glob, json, sys
+metas = glob.glob(sys.argv[1] + '/z1/sessions/*/meta.json')
+meta = json.load(open(metas[0]))
+json.dump({'id': meta['id'], 'name': meta['name']}, open(sys.argv[2], 'w'))
+PY
+
+# /clear empties a 4-message session in place: 1 session, messageCount 0,
+# events.jsonl 0 bytes, name unchanged.
+run_chat "$repo" "$tmp/runs-d.db" $'/sessions 1\n/clear\n/exit\n' >"$tmp/d.out" 2>"$tmp/d.err" || {
+  echo "FAIL: /clear run exited non-zero" >&2
+  sed -n '1,20p' "$tmp/d.err" >&2
+  exit 1
+}
+for needle in 'cleared' 'same session'; do
+  if ! grep -q "$needle" "$tmp/d.out"; then
+    echo "FAIL: /clear output missing '$needle'" >&2
+    sed -n '1,30p' "$tmp/d.out" >&2
+    exit 1
+  fi
+done
+python3 - "$repo" "$tmp/before.json" <<'PY'
+import glob, json, os, sys
+before = json.load(open(sys.argv[2]))
+metas = glob.glob(sys.argv[1] + '/z1/sessions/*/meta.json')
+if len(metas) != 1:
+    raise SystemExit(f'after /clear expected one session, found {len(metas)}')
+meta = json.load(open(metas[0]))
+if meta['id'] != before['id']:
+    raise SystemExit(f"/clear changed the id: {before['id']} -> {meta['id']}")
+if meta['name'] != before['name']:
+    raise SystemExit(f"/clear changed the name: {before['name']!r} -> {meta['name']!r}")
+if meta.get('messageCount') != 0:
+    raise SystemExit(f"expected messageCount 0, found {meta.get('messageCount')}")
+events = metas[0].replace('meta.json', 'events.jsonl')
+size = os.path.getsize(events)
+if size != 0:
+    raise SystemExit(f'expected events.jsonl to be 0 bytes, found {size}')
+PY
+if [ -n "$(git -C "$repo" status --porcelain)" ]; then
+  echo "FAIL: /clear dirtied git status" >&2
+  exit 1
+fi
+
+# The next prompt after /clear appends to the same session again.
+run_chat "$repo" "$tmp/runs-e.db" $'/sessions 1\nthird\n/exit\n' >"$tmp/e.out" 2>"$tmp/e.err" || {
+  echo "FAIL: post-clear resume exited non-zero" >&2
+  sed -n '1,20p' "$tmp/e.err" >&2
+  exit 1
+}
+python3 - "$repo" "$tmp/before.json" <<'PY'
+import glob, json, sys
+before = json.load(open(sys.argv[2]))
+metas = glob.glob(sys.argv[1] + '/z1/sessions/*/meta.json')
+if len(metas) != 1:
+    raise SystemExit(f'after post-clear prompt expected one session, found {len(metas)}')
+meta = json.load(open(metas[0]))
+if meta['id'] != before['id']:
+    raise SystemExit(f"post-clear prompt moved to {meta['id']}, expected {before['id']}")
+if meta.get('messageCount') != 2:
+    raise SystemExit(f'expected messageCount 2 after one prompt, found {meta.get("messageCount")}')
+PY
+
+# /new drops the live transcript and creates an unnamed session with the next
+# prompt: the old one keeps its count, and the prompt is not used as the name.
+prompt='a prompt that must never become the session name, not even its first part'
+input=$'/new\n'"$prompt"$'\n/exit\n'
+run_chat "$repo" "$tmp/runs-f.db" "$input" >"$tmp/f.out" 2>"$tmp/f.err" || {
+  echo "FAIL: /new run exited non-zero" >&2
+  sed -n '1,20p' "$tmp/f.err" >&2
+  exit 1
+}
+python3 - "$repo" "$tmp/before.json" "$prompt" <<'PY'
+import glob, json, re, sys
+before = json.load(open(sys.argv[2]))
+prompt = sys.argv[3]
+metas = glob.glob(sys.argv[1] + '/z1/sessions/*/meta.json')
+if len(metas) != 2:
+    raise SystemExit(f'after /new expected two sessions, found {len(metas)}')
+rows = [json.load(open(path)) for path in metas]
+ids = {row['id'] for row in rows}
+if len(ids) != 2:
+    raise SystemExit(f'expected different ids, found {sorted(ids)}')
+old = next((row for row in rows if row['id'] == before['id']), None)
+new = next((row for row in rows if row['id'] != before['id']), None)
+if old is None or new is None:
+    raise SystemExit('/new lost the previous session or reused it')
+if old.get('messageCount') != 2:
+    raise SystemExit(f"old session count changed: {old.get('messageCount')} != 2")
+if new.get('messageCount') != 2:
+    raise SystemExit(f"expected new session to hold 2 messages, found {new.get('messageCount')}")
+fallback = re.sub(r'\s+', ' ', prompt).strip()[:60]
+if new['name'] == fallback:
+    raise SystemExit(f"the first prompt became the session name: {new['name']!r}")
+PY
+
+# /clear with no session at all says so and creates no session directory.
+empty="$tmp/empty"
+mkdir -p "$empty"
+git -C "$empty" init -q
+run_chat "$empty" "$tmp/runs-g.db" $'/clear\n/exit\n' >"$tmp/g.out" 2>"$tmp/g.err" || {
+  echo "FAIL: empty /clear run exited non-zero" >&2
+  sed -n '1,20p' "$tmp/g.err" >&2
+  exit 1
+}
+if ! grep -q 'already empty' "$tmp/g.out"; then
+  echo "FAIL: /clear with no session did not say 'already empty'" >&2
+  sed -n '1,30p' "$tmp/g.out" >&2
+  exit 1
+fi
+if [ -d "$empty/z1/sessions" ] && find "$empty/z1/sessions" -name meta.json -print -quit | grep -q .; then
+  echo "FAIL: /clear with no session created a session directory" >&2
+  find "$empty/z1/sessions" -name meta.json >&2
+  exit 1
+fi
+
 # `--once` is a one-liner and must not leave a z1/ directory.
 once="$tmp/once"
 mkdir -p "$once"
@@ -96,4 +214,4 @@ if [ -e "$once/z1" ]; then
   exit 1
 fi
 
-echo "PASS: sessions save, list, resume, stay out of git; --once leaves no z1/"
+echo "PASS: sessions save, list, resume, /clear in place, /new unnamed, stay out of git; --once leaves no z1/"

@@ -142,8 +142,11 @@ repo.
   in the project (ignored through `.git/info/exclude`). `/sessions` opens an
   arrow picker; `new`, `rename`, `delete`, `archive` and `--all` are the text
   subcommands. A new session is named by the model from its first message (the
-  first 60 characters are the fallback if that call fails). The next prompt
-  after `/new` or a delete starts a new one. The transcript is authoritative;
+  store's `Session <timestamp>` default is the fallback if that call fails); the
+  first prompt is never stored as the name. The next prompt
+  after `/new` or a delete starts a new one. `/clear` empties the current
+  conversation in place: same session id, name and colour, `messageCount: 0`,
+  and the next prompt appends to that same session. The transcript is authoritative;
   `runs.db` is only provenance. `--once` never creates a session.
 - **Pipes and `Z1_TRAY=off`**: readline path with `\` line continuation, no
   alternate screen and no escape sequences emitted; `Ctrl-C` cancels a run.
@@ -247,6 +250,7 @@ selecting the same session is still a no-op.
 ```
 /help              show help
 /new               start a fresh conversation (a new session on the next prompt)
+/clear             empty this conversation, keep the session (id, name, colour)
 /model <p/m>       switch model
 /tools             interactive picker: ↑↓, Enter toggle, Delete remove, Esc close
 /tools off <n|name|all>  hide a tool (or all) from the agent

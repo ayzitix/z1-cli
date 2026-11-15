@@ -2842,6 +2842,7 @@ const stepLabel = (value: number): string =>
 const COMMANDS: readonly CommandSpec[] = [
   { name: '/help', description: 'show this help' },
   { name: '/new', description: 'start a fresh conversation' },
+  { name: '/clear', description: 'empty this conversation, keep the session' },
   {
     name: '/model',
     description: 'switch the model',
@@ -3718,13 +3719,18 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   /**
    * The first prompt of a conversation creates its session. A failed create
    * (read-only root, deleted parent) leaves the chat running without one.
+   *
+   * The session is created unnamed on purpose: the store's `Session <timestamp>`
+   * default is the fallback, and `titleSession` names it after the first
+   * completed turn. The prompt must not become the name, or `/new` would leak
+   * the user's first message into the session list before any title is asked for.
    */
-  const ensureSession = (prompt: string): Session | undefined => {
+  const ensureSession = (): Session | undefined => {
     if (currentSession !== undefined) return currentSession
     if (sessions === undefined) return undefined
     try {
       const created = sessions.create({
-        name: prompt.replace(/\s+/g, ' ').trim().slice(0, 60) || undefined,
+        name: undefined,
         cwd: config.cwd,
         gitBranch: branch,
         model: { provider: model.provider, model: model.model },
@@ -4435,13 +4441,63 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     '/quit': () => 'exit',
     '/new': () => {
       // A fresh conversation is a fresh session: this one stays on disk and
-      // stays listed, and the next prompt creates its replacement.
+      // stays listed, and the next prompt creates its replacement. That new
+      // session is unnamed, so the first prompt is not stored as its name.
       history = []
       currentSession = undefined
       lastContext = undefined
       lastTokens = 0
       forceCompact = false
-      say('conversation cleared · a new session starts with your next prompt')
+      say(
+        'new conversation · nothing is saved until your first message · the previous session stays in /sessions',
+      )
+      refreshStatus()
+      return 'continue'
+    },
+    '/clear': () => {
+      const resetLive = (): void => {
+        history = []
+        lastContext = undefined
+        lastTokens = 0
+        forceCompact = false
+      }
+      // No store: the transcript exists only in this process, so clearing it is
+      // real but nothing about it can be saved.
+      if (sessions === undefined) {
+        resetLive()
+        say('clear · cleared in this process only (sessions are not being saved)')
+        refreshStatus()
+        return 'continue'
+      }
+      if (currentSession === undefined) {
+        resetLive()
+        say('clear · this conversation is already empty')
+        refreshStatus()
+        return 'continue'
+      }
+      const { id, name } = currentSession.meta
+      let removed = 0
+      try {
+        // Report what the transcript actually held: `load` repairs a stale
+        // `messageCount` from `events.jsonl` before anything is removed.
+        removed = sessions.load(id)?.messages.length ?? currentSession.meta.messageCount
+        sessions.clear(id)
+        // `clear` keeps id, name, colour, model and folder; the next prompt
+        // must append here, so the handle has to stay pointed at this id.
+        currentSession = sessions.load(id) ?? currentSession
+        // Old text must not title a conversation that is now empty.
+        pendingTitles.delete(id)
+        resetLive()
+      } catch (error) {
+        sessionFailure(`could not clear ${id}`, error)
+        refreshStatus()
+        return 'continue'
+      }
+      say(
+        removed === 0
+          ? `clear · "${name}" is already empty · same session`
+          : `cleared "${name}" · ${String(removed)} ${removed === 1 ? 'message' : 'messages'} removed · same session · next prompt starts fresh`,
+      )
       refreshStatus()
       return 'continue'
     },
@@ -4597,7 +4653,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       const handle = await runtime.beginRun({ approval })
       // The first prompt of a conversation creates its session; later prompts
       // keep using it. A store failure returns undefined and the turn still runs.
-      const activeSession = ensureSession(line)
+      const activeSession = ensureSession()
       try {
         const outcome = await runTurn(runtime, handle, model, history, line, progress, {
           forceCompact,
