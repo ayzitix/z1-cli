@@ -130,6 +130,11 @@ repo.
   bring it back. The choice is written atomically to `~/.config/z1/tools.json`
   and shared by every session. The footer shows `tools <enabled>/<installed>`.
   Pipes and `Z1_TRAY=off` keep a numbered text list instead of the picker.
+- **Tool awareness**: every turn's system prompt lists the enabled tool names
+  with a count, or says `None` when everything is off. The wire `tools` array
+  still carries the full schemas, but the model can now answer "what tools do
+  you have?" and cannot invent a disabled one. Names only, so the block is about
+  40 tokens.
 - **Pipes and `Z1_TRAY=off`**: readline path with `\` line continuation, no
   alternate screen and no escape sequences emitted; `Ctrl-C` cancels a run.
 
@@ -192,7 +197,7 @@ repo.
 /new               start a fresh conversation
 /model <p/m>       switch model
 /tools             interactive picker: ↑↓, Enter toggle, Delete remove, Esc close
-/tools off <n|name>      hide a tool from the agent
+/tools off <n|name|all>  hide a tool (or all) from the agent
 /tools delete <n|name>   hide it and keep a restorable tombstone
 /tools on <n|name|all>   enable a tool (also restores a tombstone)
 /tools restore <n|name|all>  clear a tombstone

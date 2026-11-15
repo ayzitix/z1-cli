@@ -2647,6 +2647,49 @@ const formatTokens = (value: number): string =>
   value < 1000 ? String(Math.round(value)) : `${(value / 1000).toFixed(1)}k`
 
 /**
+ * A compact, authoritative list for the system prompt. The provider omits the
+ * wire `tools` array when no tool is enabled, so without this block the model
+ * has no way to know that it has none and tends to invent "basic" tools.
+ *
+ * Names only: the enabled tools' full JSON schemas already travel in the same
+ * request, and short names keep the custom section negligible beside the
+ * 6000-token prompt budget (the custom slot is dropped first when it overflows).
+ */
+const toolInventoryText = (
+  enabled: readonly ToolSchema[],
+  total: number,
+  known: boolean,
+): string => {
+  const heading = '## Tools available this turn'
+  if (!known) {
+    return [
+      heading,
+      '',
+      'The tool inventory could not be read in this run. Do not claim or call any tool. If the task needs one, say the tool service is unavailable.',
+    ].join('\n')
+  }
+  if (enabled.length === 0) {
+    return [
+      heading,
+      '',
+      'None. You have no tools this turn: you cannot read files, edit files, run commands, search, browse, or use any other tool. Do not claim to have done so. If the task needs a tool, say in one sentence which one, and ask the user to enable it with /tools.',
+    ].join('\n')
+  }
+  const names = enabled.map((tool) => `\`${tool.name}\``).join(', ')
+  const off = Math.max(0, total - enabled.length)
+  const count =
+    off > 0
+      ? `${String(enabled.length)} of ${String(total)} installed; ${String(off)} turned off`
+      : `all ${String(total)} installed`
+  return [
+    heading,
+    '',
+    `You have: ${names} (${count}).`,
+    'That list is the complete set. Never claim or call a tool not named here. Their schemas are attached to this request. If a task needs a missing tool, say which one and ask the user to enable it with /tools.',
+  ].join('\n')
+}
+
+/**
  * One user prompt: print `· working`, run the agent graph while reporting every
  * progress event, then keep the transcript for the next turn.
  */
@@ -2667,9 +2710,27 @@ const runTurn = async (
   const maxSteps = options.maxSteps ?? stepLimit(process.env['Z1_MAX_STEPS'])
   const contextWindow =
     options.contextWindow ?? (Number(process.env['Z1_CONTEXT_WINDOW'] ?? '128000') || 128_000)
+
+  // The prompt must agree with the tool service. Read the same inventory the
+  // guard will advertise, so "all tools off" becomes an explicit "None" in the
+  // system message instead of a request that merely lacks a tools array.
+  const guardedTools = createGuardedTools(handle.services.tools)
+  let enabledTools: readonly ToolSchema[] = []
+  let totalTools = 0
+  let inventoryKnown = true
+  try {
+    const installed = await handle.services.tools.list()
+    totalTools = installed.length
+    const { prefs } = loadToolPreferences()
+    enabledTools = installed.filter((tool) => toolState(prefs, tool.name) === 'enabled')
+  } catch {
+    inventoryKnown = false
+  }
+
   let built: unknown = buildAgentGraph({
     model,
     maxSteps,
+    system: toolInventoryText(enabledTools, totalTools, inventoryKnown),
     ...(Number.isFinite(contextWindow) && contextWindow > 0 ? { contextWindow } : {}),
   })
   if (options.forceCompact === true) built = forceCompaction(built, options.lastTokens ?? 2_000)
@@ -2699,7 +2760,7 @@ const runTurn = async (
       // One policy for both the advertised list and execution. The model sees
       // only enabled tools, and a hallucinated name is rejected as a tool error
       // (z1.tool.call turns a throw into data), so it cannot run hidden tools.
-      tools: createGuardedTools(handle.services.tools),
+      tools: guardedTools,
       onEvent: (event) => {
         if (event.type === 'node.stream' && event.port === 'text' && event.path.endsWith('/chat')) {
           streamed = true
@@ -3221,7 +3282,20 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       return
     }
     if (selector === '') {
-      say(`usage: /tools ${verb} <n|name>${verb === 'on' || verb === 'restore' ? '|all' : ''}`)
+      const all = verb === 'on' || verb === 'off' || verb === 'restore' ? '|all' : ''
+      say(`usage: /tools ${verb} <n|name>${all}`)
+      return
+    }
+    if (verb === 'off' && selector === 'all') {
+      const names = tools
+        .map((tool) => tool.name)
+        .filter((name) => toolState(toolPrefs, name) !== 'disabled')
+      if (names.length === 0) {
+        say('tools · every tool is already off')
+        return
+      }
+      if (!applyToolState(names, 'disabled')) return
+      say(`tools · ${String(names.length)} tools off`)
       return
     }
     if ((verb === 'on' || verb === 'restore') && selector === 'all') {
