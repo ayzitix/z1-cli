@@ -51,8 +51,36 @@ export function splitCommandAndPrompt(text: string, isCommand: CommandProbe): Co
   const name = first.split(FIRST_TOKEN, 1)[0] ?? first
   const rest = first.slice(name.length).trim()
   if (!isCommand(name, rest)) return undefined
-  // Blank lines between the command and the question are spacing, not prompt.
+  return { command: first, prompt: promptUnder(lines) }
+}
+
+/**
+ * `/foo` on the first line, a real question under it, and no such command.
+ *
+ * The dispatcher prints "unknown command /foo" and stops, which is right for
+ * the command line — but it used to take the question with it, because the
+ * dispatcher consumed the whole submission. Sending the text below is the less
+ * surprising half: the user typed it, the console says what it did with it, and
+ * nothing is lost. `isKnown` is asked about the bare name only, so a known
+ * command with the wrong shape keeps its usage error instead of becoming a
+ * prompt.
+ */
+export function splitUnknownCommand(text: string, isKnown: (name: string) => boolean): CommandSplit | undefined {
+  const lines = text.split('\n')
+  if (lines.length < 2) return undefined
+  const first = (lines[0] ?? '').trim()
+  if (!first.startsWith('/')) return undefined
+  const name = first.split(FIRST_TOKEN, 1)[0] ?? first
+  if (isKnown(name)) return undefined
+  const prompt = promptUnder(lines)
+  // Nothing under it: the plain unknown-command line already says everything.
+  if (prompt === '') return undefined
+  return { command: first, prompt }
+}
+
+/** The lines below the first, blank separators dropped, trailing space trimmed. */
+const promptUnder = (lines: readonly string[]): string => {
   let at = 1
   while (at < lines.length && (lines[at] ?? '').trim() === '') at += 1
-  return { command: first, prompt: lines.slice(at).join('\n').trimEnd() }
+  return lines.slice(at).join('\n').trimEnd()
 }

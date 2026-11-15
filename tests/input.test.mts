@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 
-import { splitCommandAndPrompt } from '../input.ts'
+import { splitCommandAndPrompt, splitUnknownCommand } from '../input.ts'
 
 /** The console's own predicate, reduced to existence and shape. */
 const probeFor = (table: Record<string, 'none' | 'args' | 'rest'>) => (name: string, rest: string): boolean => {
@@ -66,4 +66,46 @@ assert.equal(splitCommandAndPrompt('hello\nthere', probe), undefined)
 assert.equal(splitCommandAndPrompt('hello\n/tools', probe), undefined)
 assert.equal(asked.length, 0, 'a non-slash first line does not consult the table')
 
-console.log('input tests passed (6 split cases, 2 no-split cases)')
+// ------------------------------------------------------- unknown command + text
+// `/foo` runs nothing and the dispatcher says so, but the question under it is
+// still what the user asked: the split is reported so the caller can print the
+// unknown-command line and then ask the rest.
+const noCommands = (): boolean => false
+assert.deepEqual(splitUnknownCommand('/foo\nhi', noCommands), { command: '/foo', prompt: 'hi' })
+// The command line keeps its own arguments: only the table decides.
+assert.deepEqual(splitUnknownCommand('  /foo --bar \nhi', noCommands), { command: '/foo --bar', prompt: 'hi' })
+// Blank separator lines under it are spacing, as for a known command.
+assert.deepEqual(splitUnknownCommand('/foo\n\nhi\nthere', noCommands), { command: '/foo', prompt: 'hi\nthere' })
+
+// No text under it: the plain unknown-command line already says everything, so
+// there is no second half to send (and no empty prompt).
+assert.equal(splitUnknownCommand('/foo', noCommands), undefined)
+assert.equal(splitUnknownCommand('/foo\n\n   \n', noCommands), undefined)
+
+// A known command is never an unknown one, whatever its shape: `/tools` with a
+// question is `splitCommandAndPrompt`'s case, and a known-but-misshapen line is
+// a usage error, not a prompt.
+const known = (name: string): boolean => name === '/tools' || name === '/exit'
+assert.equal(splitUnknownCommand('/tools\nhi', known), undefined)
+assert.equal(splitUnknownCommand('/exit now\nhi', known), undefined, 'a misshapen command stays a usage error')
+
+// Nothing to split without a newline, and a non-slash first line is a prompt.
+assert.equal(splitUnknownCommand('/foo hi', noCommands), undefined)
+assert.equal(splitUnknownCommand('hello\n/foo', noCommands), undefined)
+
+// Only the bare first token is looked up, so `/foo/bar` is not `/foo`.
+const names: string[] = []
+assert.equal(
+  splitUnknownCommand(
+    '/foo/bar\nhi',
+    (name) => {
+      names.push(name)
+      return false
+    },
+  )?.command,
+  '/foo/bar',
+)
+assert.deepEqual(names, ['/foo/bar'])
+
+console.log('input tests passed (6 split cases, 2 no-split cases, 9 unknown-command cases)')
+

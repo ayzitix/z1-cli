@@ -36,7 +36,7 @@ import type {
 
 import { ownStateText } from './workspace-state.ts'
 import { ensureWebSearch } from './web-service.ts'
-import { splitCommandAndPrompt } from './input.ts'
+import { splitCommandAndPrompt, splitUnknownCommand } from './input.ts'
 import { toolInventoryText } from './tool-inventory.ts'
 import { type ToolState } from './tool-policy.ts'
 import { ToolState as ToolStore } from './tool-state.ts'
@@ -3288,15 +3288,31 @@ const oneShot = async (prompt: string, explicitModel: string | undefined): Promi
     name === '/tools' && shapeAllows(commandSpec(name), rest)
   const trimmed = prompt.trimStart()
   const split = splitCommandAndPrompt(trimmed, headless)
-  const question = split === undefined ? prompt : split.prompt
+  // An unknown `/foo` is not an interactive command, so the error below is not
+  // the answer: the question under it is. A known command with the wrong shape
+  // is still the error (`splitUnknownCommand` asks only about the table).
+  const unknown =
+    split === undefined ? splitUnknownCommand(trimmed, (name) => commandSpec(name) !== undefined) : undefined
+  const firstLine = (trimmed.split('\n', 1)[0] ?? '').trim()
+  const firstName = firstLine.split(/\s+/, 1)[0] ?? firstLine
+  // `/exit` and `/quit` are the user asking to stop: a one-shot has nothing
+  // left to do, and it is not a prompt either.
+  if (firstName === '/exit' || firstName === '/quit') return 0
+  const question = split !== undefined ? split.prompt : unknown !== undefined ? unknown.prompt : prompt
   if (split !== undefined && question.length === 0) {
     console.error('chat --once: /tools alone has no question under it; add a prompt on the next line')
     return 2
   }
-  if (split === undefined && trimmed.startsWith('/')) {
-    const command = trimmed.split(/\s+/, 1)[0] ?? trimmed
-    console.error(`chat --once: ${command} is an interactive command; run z1 without --once`)
+  if (split === undefined && unknown === undefined && trimmed.startsWith('/')) {
+    console.error(`chat --once: ${firstName} is an interactive command; run z1 without --once`)
     return 2
+  }
+  if (unknown !== undefined) {
+    // Same report as before, now followed by what actually happened to the text
+    // under it: stderr, because a one-shot's stdout is the answer and may be
+    // piped. The run continues with the question instead of exiting 2.
+    console.error(`chat --once: unknown command ${firstName} · run z1 without --once for the menu`)
+    console.error(dim('the text under it was sent as a prompt'))
   }
   const model = startModel(explicitModel)
   const config = loadRuntimeConfig({ cwd: process.cwd(), env: process.env, overrides: { live: true } })
@@ -4851,10 +4867,24 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         if (split.prompt.length === 0) continue
         line = split.prompt
       } else {
-        const outcome = await runCommand(line)
-        if (outcome === 'exit') break
-        // A consumed command (or a usage/unknown-command report) is not a prompt.
-        if (outcome === 'continue') continue
+        // Not a runnable command — but `/foo` on the first line with a question
+        // under it is not nothing either. The dispatcher knows no `/foo`, so it
+        // used to print "unknown command" and take the question down with it:
+        // the user typed both halves and the console reports what it did with
+        // the second. A *known* command with the wrong shape stays the usage
+        // error it always was (the predicate here asks only about the table, so
+        // `/exit now` under a question is refused, not forwarded).
+        const unknown = splitUnknownCommand(line, (name) => commandSpec(name) !== undefined)
+        if (unknown !== undefined) {
+          await runCommand(unknown.command)
+          say(dim('the text under it was sent as a prompt'))
+          line = unknown.prompt
+        } else {
+          const outcome = await runCommand(line)
+          if (outcome === 'exit') break
+          // A consumed command (or a usage/unknown-command report) is not a prompt.
+          if (outcome === 'continue') continue
+        }
       }
 
       composer?.setBusy(true)

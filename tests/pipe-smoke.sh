@@ -63,4 +63,39 @@ if ! grep -q 'mock: hi' "$out"; then
   exit 1
 fi
 
-echo "PASS: pipe smoke (exit 0, no ESC bytes, 'tools ·' and the prompt under it)"
+# An unknown command is still reported as unknown, and the text under it is still
+# sent: the console says what it did with the second half instead of dropping it.
+out2="$tmp/stdout2.txt"
+err2="$tmp/stderr2.txt"
+printf '/foo\nhi\n/exit\n' | env \
+  Z1_DB="$tmp/runs2.db" \
+  Z1_TOOLS_FILE="$tmp/tools2.json" \
+  Z1_MODEL=mock/mock-1 \
+  Z1_PINNED=off \
+  Z1_TRAY=off \
+  Z1_WEB_AUTOSTART=off \
+  Z1_MODULES_DIR="${Z1_MODULES_DIR:-$HOME/.local/share/z1/modules}" \
+  "$TSX" "$CHAT" >"$out2" 2>"$err2"
+code2=$?
+
+if [ "$code2" -ne 0 ]; then
+  echo "FAIL: chat exited $code2 on an unknown command" >&2
+  sed -n '1,20p' "$err2" >&2
+  exit 1
+fi
+if [ "$(grep -c $'\033' "$out2" || true)" != "0" ]; then
+  echo "FAIL: unknown-command run wrote ESC bytes" >&2
+  exit 1
+fi
+if ! grep -q 'unknown command /foo' "$out2"; then
+  echo "FAIL: /foo was not reported as an unknown command" >&2
+  sed -n '1,20p' "$out2" >&2
+  exit 1
+fi
+if ! grep -q 'mock: hi' "$out2"; then
+  echo "FAIL: the text under an unknown command was not sent as a prompt" >&2
+  sed -n '1,40p' "$out2" >&2
+  exit 1
+fi
+
+echo "PASS: pipe smoke (exit 0, no ESC bytes, 'tools ·' and the prompt under it, unknown command keeps its prompt)"

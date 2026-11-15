@@ -1,43 +1,65 @@
 /**
  * Unit tests for `web-service.ts`: path resolution, the settings template, the
- * health probe, stale pid files and the `Z1_SEARX_URL` opt-out.
+ * health probe, stale pid files, process identity, log rotation, the download's
+ * checksum/deadline, stop-refusal and the `Z1_SEARX_URL` opt-out.
  *
- * Nothing here installs SearXNG, downloads anything or binds port 8888 — every
- * network interaction is a `node:http` server on an ephemeral port, so the test
- * runs offline in well under a second.
+ * Nothing here installs SearXNG, downloads the real tarball or binds port 8888 —
+ * every network interaction is a `node:http` server on an ephemeral port, so the
+ * test needs no network. The one child process it spawns runs a two-line script
+ * against a silent local server: that is the `--once`-must-not-hang check.
  */
 
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { pathToFileURL } from 'node:url'
 
 import {
   DEFAULT_SEARX_URL,
+  LOG_MAX_BYTES,
   SEARXNG_SHA,
   SEARX_STATE_ENV,
   autostartEnabled,
   checkHealth,
+  downloadSource,
   ensureWebSearch,
   expandHome,
   formatSearxState,
   generateSecret,
+  identityMatches,
   initialSearxPhase,
   isExternallyManaged,
   isInstalled,
   isProcessAlive,
+  processIdentity,
   readPid,
+  readServerRecord,
   renderSettings,
   resolveWebDir,
   resolveWebPaths,
+  rotateLog,
   searxUrl,
   stopWebSearch,
   takeLock,
   waitForHealth,
   webSearchStatus,
+  writeServerRecord,
 } from '../web-service.ts'
+import type { ProcessIdentity } from '../web-service.ts'
 
 const templatePath = join(import.meta.dirname, '..', 'web', 'searxng.settings.yml')
 const template = readFileSync(templatePath, 'utf8')
@@ -61,7 +83,11 @@ assert.equal(paths.srcDir, '/tmp/webdir/searxng/src')
 assert.equal(paths.settingsFile, '/tmp/webdir/searxng/settings.yml')
 assert.equal(paths.logFile, '/tmp/webdir/searxng/searxng.log')
 assert.equal(paths.pidFile, '/tmp/webdir/searxng/searxng.pid')
+assert.equal(paths.identityFile, '/tmp/webdir/searxng/searxng.json')
 assert.equal(paths.manifestFile, '/tmp/webdir/searxng/installed.json')
+assert.equal(paths.lockFile, '/tmp/webdir/searxng/install.lock')
+assert.equal(paths.logFile, '/tmp/webdir/searxng/searxng.log')
+assert.equal(paths.templateFile, join(import.meta.dirname, '..', 'web', 'searxng.settings.yml'))
 assert.ok(paths.python.endsWith(process.platform === 'win32' ? join('Scripts', 'python.exe') : join('bin', 'python')))
 assert.ok(isInstalled(paths) === false)
 
@@ -160,6 +186,44 @@ assert.equal(isProcessAlive(999_999), false)
 writeFileSync(pidFile, 'garbage')
 assert.equal(readPid(pidFile), undefined)
 
+// ---- process identity ------------------------------------------------------
+// A pid is not an identity: three things must agree before z1 signals anything.
+
+const ours = await processIdentity(process.pid)
+assert.equal(ours?.pid, process.pid, 'the running test process has a readable identity')
+assert.ok((ours?.command ?? '').includes('node'), 'the command line is read from the kernel')
+
+const record = {
+  pid: process.pid,
+  startedAt: ours?.startedAt ?? '424242',
+  port: 8888,
+  command: `python -m waitress --listen=127.0.0.1:8888 --threads=8 searx.webapp:app`,
+}
+const asIdentity = (over: Partial<ProcessIdentity>): ProcessIdentity => ({
+  pid: record.pid,
+  startedAt: record.startedAt,
+  command: record.command,
+  ...over,
+})
+
+assert.equal(identityMatches(record, asIdentity({})), true, 'same pid, start marker, command and port matches')
+// A recycled pid: same number, different process, so a different start marker.
+assert.equal(identityMatches(record, asIdentity({ startedAt: '424243' })), false)
+// The portable half of the check: the command must be *this* waitress.
+assert.equal(identityMatches(record, asIdentity({ command: 'node --listen=127.0.0.1:8888 server.js' })), false)
+assert.equal(identityMatches(record, asIdentity({ pid: process.pid + 1 })), false)
+// The port is part of the claim: another waitress on another port is other work.
+assert.equal(identityMatches({ ...record, port: 9999 }, asIdentity({})), false)
+// The real identity of a live process is not this SearXNG, so it must not match.
+assert.equal(identityMatches(record, ours), false, 'a live pid whose command differs is not ours')
+// An unreadable identity is a refusal, never a maybe (stop then leaves it alone).
+assert.equal(identityMatches(record, undefined), false)
+// The Windows `wmic` fallback has no start marker for either side: the check is
+// weaker (command and port only) but it is still a check.
+const noMarker = { ...record, startedAt: '' }
+assert.equal(identityMatches(noMarker, asIdentity({ startedAt: '' })), true)
+assert.equal(identityMatches(noMarker, asIdentity({ startedAt: '', command: 'node x' })), false)
+
 // ---- status + stale state --------------------------------------------------
 
 // A finished install is: manifest, venv interpreter and source tree.
@@ -204,8 +268,11 @@ assert.equal(off.state, 'disabled')
 assert.ok(off.detail.includes('autostart off'))
 assert.equal(isInstalled(resolveWebPaths({ Z1_WEB_DIR: join(dir, 'off') })), false)
 
-// Nothing on the pid file means stop is a clean no-op too.
-const idle = await stopWebSearch({ Z1_WEB_DIR: dir, Z1_SEARX_URL: '' })
+// Nothing to stop: no record, no pid, and nothing answering on `down`, so stop
+// is a clean no-op. (The url is injected: a real backend on 8888 answers 200 and
+// would turn this into "not mine to stop", which is a different case.)
+rmSync(fakePaths.pidFile, { force: true })
+const idle = await stopWebSearch({ Z1_WEB_DIR: dir, Z1_SEARX_URL: '' }, { url: down })
 assert.equal(idle.state, 'stopped')
 assert.equal(idle.detail, 'was not running')
 assert.equal(readPid(fakePaths.pidFile), undefined)
@@ -263,8 +330,51 @@ assert.equal(readPid(fakePaths.pidFile), undefined)
 
 // `starting:`/`installing:` hints are dropped by a stop: nothing is coming up.
 const stopHint: NodeJS.ProcessEnv = { Z1_WEB_DIR: dir, Z1_SEARX_URL: '', [SEARX_STATE_ENV]: 'starting:1' }
-assert.equal((await stopWebSearch(stopHint)).state, 'stopped')
+assert.equal((await stopWebSearch(stopHint, { url: down })).state, 'stopped')
 assert.equal(stopHint[SEARX_STATE_ENV], undefined)
+
+// ---- stop refuses what it cannot verify ------------------------------------
+
+// A record that names a live pid — this test process — but describes a waitress
+// command: the start marker agrees, the command does not. Nothing is signalled
+// (the assertion below would never run if it were), and only the record goes.
+const stopDir = join(dir, 'stop')
+const stopPaths = resolveWebPaths({ Z1_WEB_DIR: stopDir })
+mkdirSync(stopPaths.dataDir, { recursive: true })
+writeServerRecord(stopPaths, {
+  pid: process.pid,
+  startedAt: ours?.startedAt ?? '1',
+  port: 4321,
+  command: 'python -m waitress --listen=127.0.0.1:4321 searx.webapp:app',
+})
+assert.equal(readServerRecord(stopPaths)?.pid, process.pid, 'the identity file parses back')
+assert.equal(readPid(stopPaths.pidFile), process.pid, 'the plain pid file is written beside it')
+const refused = await stopWebSearch({ Z1_WEB_DIR: stopDir, Z1_SEARX_URL: '' }, { url: down })
+assert.equal(refused.state, 'stopped')
+assert.match(refused.detail, /refusing to signal pid/)
+assert.equal(isProcessAlive(process.pid), true, 'an unrelated live pid was not signalled')
+assert.equal(readServerRecord(stopPaths), undefined, 'our stale record is removed')
+assert.equal(readPid(stopPaths.pidFile), undefined)
+
+// A pid with no identity beside it (an older build, a deleted file): the number
+// is not a claim about anything, so it is reported and never signalled.
+const orphanDir = join(dir, 'orphan')
+const orphanPaths = resolveWebPaths({ Z1_WEB_DIR: orphanDir })
+mkdirSync(orphanPaths.dataDir, { recursive: true })
+writeFileSync(orphanPaths.pidFile, `${String(process.pid)}\n`)
+const orphan = await stopWebSearch({ Z1_WEB_DIR: orphanDir, Z1_SEARX_URL: '' }, { url: down })
+assert.equal(orphan.state, 'stopped')
+assert.match(orphan.detail, new RegExp(`pid ${String(process.pid)} has no recorded identity`))
+assert.equal(isProcessAlive(process.pid), true, 'a bare pid is not signalled either')
+assert.equal(existsSync(orphanPaths.pidFile), false, 'the unverifiable record is cleaned up')
+
+// Healthy, but nothing of ours on record: someone else's listener. z1 says so
+// and leaves it running — it is not z1's process to stop.
+const listenerDir = join(dir, 'listener')
+const listener = await stopWebSearch({ Z1_WEB_DIR: listenerDir, Z1_SEARX_URL: '' }, { url: good })
+assert.equal(listener.state, 'ready')
+assert.match(listener.detail, /was not started by this z1; not stopping it/)
+assert.equal(await checkHealth(good), true, 'the unmanaged listener is still answering')
 
 // ---- install lock ----------------------------------------------------------
 
@@ -298,7 +408,165 @@ reclaimed?.()
 // here the web dir's parent is a regular file.
 assert.throws(() => takeLock(resolveWebPaths({ Z1_WEB_DIR: blockedDir })), /install lock failed/)
 
+// A **live** owner holds the lock however old the file looks: a first install or
+// a 60 s readiness wait legitimately owns it for minutes, so mtime decides no-
+// thing while the owner answers `kill(pid, 0)`.
+const liveDir = join(dir, 'lock-live')
+const livePaths = resolveWebPaths({ Z1_WEB_DIR: liveDir })
+mkdirSync(livePaths.dataDir, { recursive: true })
+writeFileSync(livePaths.lockFile, `${String(process.pid)}\n`)
+const hourAgo = new Date(Date.now() - 60 * 60_000)
+utimesSync(livePaths.lockFile, hourAgo, hourAgo)
+assert.equal(
+  takeLock(livePaths),
+  undefined,
+  'a live owner with an hour-old mtime still holds the lock (no second claimant)',
+)
+// The same file with a dead owner is stale at once, old mtime or not.
+writeFileSync(livePaths.lockFile, '999999\n')
+utimesSync(livePaths.lockFile, hourAgo, hourAgo)
+const afterDeath = takeLock(livePaths)
+assert.equal(typeof afterDeath, 'function', 'a dead owner with an old mtime is reclaimed')
+assert.equal(readPid(livePaths.lockFile), process.pid, 'the reclaimer owns it now')
+afterDeath?.()
+// Neither pid nor age to go on (a half-written file): held until the 10-minute
+// grace expires, because only that file can say a live install is in progress.
+writeFileSync(livePaths.lockFile, 'garbage')
+assert.equal(takeLock(livePaths), undefined, 'an unreadable owner younger than the grace is still held')
+utimesSync(livePaths.lockFile, hourAgo, hourAgo)
+const afterGrace = takeLock(livePaths)
+assert.equal(typeof afterGrace, 'function', 'an unreadable owner past the grace is stale')
+afterGrace?.()
+
+// ---- log rotation ----------------------------------------------------------
+
+const logDir = join(dir, 'logs')
+mkdirSync(logDir, { recursive: true })
+const logFile = join(logDir, 'searxng.log')
+assert.equal(rotateLog(logFile), false, 'a log that does not exist is not rotated')
+writeFileSync(logFile, 'x'.repeat(64))
+assert.equal(rotateLog(logFile), false, 'a small log is untouched')
+assert.equal(statSync(logFile).size, 64)
+assert.equal(existsSync(`${logFile}.1`), false, 'no rotation, no .1')
+// Exactly the cap is still fine; one byte over rotates, and the old .1 goes.
+writeFileSync(logFile, Buffer.alloc(LOG_MAX_BYTES))
+assert.equal(rotateLog(logFile), false, 'at the cap the log is left alone')
+assert.equal(statSync(logFile).size, LOG_MAX_BYTES)
+writeFileSync(`${logFile}.1`, 'older generation')
+writeFileSync(logFile, Buffer.alloc(LOG_MAX_BYTES + 1))
+assert.equal(rotateLog(logFile), true, 'past the cap the log is rotated')
+assert.equal(existsSync(logFile), false, 'the current log became .1')
+assert.equal(statSync(`${logFile}.1`).size, LOG_MAX_BYTES + 1, 'one generation, the newest one')
+assert.ok(!readFileSync(`${logFile}.1`, 'utf8').includes('older generation'))
+
+// ---- download: checksum, redirects, deadline -------------------------------
+
+const body = Buffer.alloc(1_100_000, 7) // above the 1 MB truncation guard
+const bodySha = createHash('sha256').update(body).digest('hex')
+const source = createServer((req, res) => {
+  if (req.url === '/slow') return // accepts, never answers: the deadline case
+  if (req.url === '/redirect') {
+    res.writeHead(302, { location: '/source.tar.gz' })
+    res.end()
+    return
+  }
+  if (req.url === '/source.tar.gz') {
+    res.writeHead(200, { 'content-type': 'application/gzip' })
+    res.end(body)
+    return
+  }
+  res.writeHead(404)
+  res.end()
+})
+await new Promise<void>(resolve => source.listen({ host: '127.0.0.1', port: 0 }, resolve))
+const sourceBase = `http://127.0.0.1:${String((source.address() as AddressInfo).port)}`
+
+// A redirect is followed by hand (`fetch` cannot unref its socket), and the
+// digest of the bytes that arrived is the return value.
+const goodTarball = join(dir, 'good.tar.gz')
+assert.equal(
+  await downloadSource(`${sourceBase}/redirect`, goodTarball, { sha256: bodySha }),
+  bodySha,
+)
+assert.equal(statSync(goodTarball).size, body.byteLength)
+assert.equal(statSync(goodTarball).mode & 0o777, 0o600, 'the tarball is private')
+// Wrong bytes (a proxy error page, a tampered mirror): the digest, not the URL,
+// is what is believed, and nothing is written for `tar` to unpack.
+const badTarball = join(dir, 'bad.tar.gz')
+await assert.rejects(
+  downloadSource(`${sourceBase}/source.tar.gz`, badTarball, { sha256: '0'.repeat(64) }),
+  /checksum mismatch/,
+)
+assert.equal(existsSync(badTarball), false, 'a mismatch writes no file')
+
+// A server that accepts and says nothing gets a deadline, not a hang.
+const slowStart = Date.now()
+await assert.rejects(downloadSource(`${sourceBase}/slow`, join(dir, 'slow.tgz'), { timeoutMs: 150 }), /timed out/)
+assert.ok(Date.now() - slowStart < 5000, 'the download honours its deadline')
+
+// ---- no hang: a background provisioning must never pin a finished process ---
+
+// A server that accepts the connection and never sends a byte. Every probe here
+// has a deadline, so this returns instead of waiting for the kernel.
+const silent = createServer(() => {})
+await new Promise<void>(resolve => silent.listen({ host: '127.0.0.1', port: 0 }, resolve))
+const silentUrl = `http://127.0.0.1:${String((silent.address() as AddressInfo).port)}`
+
+const hangStart = Date.now()
+assert.equal(await waitForHealth({ url: silentUrl, timeoutMs: 300, intervalMs: 50 }), false)
+const hangElapsed = Date.now() - hangStart
+assert.ok(hangElapsed < 5000, `waitForHealth gave up in ${String(hangElapsed)} ms, not never`)
+
+// `ensureWebSearch` is the fire-and-forget one: it must come back with a status
+// (here: the web dir is a file, so the lock/install fails) instead of waiting
+// out a silent backend.
+const ensureStart = Date.now()
+const silentStatus = await ensureWebSearch({
+  env: { Z1_WEB_DIR: blockedDir, Z1_WEB_AUTOSTART: 'on' },
+  url: silentUrl,
+  timeoutMs: 150,
+})
+const ensureElapsed = Date.now() - ensureStart
+assert.equal(silentStatus.state, 'failed')
+assert.ok(ensureElapsed < 5000, `ensureWebSearch returned in ${String(ensureElapsed)} ms`)
+
+// The real property is the process, not the promise: a `--once` that printed its
+// answer exits while this provisioning is still in flight. A child runs the same
+// two calls and must exit on its own — a ref'd timer or socket keeps it alive
+// until the spawn timeout below, which fails the test.
+const childScript = join(dir, 'no-hang.mts')
+writeFileSync(
+  childScript,
+  [
+    `import { ensureWebSearch, waitForHealth } from ${JSON.stringify(pathToFileURL(join(import.meta.dirname, '..', 'web-service.ts')).href)}`,
+    `const [url, blocked] = process.argv.slice(2)`,
+    `if (await waitForHealth({ url, timeoutMs: 150, intervalMs: 20 })) { console.error('unexpected health'); process.exit(2) }`,
+    `console.log('waited')`,
+    `const status = await ensureWebSearch({ env: { Z1_WEB_DIR: blocked, Z1_WEB_AUTOSTART: 'on' }, url, timeoutMs: 150 })`,
+    `console.log(status.state)`,
+    '',
+  ].join('\n'),
+)
+const childStart = Date.now()
+const child = spawnSync(process.execPath, [childScript, silentUrl, blockedDir], {
+  encoding: 'utf8',
+  timeout: 15_000,
+})
+const childElapsed = Date.now() - childStart
+// `null` means the spawn timeout killed it: that is the hang this test exists to
+// catch. 0 is "finished everything"; 13 is "exited while an unref'd background
+// promise was still pending", which is exactly a `--once` leaving its
+// provisioner behind.
+assert.notEqual(child.status, null, `the child never exited on its own: ${String(child.error?.message)}`)
+assert.ok(child.status === 0 || child.status === 13, `the child exited ${String(child.status)}: ${String(child.stderr)}`)
+assert.equal(child.stdout.split('\n')[0], 'waited', 'the bounded poll finished before the process left')
+assert.ok(childElapsed < 12_000, `the child exited in ${String(childElapsed)} ms`)
+await new Promise<void>(resolve => silent.close(() => resolve()))
+await new Promise<void>(resolve => source.close(() => resolve()))
+
 await new Promise<void>(resolve => server.close(() => resolve()))
 rmSync(dir, { recursive: true, force: true })
 
-console.log('PASS: web-service (paths, template, health, pid, external, off switch, state hint, install lock)')
+console.log(
+  'PASS: web-service (paths, template, health, pid, identity, external, off switch, state hint, stop refusal, install lock, rotation, download, no hang)',
+)

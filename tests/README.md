@@ -1,6 +1,6 @@
 # z1 CLI tests
 
-Seven dependency-free checks: no test framework, no network, nothing installed —
+Eight dependency-free checks: no test framework, no network, nothing installed —
 and deliberately **not** a full CLI suite.
 
 Prerequisites: `z1-sdk` at `~/Projects/z1-sdk` (or `Z1_SDK_REPO`), Node 24.9+,
@@ -15,6 +15,7 @@ From the repo root:
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/tool-state.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/tool-inventory.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/workspace-state.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/input.test.mts
 tests/pipe-smoke.sh
 tests/session-smoke.sh
 tests/clear-wipe.sh
@@ -26,6 +27,15 @@ pinned engine set), the health probe and its deadline, pid-file staleness, the
 install lock on a web dir that does not exist yet, `external`/`disabled`/
 `stopped`, and the `Z1_SEARX_STATE` hint the web module reads. Every request goes
 to an ephemeral local server: it never touches 8888 or the network.
+
+It also covers process identity (`searxng.json`, `/proc` start time and cmdline),
+stop refusal for a recycled pid, the live-owner lock rule (a live pid holds the
+lock however old the file looks, while a dead one is stale at once), log rotation
+at 5 MB with one generation kept, tarball SHA-256 verification, the download
+timeout, and the no-hang guarantee for `--once`. `input.test.mts` covers the
+unknown-command-plus-prompt split: `/foo` followed by text is reported as unknown
+and the text under it is still sent as a prompt, while an unknown command with
+nothing under it stays a single line.
 
 `tool-state.test.mts`: startup revision, same-order reload keeps it, a real change
 bumps/stales, `markListed`, orphan `installed: false`, guard frozen list vs
@@ -39,8 +49,10 @@ size guard (one line per fact, <260 words for 22 tools).
 workspace, nested and outside roots, `.z1/` always present, and the session line
 staying ≤120 chars for long/Cyrillic names.
 
-`pipe-smoke.sh`: pipes `/tools` + `/exit` with temp `Z1_DB`/`Z1_TOOLS_FILE`;
-fails on a non-zero exit, any ESC byte, or a missing `tools ·`.
+`pipe-smoke.sh`: pipes `/tools`, a prompt and `/exit` with temp
+`Z1_DB`/`Z1_TOOLS_FILE`, and `/foo` + text to prove an unknown command still
+sends the text under it; fails on a non-zero exit, any ESC byte, a missing
+`tools ·`, or a missing `mock:` answer.
 
 `session-smoke.sh`: creates a temp git repo, saves a turn under `z1/`, lists
 and resumes it, asserts four messages survive, `git status` is clean, drives the

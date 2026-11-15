@@ -23,9 +23,23 @@
  *       src/            extracted source at SEARXNG_SHA
  *       venv/           python with SearXNG's requirements + waitress
  *       settings.yml    rendered from the template, 0600, random secret_key
- *       searxng.log     waitress/SearXNG stdout+stderr, 0600
- *       searxng.pid     pid of the process we started
+ *       searxng.log     waitress/SearXNG stdout+stderr, 0600, rotated at 5 MB
+ *       searxng.json    identity of the process we started (see below)
+ *       searxng.pid     the same pid, plain, for humans and older builds
  *       installed.json  what was installed, when, and from where
+ *
+ * Process identity: a pid on its own is not an identity. Pids are recycled, and
+ * the pid file can be deleted (or belong to a previous boot), so signalling
+ * whatever number is in it can kill an unrelated program. `searxng.json`
+ * therefore records `{ pid, startedAt, port, command }` at spawn time, where
+ * `startedAt` is the kernel's start marker for that pid (`/proc/<pid>/stat`
+ * field 22 on Linux, `ps -o lstart=` on macOS, the WMI creation date on
+ * Windows). Before z1 signals anything it re-reads the identity and compares:
+ * same pid, same start marker, and a command line that is this waitress
+ * (`searx.webapp:app`) on this port. A mismatch means the pid now belongs to
+ * something else, and z1 refuses to signal it — it removes its own stale record
+ * instead. Only a *verified* process is ever sent SIGTERM, and only a verified
+ * process that ignored SIGTERM is sent SIGKILL.
  *
  * `Z1_SEARX_URL` means "someone else runs the backend": when it is set this
  * module only reports health and never installs, starts or stops anything.
@@ -39,10 +53,15 @@
  *
  * Security: refuses to run as root, binds `127.0.0.1` only, writes settings and
  * log 0600, and spawns with argv arrays — there is no shell string anywhere.
+ *
+ * Timeouts: every network step here has a deadline and an unref'd socket/timer.
+ * z1 fires `ensureWebSearch()` in the background, so a backend that accepts a
+ * connection and then says nothing must never keep a finished one-shot alive:
+ * `--once` prints its answer and exits while this module is still polling.
  */
 
-import { spawn } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
+import { spawn, execFile } from 'node:child_process'
+import { createHash, randomBytes } from 'node:crypto'
 import {
   chmodSync,
   closeSync,
@@ -72,6 +91,22 @@ export const SEARXNG_SHA = '2d500cb6b8e98b5f57fb446786e91f8de03be89f'
 /** Source tarball for `SEARXNG_SHA` (~6.5 MB). */
 export const SEARXNG_SOURCE_URL = `https://github.com/searxng/searxng/archive/${SEARXNG_SHA}.tar.gz`
 
+/**
+ * SHA-256 of that exact tarball, computed from the URL above.
+ *
+ * The commit SHA pins *which* archive GitHub is asked for, not which bytes
+ * arrive: a compromised mirror, a proxy error page or a truncated stream all
+ * pass a URL check. The digest turns any of those into a hard failure before
+ * `tar` ever runs.
+ */
+export const SEARXNG_TARBALL_SHA256 = 'd214b4d411ebecbc913ab9a1548d43ce818dde49e6676a88bd547f46665fb487'
+
+/** A download gets ten minutes: enough on a slow line, bounded for a hung one. */
+export const DOWNLOAD_TIMEOUT_MS = 10 * 60_000
+
+/** `searxng.log` is rotated (to `searxng.log.1`) once it passes this. */
+export const LOG_MAX_BYTES = 5 * 1024 * 1024
+
 /** Loopback URL used when the user did not point z1 at an existing instance. */
 export const DEFAULT_SEARX_URL = 'http://127.0.0.1:8888'
 
@@ -87,7 +122,12 @@ export const READY_TIMEOUT_MS = 60_000
 /** Minimum Python SearXNG supports (`python_requires` in its `setup.py`): 3.10. */
 const MIN_PYTHON = 310
 
-const sleep = (ms: number): Promise<void> => new Promise(resolveFn => setTimeout(resolveFn, ms))
+const sleep = (ms: number, unref = false): Promise<void> =>
+  new Promise(resolveFn => {
+    const timer = setTimeout(resolveFn, ms)
+    // A finished `--once` must not wait out a background readiness poll.
+    if (unref) timer.unref?.()
+  })
 
 /** Every path the install touches, so tests can resolve them without I/O. */
 export interface WebPaths {
@@ -100,7 +140,10 @@ export interface WebPaths {
   python: string
   settingsFile: string
   logFile: string
+  /** Plain pid, for humans and for builds that predate `identityFile`. */
   pidFile: string
+  /** `{ pid, startedAt, port, command }` of the process we started. */
+  identityFile: string
   manifestFile: string
   /** Held while installing, so two z1 processes do not share one venv. */
   lockFile: string
@@ -150,6 +193,7 @@ export function resolveWebPaths(
     settingsFile: join(dataDir, 'settings.yml'),
     logFile: join(dataDir, 'searxng.log'),
     pidFile: join(dataDir, 'searxng.pid'),
+    identityFile: join(dataDir, 'searxng.json'),
     manifestFile: join(dataDir, 'installed.json'),
     lockFile: join(dataDir, 'install.lock'),
     templateFile:
@@ -194,8 +238,15 @@ export function renderSettings(template: string, secret: string): string {
   return template.split('{{SECRET}}').join(secret)
 }
 
-/** One `GET /healthz`; `false` on refusal, timeout, non-200 or a malformed URL. */
-export function checkHealth(url: string, timeoutMs = 2000): Promise<boolean> {
+/**
+ * One `GET /healthz`; `false` on refusal, timeout, non-200 or a malformed URL.
+ *
+ * The socket and the deadline timer are unref'd so a probe still in flight can
+ * never hold a finished process open; callers that must stay alive for the
+ * answer (tests, the readiness poll) pass `unref: false`.
+ */
+export function checkHealth(url: string, timeoutMs = 2000, options: { unref?: boolean } = {}): Promise<boolean> {
+  const unref = options.unref ?? true
   return new Promise<boolean>(resolve => {
     let target: URL
     try {
@@ -206,9 +257,11 @@ export function checkHealth(url: string, timeoutMs = 2000): Promise<boolean> {
     }
     const send = target.protocol === 'https:' ? httpsRequest : httpRequest
     let settled = false
+    let timer: NodeJS.Timeout | undefined
     const done = (ok: boolean): void => {
       if (settled) return
       settled = true
+      if (timer !== undefined) clearTimeout(timer)
       resolve(ok)
     }
     let req: ReturnType<typeof httpRequest>
@@ -226,6 +279,14 @@ export function checkHealth(url: string, timeoutMs = 2000): Promise<boolean> {
       done(false)
       return
     }
+    if (unref) req.on('socket', socket => socket.unref())
+    // An explicit deadline as well as the socket timeout: a server that accepts
+    // and then never sends a byte must still end the probe.
+    timer = setTimeout(() => {
+      req.destroy()
+      done(false)
+    }, timeoutMs)
+    if (unref) timer.unref?.()
     req.on('timeout', () => {
       req.destroy()
       done(false)
@@ -244,15 +305,18 @@ export async function waitForHealth(options: {
   timeoutMs?: number
   intervalMs?: number
   check?: (url: string) => Promise<boolean>
+  /** Unref every timer and probe: the background provisioner sets this. */
+  unref?: boolean
 }): Promise<boolean> {
   const timeoutMs = options.timeoutMs ?? READY_TIMEOUT_MS
   const intervalMs = options.intervalMs ?? 500
-  const check = options.check ?? (url => checkHealth(url))
+  const unref = options.unref ?? false
+  const check = options.check ?? (target => checkHealth(target, 2000, { unref }))
   const deadline = Date.now() + timeoutMs
   for (;;) {
     if (await check(options.url)) return true
     if (Date.now() >= deadline) return false
-    await sleep(Math.min(intervalMs, Math.max(0, deadline - Date.now())))
+    await sleep(Math.min(intervalMs, Math.max(0, deadline - Date.now())), unref)
   }
 }
 
@@ -276,6 +340,160 @@ export function isProcessAlive(pid: number): boolean {
     // EPERM means it exists but belongs to someone else: still alive.
     return (error as NodeJS.ErrnoException).code === 'EPERM'
   }
+}
+
+/** What the kernel says about one pid right now. */
+export interface ProcessIdentity {
+  pid: number
+  /**
+   * Opaque start marker, unique per process for the life of the boot:
+   * `/proc/<pid>/stat` field 22 (Linux), `ps -o lstart=` (macOS), the WMI
+   * creation date (Windows). `''` when the platform could not report one.
+   */
+  startedAt: string
+  /** Full command line, best-effort; `''` when it could not be read. */
+  command: string
+}
+
+/**
+ * Read the identity of `pid`, or `undefined` when it cannot be read at all.
+ *
+ * No shell: `execFile` with an argv array on macOS/Windows, plain file reads on
+ * Linux. Every failure path returns `undefined` rather than a guess, because
+ * the caller uses this to decide whether it may signal the pid.
+ */
+export async function processIdentity(pid: number): Promise<ProcessIdentity | undefined> {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined
+  if (process.platform === 'linux') {
+    try {
+      // Field 2 is `(comm)` and may itself contain spaces or `)`, so the fields
+      // after it are counted from the *last* `)`.
+      const stat = readFileSync(`/proc/${String(pid)}/stat`, 'utf8')
+      const close = stat.lastIndexOf(')')
+      if (close < 0) return undefined
+      const fields = stat.slice(close + 1).trim().split(/\s+/)
+      // `fields[0]` is field 3 (state), so field 22 is `fields[19]`.
+      const startedAt = fields[19]
+      if (startedAt === undefined) return undefined
+      let command = ''
+      try {
+        command = readFileSync(`/proc/${String(pid)}/cmdline`, 'utf8').replace(/\0/g, ' ').trim()
+      } catch {
+        // A zombie has an empty cmdline; the start marker is still valid.
+      }
+      return { pid, startedAt, command }
+    } catch {
+      return undefined
+    }
+  }
+  if (process.platform === 'darwin') {
+    const line = await execText('ps', ['-p', String(pid), '-o', 'lstart=,command='])
+    if (line === undefined) return undefined
+    const parts = line.trim().split(/\s+/)
+    // `lstart` is exactly five tokens (`Sun Nov 15 21:00:00 2026`).
+    if (parts.length < 5) return undefined
+    return { pid, startedAt: parts.slice(0, 5).join(' '), command: parts.slice(5).join(' ') }
+  }
+  if (process.platform === 'win32') {
+    // PowerShell first: it reports the creation date as well as the command
+    // line, so pid reuse is detectable. `wmic` is the fallback and only gives
+    // the command, which makes the check weaker — and documented as such.
+    const script = `$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${String(pid)}'; if ($p) { Write-Output $p.CreationDate.ToUniversalTime().ToString('o'); Write-Output $p.CommandLine }`
+    const out = await execText('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script])
+    if (out !== undefined) {
+      const [startedAt, ...rest] = out.split(/\r?\n/)
+      if (startedAt !== undefined && startedAt.trim() !== '') {
+        return { pid, startedAt: startedAt.trim(), command: rest.join(' ').trim() }
+      }
+    }
+    const wmic = await execText('wmic', ['process', 'where', `processid=${String(pid)}`, 'get', 'commandline'])
+    if (wmic === undefined) return undefined
+    // `wmic` prints a header line and pads with blank lines.
+    const command = wmic
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line => line !== '' && !/^CommandLine$/i.test(line))
+      .join(' ')
+    if (command === '') return undefined
+    return { pid, startedAt: '', command }
+  }
+  return undefined
+}
+
+/** One short-lived `execFile` whose output is line-joined; `undefined` on any failure. */
+function execText(file: string, args: readonly string[]): Promise<string | undefined> {
+  return new Promise(resolve => {
+    execFile(file, [...args], { timeout: 4000, maxBuffer: 64 * 1024 }, (error, stdout) => {
+      if (error !== null) {
+        resolve(undefined)
+        return
+      }
+      resolve(String(stdout).trim())
+    })
+  })
+}
+
+/**
+ * What z1 wrote at spawn time: enough to recognise its own process later.
+ * `startedAt`/`command` are `''` when the platform could not report them, which
+ * makes the check weaker, never wrong: an unreadable identity is a refusal.
+ */
+export interface ServerRecord {
+  pid: number
+  startedAt: string
+  port: number
+  command: string
+}
+
+/** The recorded identity, or `undefined` for a missing or corrupt file. */
+export function readServerRecord(paths: WebPaths): ServerRecord | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(paths.identityFile, 'utf8')) as Partial<ServerRecord>
+    if (typeof raw.pid !== 'number' || !Number.isInteger(raw.pid) || raw.pid <= 0) return undefined
+    if (typeof raw.startedAt !== 'string' || typeof raw.command !== 'string') return undefined
+    if (typeof raw.port !== 'number' || !Number.isInteger(raw.port)) return undefined
+    return { pid: raw.pid, startedAt: raw.startedAt, port: raw.port, command: raw.command }
+  } catch {
+    return undefined
+  }
+}
+
+/** Record the process z1 just spawned; the plain pid file stays for humans. */
+export function writeServerRecord(paths: WebPaths, record: ServerRecord): void {
+  writeFileSync(paths.identityFile, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 })
+  writeFileSync(paths.pidFile, String(record.pid), { mode: 0o600 })
+}
+
+/** Remove both files: a pid with no identity is not a claim about anything. */
+export function clearServerRecord(paths: WebPaths): void {
+  // Best-effort: a record we cannot delete (a directory in the way, a read-only
+  // data dir) must not turn into a crash on the failure path.
+  for (const file of [paths.identityFile, paths.pidFile]) {
+    try {
+      rmSync(file, { force: true })
+    } catch {
+      // Nothing else to do with a file we do not own.
+    }
+  }
+}
+
+/**
+ * True when `current` is the process the record describes: same pid, same start
+ * marker, and a command line that is this waitress on this port.
+ *
+ * The start marker alone would be enough on Linux/macOS, but it is `''` on a
+ * Windows fallback, so the command line is the portable half of the check.
+ */
+export function identityMatches(record: ServerRecord, current: ProcessIdentity | undefined): boolean {
+  if (current === undefined) return false
+  if (current.pid !== record.pid) return false
+  if (record.startedAt !== '' && current.startedAt !== '' && record.startedAt !== current.startedAt) return false
+  if (!current.command.includes('searx.webapp:app')) return false
+  return (
+    current.command.includes(`--listen=127.0.0.1:${String(record.port)}`) ||
+    current.command.includes(`:${String(record.port)} `) ||
+    current.command.includes(`:${String(record.port)}`)
+  )
 }
 
 /** True when an install finished and the venv still exists. */
@@ -379,18 +597,19 @@ export async function webSearchStatus(
   }
 
   if (await checkHealth(url)) {
-    const pid = readPid(paths.pidFile)
+    const record = readServerRecord(paths)
+    const ours = record !== undefined && identityMatches(record, await processIdentity(record.pid))
     return {
       ...base,
       state: 'ready',
-      ...(pid !== undefined && isProcessAlive(pid) ? { pid } : {}),
-      detail: `ready at ${url}`,
+      ...(ours ? { pid: record.pid } : {}),
+      detail: ours ? `ready at ${url}` : `SearXNG is answering on ${url} but was not started by this z1`,
     }
   }
 
-  const pid = readPid(paths.pidFile)
-  if (pid !== undefined && isProcessAlive(pid)) {
-    return { ...base, state: 'starting', pid, detail: `starting (pid ${String(pid)})` }
+  const record = readServerRecord(paths)
+  if (record !== undefined && identityMatches(record, await processIdentity(record.pid))) {
+    return { ...base, state: 'starting', pid: record.pid, detail: `starting (pid ${String(record.pid)})` }
   }
   if (installed) {
     return { ...base, state: 'stopped', detail: 'installed, not running' }
@@ -452,19 +671,106 @@ async function probePython(command: string): Promise<{ path: string; version: nu
   return { path: command, version: Number(match[1]) * 100 + Number(match[2]) }
 }
 
-/** Download the pinned tarball to `dest`. */
-async function download(url: string, dest: string): Promise<void> {
-  let response: Response
+/** One HTTP GET with a deadline; the socket is unref'd so it cannot pin a process. */
+function requestOnce(
+  target: URL,
+  timeoutMs: number,
+): Promise<{ status: number; location: string | undefined; body: Buffer }> {
+  return new Promise((resolve, reject) => {
+    const send = target.protocol === 'https:' ? httpsRequest : httpRequest
+    const chunks: Buffer[] = []
+    let settled = false
+    let timer: NodeJS.Timeout | undefined
+    const fail = (error: Error): void => {
+      if (settled) return
+      settled = true
+      if (timer !== undefined) clearTimeout(timer)
+      reject(error)
+    }
+    let req: ReturnType<typeof httpRequest>
+    try {
+      req = send(target, { method: 'GET', headers: { 'user-agent': 'z1', accept: 'application/gzip' } })
+    } catch (error) {
+      fail(new WebServiceError(`download failed: ${(error as Error).message}`))
+      return
+    }
+    // Unref'd: a one-shot that already printed its answer may exit mid-download.
+    req.on('socket', socket => socket.unref())
+    timer = setTimeout(() => {
+      req.destroy()
+      fail(new WebServiceError(`download timed out after ${String(Math.round(timeoutMs / 1000))} s`))
+    }, timeoutMs)
+    timer.unref?.()
+    req.on('response', response => {
+      response.on('data', (chunk: Buffer) => chunks.push(chunk))
+      response.on('error', error => fail(new WebServiceError(`download failed: ${error.message}`)))
+      response.on('end', () => {
+        if (settled) return
+        settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        const location = response.headers.location
+        resolve({
+          status: response.statusCode ?? 0,
+          location: location === undefined ? undefined : location,
+          body: Buffer.concat(chunks),
+        })
+      })
+    })
+    req.on('error', error => fail(new WebServiceError(`no network (${error.message})`)))
+    req.end()
+  })
+}
+
+/**
+ * Download the pinned tarball to `dest`, verifying its SHA-256.
+ *
+ * Redirects are followed by hand rather than by `fetch`, because `fetch` has no
+ * way to unref its socket: a pending download would keep a finished `--once`
+ * process alive (the exact hang this module must not have). `sha256` and
+ * `timeoutMs` are injectable so the tests can force a mismatch and a timeout
+ * without the network.
+ */
+export async function downloadSource(
+  url: string,
+  dest: string,
+  options: { sha256?: string; timeoutMs?: number } = {},
+): Promise<string> {
+  const timeoutMs = options.timeoutMs ?? DOWNLOAD_TIMEOUT_MS
+  const expected = options.sha256 ?? SEARXNG_TARBALL_SHA256
+  let target: URL
   try {
-    response = await fetch(url, { redirect: 'follow' })
-  } catch (error) {
-    throw new WebServiceError(`no network (${(error as Error).message})`)
+    target = new URL(url)
+  } catch {
+    throw new WebServiceError(`download failed: not a URL (${url})`)
   }
-  if (!response.ok) throw new WebServiceError(`download failed (HTTP ${String(response.status)})`)
-  const bytes = Buffer.from(await response.arrayBuffer())
+  let body: Buffer | undefined
+  for (let hop = 0; hop <= 5; hop += 1) {
+    const result = await requestOnce(target, timeoutMs)
+    if (result.status >= 300 && result.status < 400 && result.location !== undefined) {
+      try {
+        target = new URL(result.location, target)
+      } catch {
+        throw new WebServiceError(`download failed: bad redirect to ${result.location}`)
+      }
+      continue
+    }
+    if (result.status !== 200) throw new WebServiceError(`download failed (HTTP ${String(result.status)})`)
+    body = result.body
+    break
+  }
+  if (body === undefined) throw new WebServiceError('download failed (too many redirects)')
+  const actual = createHash('sha256').update(body).digest('hex')
+  // Checked before the size heuristic: the wrong bytes are the more useful
+  // reason, and a truncated stream is a mismatch too.
+  if (actual !== expected) {
+    throw new WebServiceError(
+      `download failed: checksum mismatch for the pinned source (expected ${expected}, got ${actual})`,
+    )
+  }
   // 6.5 MB is expected; anything wildly smaller is a proxy page, not a tarball.
-  if (bytes.byteLength < 1_000_000) throw new WebServiceError('download failed (truncated tarball)')
-  writeFileSync(dest, bytes, { mode: 0o600 })
+  if (body.byteLength < 1_000_000) throw new WebServiceError('download failed (truncated tarball)')
+  writeFileSync(dest, body, { mode: 0o600 })
+  return actual
 }
 
 /**
@@ -482,7 +788,7 @@ async function install(paths: WebPaths, env: NodeJS.ProcessEnv, report: (line: s
   const staging = join(paths.dataDir, '.extract')
 
   report('web · installing SearXNG (first run, ~120 MB)…')
-  await download(SEARXNG_SOURCE_URL, tarball)
+  await downloadSource(SEARXNG_SOURCE_URL, tarball)
 
   rmSync(staging, { recursive: true, force: true })
   mkdirSync(staging, { recursive: true, mode: 0o700 })
@@ -572,8 +878,10 @@ async function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
  * removed underneath us, which is a real error, not "someone else holds it".)
  *
  * Only `EEXIST` means "held": a permission problem is a failure to report, not
- * a lock to wait out. A lock left by a crashed run is stale when its pid is
- * gone or the file is older than any install could take.
+ * a lock to wait out. A lock left by a crashed run is stale when its owner pid
+ * is gone. A **live** owner always means held, however old the file looks: the
+ * holder may legitimately own it for minutes (a first install, a 60 s readiness
+ * wait), and mtime is only consulted when the pid could not be read at all.
  */
 export function takeLock(paths: WebPaths): (() => void) | undefined {
   try {
@@ -599,7 +907,10 @@ export function takeLock(paths: WebPaths): (() => void) | undefined {
   if (mine !== undefined) return mine
 
   const owner = readPid(paths.lockFile)
-  const stale = owner === undefined || !isProcessAlive(owner) || Date.now() - mtime(paths.lockFile) > 10 * 60_000
+  // A live owner is held, no matter how old the file is. A dead pid is stale at
+  // once. An unreadable owner (a half-written file, a corrupt one) is only
+  // stale once it is older than any install could take.
+  const stale = owner === undefined ? Date.now() - mtime(paths.lockFile) > 10 * 60_000 : !isProcessAlive(owner)
   if (!stale) return undefined
   rmSync(paths.lockFile, { force: true })
   // A racing process may have re-created it first: losing that race is normal.
@@ -611,6 +922,38 @@ const mtime = (file: string): number => {
     return statSync(file).mtimeMs
   } catch {
     return 0
+  }
+}
+
+/**
+ * Keep `searxng.log` bounded: waitress runs for weeks and never rotates.
+ *
+ * Above `maxBytes` the current log becomes `searxng.log.1` (overwriting the old
+ * one — one generation is enough to explain a failed start) and a new log
+ * starts empty. POSIX `rename` replaces the target; Windows refuses, so the
+ * previous `.1` is removed first. If the move fails (a read-only directory) the
+ * file is truncated instead; if even that fails, the caller appends as before.
+ * Returns true when the log was rotated or truncated.
+ */
+export function rotateLog(logFile: string, maxBytes: number = LOG_MAX_BYTES): boolean {
+  let size: number
+  try {
+    size = statSync(logFile).size
+  } catch {
+    return false
+  }
+  if (size <= maxBytes) return false
+  try {
+    rmSync(`${logFile}.1`, { force: true })
+    renameSync(logFile, `${logFile}.1`)
+    return true
+  } catch {
+    try {
+      writeFileSync(logFile, '', { mode: 0o600 })
+      return true
+    } catch {
+      return false
+    }
   }
 }
 
@@ -633,31 +976,36 @@ function portInUse(port: number): Promise<boolean> {
  * Resolving only on the child's `spawn` event matters: a missing or
  * non-executable interpreter is reported asynchronously, and an unhandled
  * `error` event would take the whole CLI down instead of producing a status.
+ *
+ * The pid is recorded together with the kernel's start marker and the command
+ * line we are about to run, because neither the pid file nor the pid itself is
+ * an identity: see the module header.
  */
-async function startServer(paths: WebPaths, env: NodeJS.ProcessEnv, port: number): Promise<number> {
+async function startServer(paths: WebPaths, env: NodeJS.ProcessEnv, port: number): Promise<ServerRecord> {
+  // A log that grew past the cap is rotated before the new process appends to
+  // it: waitress holds the descriptor for its whole life, so this is the only
+  // moment the file can be replaced.
+  rotateLog(paths.logFile)
   const logFd = openSync(paths.logFile, 'a', 0o600)
   chmodSync(paths.logFile, 0o600)
+  const args = [
+    '-m',
+    'waitress',
+    `--listen=127.0.0.1:${String(port)}`,
+    '--threads=8',
+    '--channel-timeout=300',
+    'searx.webapp:app',
+  ]
   let child
   try {
-    child = spawn(
-      paths.python,
-      [
-        '-m',
-        'waitress',
-        `--listen=127.0.0.1:${String(port)}`,
-        '--threads=8',
-        '--channel-timeout=300',
-        'searx.webapp:app',
-      ],
-      {
-        cwd: paths.srcDir,
-        // The rendered settings are outside the source tree on purpose: an
-        // upgrade re-extracts `src/` and must not overwrite the secret.
-        env: { ...env, SEARXNG_SETTINGS_PATH: paths.settingsFile },
-        detached: true,
-        stdio: ['ignore', logFd, logFd],
-      },
-    )
+    child = spawn(paths.python, args, {
+      cwd: paths.srcDir,
+      // The rendered settings are outside the source tree on purpose: an
+      // upgrade re-extracts `src/` and must not overwrite the secret.
+      env: { ...env, SEARXNG_SETTINGS_PATH: paths.settingsFile },
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+    })
   } finally {
     // The child holds its own descriptor now.
     closeSync(logFd)
@@ -670,8 +1018,21 @@ async function startServer(paths: WebPaths, env: NodeJS.ProcessEnv, port: number
   })
   if (child.pid === undefined) throw new WebServiceError('searxng did not start')
   child.unref()
-  writeFileSync(paths.pidFile, String(child.pid), { mode: 0o600 })
-  return child.pid
+  // Read the identity now, while this is certainly the process we spawned. A
+  // brief retry covers the instant between `spawn` and a readable cmdline.
+  let identity = await processIdentity(child.pid)
+  for (let attempt = 0; attempt < 5 && (identity === undefined || identity.command === ''); attempt += 1) {
+    await sleep(50)
+    identity = await processIdentity(child.pid)
+  }
+  const record: ServerRecord = {
+    pid: child.pid,
+    startedAt: identity?.startedAt ?? '',
+    port,
+    command: identity?.command ?? args.join(' '),
+  }
+  writeServerRecord(paths, record)
+  return record
 }
 
 /** The port the local backend should bind: the one in the default URL. */
@@ -762,6 +1123,9 @@ export async function ensureWebSearch(options: EnsureOptions = {}): Promise<WebS
       waitForHealth({
         url,
         timeoutMs: options.timeoutMs,
+        // Unref'd: this poll runs in the background while a one-shot answers,
+        // and a finished one-shot must not wait out the readiness budget.
+        unref: true,
         check: async target => {
           publishSearxState(env, phase)
           return checkHealth(target)
@@ -773,60 +1137,89 @@ export async function ensureWebSearch(options: EnsureOptions = {}): Promise<WebS
 
       const healthy = await checkHealth(url)
       if (healthy) {
+        // Healthy, but is it ours? A listener on the port with no matching
+        // identity was started by something else (an older z1, a manual run, a
+        // deleted pid file). Using it is fine; claiming it as manageable is not.
+        const record = readServerRecord(paths)
+        const ours = record !== undefined && identityMatches(record, await processIdentity(record.pid))
         publishSearxState(env, 'up')
-        return { state: 'ready', managed: true, url, dataDir: paths.dataDir, detail: `ready at ${url}`, installed: isInstalled(paths) }
+        if (!ours) {
+          report(`web · SearXNG is answering on ${url} but was not started by this z1; not stopping it`)
+        }
+        return {
+          state: 'ready',
+          managed: true,
+          url,
+          dataDir: paths.dataDir,
+          ...(ours ? { pid: record.pid } : {}),
+          detail: ours ? `ready at ${url}` : `SearXNG is answering on ${url} but was not started by this z1`,
+          installed: isInstalled(paths),
+        }
       }
 
-      // A pid file with a live process means a start is in progress (or a
-      // wedged one): wait for it instead of racing a second bind.
-      const pid = readPid(paths.pidFile)
-      if (pid !== undefined && isProcessAlive(pid)) {
+      // Not answering: a *verified* live process is a start in progress (or a
+      // wedged one), so wait for it instead of racing a second bind. A live pid
+      // whose command line is not this SearXNG is a recycled pid: drop the
+      // record and start, rather than burning the whole readiness budget on a
+      // process that will never answer for us.
+      const record = readServerRecord(paths)
+      if (record !== undefined && isProcessAlive(record.pid) && identityMatches(record, await processIdentity(record.pid))) {
         if (await waitReady('starting')) {
           publishSearxState(env, 'up')
-          return { state: 'ready', managed: true, url, dataDir: paths.dataDir, pid, detail: `ready at ${url}`, installed: isInstalled(paths) }
+          return { state: 'ready', managed: true, url, dataDir: paths.dataDir, pid: record.pid, detail: `ready at ${url}`, installed: isInstalled(paths) }
         }
-        return await failed(`pid ${String(pid)} is running but not answering ${HEALTH_PATH}`)
+        return await failed(`pid ${String(record.pid)} is running but not answering ${HEALTH_PATH}`)
       }
-      // Dead or stale pid: clean up so `starting` cannot be reported forever.
-      rmSync(paths.pidFile, { force: true })
+      // Dead, recycled, or a bare pid file from a build that had no identity:
+      // clean up so `starting` cannot be reported forever.
+      clearServerRecord(paths)
 
-      // Only an absent install pays the download; either way the sync hint
-      // above already said "coming up".
+      // The install lock covers the *start* as well: from here until health (or
+      // failure) only one z1 in the machine may spawn a waitress, and the loser
+      // waits for the winner's port instead of racing a second bind into
+      // EADDRINUSE. A live lock owner is always held, however long the install
+      // takes.
+      const installedBefore = isInstalled(paths)
+      const release = takeLock(paths)
+      if (release === undefined) {
+        // Another z1 is installing or starting: give it the same budget.
+        if (await waitReady(installedBefore ? 'starting' : 'installing')) {
+          publishSearxState(env, 'up')
+          return { state: 'ready', managed: true, url, dataDir: paths.dataDir, detail: `ready at ${url}`, installed: isInstalled(paths) }
+        }
+        return await failed(installedBefore ? 'another z1 is starting SearXNG' : 'another z1 is installing SearXNG')
+      }
       let started = false
-      if (!isInstalled(paths)) {
-        const release = takeLock(paths)
-        if (release === undefined) {
-          // Another z1 is installing: give it the same budget as a start.
-          if (await waitReady('installing')) {
-            publishSearxState(env, 'up')
-            return { state: 'ready', managed: true, url, dataDir: paths.dataDir, detail: `ready at ${url}`, installed: true }
-          }
-          return await failed('another z1 is installing SearXNG')
-        }
-        try {
-          await install(paths, env, report)
-        } finally {
-          release()
-        }
-        started = true
-      }
-
-      const port = managedPort(url)
-      if (await portInUse(port)) {
-        return await failed(`port ${String(port)} is in use by another program`)
-      }
-      publishSearxState(env, 'starting')
       try {
-        await startServer(paths, env, port)
-      } catch (error) {
-        return await failed((error as Error).message)
+        // Only an absent install pays the download; either way the sync hint
+        // above already said "coming up".
+        if (!installedBefore) {
+          await install(paths, env, report)
+          started = true
+        }
+
+        const port = managedPort(url)
+        if (await portInUse(port)) {
+          return await failed(`port ${String(port)} is in use by another program`)
+        }
+        publishSearxState(env, 'starting')
+        let record: ServerRecord
+        try {
+          record = await startServer(paths, env, port)
+        } catch (error) {
+          return await failed((error as Error).message)
+        }
+        // Nothing this process spawned is left behind unrecorded, even when the
+        // wait below times out: `stop` can then verify and signal it.
+        if (!(await waitReady('starting'))) {
+          return await failed(`backend did not answer ${HEALTH_PATH} in ${String(Math.round((options.timeoutMs ?? READY_TIMEOUT_MS) / 1000))} s (log: ${paths.logFile})`)
+        }
+        publishSearxState(env, 'up')
+        if (started) report('web · ready')
+        return { state: 'ready', managed: true, url, dataDir: paths.dataDir, pid: record.pid, detail: `ready at ${url}`, installed: true }
+      } finally {
+        release()
       }
-      if (!(await waitReady('starting'))) {
-        return await failed(`backend did not answer ${HEALTH_PATH} in ${String(Math.round((options.timeoutMs ?? READY_TIMEOUT_MS) / 1000))} s (log: ${paths.logFile})`)
-      }
-      publishSearxState(env, 'up')
-      if (started) report('web · ready')
-      return { state: 'ready', managed: true, url, dataDir: paths.dataDir, detail: `ready at ${url}`, installed: true }
     } catch (error) {
       // Expected failures carry their own line; anything else is a bug in this
       // module but must still not take the CLI down with it.
@@ -842,38 +1235,104 @@ export async function ensureWebSearch(options: EnsureOptions = {}): Promise<WebS
   }
 }
 
+/** Options for `stopWebSearch`; the URL is injectable for the same reason as `webSearchStatus`. */
+export interface StopOptions {
+  /** Health target; defaults to `searxUrl(env)`. Tests point it at a closed port. */
+  url?: string
+  /** How long SIGTERM gets before SIGKILL; shortened in tests. */
+  graceMs?: number
+}
+
 /**
  * Stop the backend z1 started. Leaves an external instance alone, and leaves
  * the install in place: the next start only pays the spawn, not the download.
+ *
+ * Nothing is signalled unless the recorded identity still matches the pid: a
+ * recycled pid belongs to an unrelated program, and killing it is worse than
+ * leaving a listener running. When z1 cannot verify the process it says so and
+ * removes only its own record — a listener it never started is not its to stop.
  */
-export async function stopWebSearch(env: NodeJS.ProcessEnv = process.env): Promise<WebStatus> {
+export async function stopWebSearch(env: NodeJS.ProcessEnv = process.env, options: StopOptions = {}): Promise<WebStatus> {
   const paths = resolveWebPaths(env)
-  const url = searxUrl(env)
+  const url = options.url ?? searxUrl(env)
+  const graceMs = options.graceMs ?? 5000
   // z1 is no longer provisioning anything: drop the hint rather than claim a
   // phase the module would believe for 20 minutes.
   delete env[SEARX_STATE_ENV]
   if (isExternallyManaged(env)) {
     return { state: 'external', managed: false, url, dataDir: paths.dataDir, detail: 'not managed by z1', installed: false }
   }
-  const pid = readPid(paths.pidFile)
-  if (pid === undefined || !isProcessAlive(pid)) {
-    rmSync(paths.pidFile, { force: true })
-    return { state: 'stopped', managed: true, url, dataDir: paths.dataDir, detail: 'was not running', installed: isInstalled(paths) }
+
+  const record = readServerRecord(paths)
+  if (record === undefined) {
+    // Either nothing ran, or the record was deleted while the listener kept
+    // going. The second case is not ours to kill: only the record says what we
+    // started, and a bare pid is not an identity.
+    const legacy = readPid(paths.pidFile)
+    clearServerRecord(paths)
+    if (await checkHealth(url)) {
+      return {
+        state: 'ready',
+        managed: true,
+        url,
+        dataDir: paths.dataDir,
+        detail: `SearXNG is answering on ${url} but was not started by this z1; not stopping it`,
+        installed: isInstalled(paths),
+      }
+    }
+    return {
+      state: 'stopped',
+      managed: true,
+      url,
+      dataDir: paths.dataDir,
+      detail: legacy === undefined ? 'was not running' : `pid ${String(legacy)} has no recorded identity; nothing was signalled`,
+      installed: isInstalled(paths),
+    }
   }
+
+  const current = await processIdentity(record.pid)
+  if (!identityMatches(record, current)) {
+    clearServerRecord(paths)
+    if (await checkHealth(url)) {
+      return {
+        state: 'ready',
+        managed: true,
+        url,
+        dataDir: paths.dataDir,
+        detail: `SearXNG is answering on ${url} but was not started by this z1; not stopping it`,
+        installed: isInstalled(paths),
+      }
+    }
+    return {
+      state: 'stopped',
+      managed: true,
+      url,
+      dataDir: paths.dataDir,
+      detail: `refusing to signal pid ${String(record.pid)}: it is not this SearXNG`,
+      installed: isInstalled(paths),
+    }
+  }
+
+  const pid = record.pid
   try {
     process.kill(pid, 'SIGTERM')
   } catch {
-    // Gone between the check and the signal; the pid file is still stale.
+    // Gone between the check and the signal; the record is still stale.
   }
-  if (!(await waitForExit(pid, 5000))) {
-    try {
-      process.kill(pid, 'SIGKILL')
-    } catch {
-      // Same race, nothing left to do.
+  // SIGKILL only for the same verified process: the pid could have been reused
+  // during the grace period, and an unrelated program must not be killed for
+  // something we merely used to own.
+  if (!(await waitForExit(pid, graceMs))) {
+    if (identityMatches(record, await processIdentity(pid))) {
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {
+        // Same race, nothing left to do.
+      }
+      await waitForExit(pid, 2000)
     }
-    await waitForExit(pid, 2000)
   }
-  rmSync(paths.pidFile, { force: true })
+  clearServerRecord(paths)
   return {
     state: 'stopped',
     managed: true,
