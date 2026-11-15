@@ -17,6 +17,7 @@ import { argv, stdin, stdout } from 'node:process'
 import { createRuntime, loadRuntimeConfig } from '/home/oleksii/Projects/z1-sdk/z1/packages/bootstrap/src/index.ts'
 import type { Runtime, RunHandle } from '/home/oleksii/Projects/z1-sdk/z1/packages/bootstrap/src/index.ts'
 import { buildAgentGraph } from '/home/oleksii/Projects/z1-sdk/z1/packages/agent/src/index.ts'
+import type { ChatMessage } from '/home/oleksii/Projects/z1-sdk/z1/packages/node/src/index.ts'
 import { runGraph } from '/home/oleksii/Projects/z1-sdk/z1/packages/runtime/src/index.ts'
 import type { ApprovalService, RunEvent, RunResult } from '/home/oleksii/Projects/z1-sdk/z1/packages/runtime/src/index.ts'
 import { graphDigest } from '/home/oleksii/Projects/z1-sdk/z1/packages/graph/src/index.ts'
@@ -32,7 +33,6 @@ process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
   return (stderrWrite as (...args: unknown[]) => boolean)(chunk, ...rest)
 }) as typeof process.stderr.write
 
-type ChatMessage = { role: 'system' | 'user' | 'assistant' | 'tool'; content: string; toolCallId?: string; toolCalls?: unknown[] }
 type ModelHandle = { provider: string; model: string; credentialRef?: string; params?: Record<string, unknown> }
 type ToolSchema = Awaited<ReturnType<RunHandle['services']['tools']['list']>>[number]
 type MutableGraph = {
@@ -2592,54 +2592,6 @@ const usage = (print: (line?: string) => void): void => {
   print(`\n  ${dim('Type / for the menu; Ctrl-D also exits.')}\n`)
 }
 
-/**
- * Seed the previous transcript while keeping the **current** system prompt.
- *
- * The loop seed is `[promptHead, [history, newUser]]`: `promptHead` is rebuilt
- * from the prompt stack for this turn (memory, compaction, tool inventory). The
- * old version replaced the `promptHead` input with the whole history, so every
- * follow-up turn silently reused the previous system message — enabling a tool
- * mid-chat changed the request but the model still read "no tools".
- *
- * The history's own system message is dropped; the fresh `promptHead` supplies
- * it. Tool calls and tool results stay in order.
- */
-const seedHistory = (graph: unknown, history: readonly ChatMessage[]): unknown => {
-  if (history.length === 0) return graph
-  const previous = history.filter((message) => message.role !== 'system')
-  if (previous.length === 0) return graph
-  // The caller builds this graph for one turn and does not share it, so it is
-  // mutated in place: the caller owns the graph and discards it after the run.
-  const g = graph as MutableGraph
-  const loop = g.nodes.find(node => node['type'] === 'z1.flow.loop')
-  if (!loop) return graph
-  const loopId = String(loop['id'])
-  const seed = g.edges.find(edge => edge.to.node === loopId && edge.to.port === 'seed')
-  if (!seed) return graph
-  const concat = g.nodes.find(node => node['id'] === seed.from.node)
-  if (!concat || concat['type'] !== 'z1.core.concat') return graph
-  const concatId = String(concat['id'])
-
-  // `seed = concat(promptHead, seedUser)`, and `seedUser = concat(empty, user)`.
-  // Fill the empty constant; leave `promptHead` alone.
-  const userEdge = g.edges.find(edge => edge.to.node === concatId && edge.to.port === 'b')
-  if (!userEdge) return graph
-  const userConcat = g.nodes.find(node => node['id'] === userEdge.from.node)
-  if (!userConcat || userConcat['type'] !== 'z1.core.concat') return graph
-  const userConcatId = String(userConcat['id'])
-  const emptyEdge = g.edges.find(edge => edge.to.node === userConcatId && edge.to.port === 'a')
-  if (!emptyEdge) return graph
-  const empty = g.nodes.find(node => node['id'] === emptyEdge.from.node)
-  if (!empty || empty['type'] !== 'z1.core.const') return graph
-
-  const current = empty['config']
-  empty['config'] = {
-    ...(typeof current === 'object' && current !== null ? (current as Record<string, unknown>) : {}),
-    value: previous,
-  }
-  return g
-}
-
 /** Prompt for a y/N decision; `--once` has no terminal, so it always rejects. */
 const consoleApproval = (ask: (question: string) => Promise<string>): ApprovalService => ({
   async request(request) {
@@ -2784,13 +2736,17 @@ const runTurn = async (
     model,
     maxSteps,
     system: toolInventoryText(enabledSchemas, snapshot.installedCount, snapshot.inventoryKnown),
+    // The SDK owns history placement: it drops the transcript's own `system`
+    // entries and fills the loop seed, so the system prompt above is rebuilt
+    // from this turn's snapshot and the full previous transcript is safe here.
+    history,
     // An empty explicit list is "no override" in the SDK, which would ask the
     // guard per iteration; the guard's empty answer is the same, so omit it.
     ...(enabledSchemas.length > 0 ? { tools: enabledSchemas } : {}),
     ...(Number.isFinite(contextWindow) && contextWindow > 0 ? { contextWindow } : {}),
   })
   if (options.forceCompact === true) built = forceCompaction(built, options.lastTokens ?? 2_000)
-  const graph = seedHistory(built, history)
+  const graph = built
   const runId = `run_${randomUUID()}`
   const now = Date.now()
   runtime.journal.createRun({
