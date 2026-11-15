@@ -53,6 +53,107 @@ for (let split = 0; split <= BLOCK.length; split += 1) {
   assert.equal(text, '', 'the block and its line ending are gone')
 }
 
+// ------------------------------------------- the spaced form a model emitted
+// The reported text, exactly: the model put spaces inside the control token
+// (`<| DSML | calls>`), which the tight matcher left as ` calls>` prose.
+const SPACED = [
+  '<| DSML | calls>',
+  '<| DSML | invoke name="process.kill">',
+  '<| DSML | parameter name="id" string="true">bg_7c4fcd0d</| DSML | parameter>',
+  '</| DSML | invoke>',
+  '</| DSML | calls>',
+].join('\n')
+
+{
+  const spaced = sanitizeOutput(SPACED)
+  assert.equal(spaced.text, '', 'the spaced block leaves no text')
+  assert.equal(spaced.removed, true, 'and the caller is told something was removed')
+}
+
+for (let split = 0; split <= SPACED.length; split += 1) {
+  const sanitizer = createOutputSanitizer()
+  const text = sanitizer.push(SPACED.slice(0, split)) + sanitizer.push(SPACED.slice(split)) + sanitizer.flush()
+  assert.equal(text, '', `two spaced deltas split at ${String(split)} leak nothing`)
+}
+
+{
+  const sanitizer = createOutputSanitizer()
+  let text = ''
+  for (const char of SPACED) text += sanitizer.push(char)
+  text += sanitizer.flush()
+  assert.equal(text, '', 'one-byte deltas remove the spaced block too')
+}
+
+// Mixed shapes: models are inconsistent about the spacing from line to line.
+{
+  const mixed = [
+    '<|DSML| calls>',
+    '<| DSML | invoke name="process.kill">',
+    '<|DSML| parameter name="id" string="true">bg_7c4fcd0d</| DSML | parameter>',
+    '</| DSML | invoke>',
+    '</|DSML| calls>',
+  ].join('\n')
+  assert.equal(sanitizeOutput(mixed).text, '', 'tight and spaced markers pair inside one block')
+  for (let split = 0; split <= mixed.length; split += 1) {
+    const sanitizer = createOutputSanitizer()
+    const text = sanitizer.push(mixed.slice(0, split)) + sanitizer.push(mixed.slice(split)) + sanitizer.flush()
+    assert.equal(text, '', `a mixed block split at ${String(split)} leaks nothing`)
+  }
+}
+
+// Prose on both sides of a spaced block survives, at every split.
+for (const split of [0, 3, 17, 40, 61, 90, 120, 200]) {
+  const doc = `I cannot run that.\n${SPACED}\nDone.`
+  const sanitizer = createOutputSanitizer()
+  const text =
+    sanitizer.push(doc.slice(0, split)) + sanitizer.push(doc.slice(split)) + sanitizer.flush()
+  assert.equal(text, 'I cannot run that.\nDone.', `prose around a spaced block survives a split at ${String(split)}`)
+}
+
+// The same text inside a fence is code: nobody touches it.
+{
+  const fenced = `\`\`\`\n${SPACED}\n\`\`\``
+  assert.equal(sanitizeOutput(fenced).text, fenced, 'a fence holding the spaced block is untouched')
+  assert.equal(sanitizeOutput(fenced).removed, false, 'nothing was removed from the fence')
+  const sanitizer = createOutputSanitizer()
+  let text = ''
+  for (const char of fenced) text += sanitizer.push(char)
+  text += sanitizer.flush()
+  assert.equal(text, fenced, 'the fence survives one-byte deltas with the block inside')
+}
+
+// A `calls>` that is part of a sentence is prose, not a block opener.
+assert.equal(
+  sanitizeOutput('The tool makes calls> often, and the parameter is optional.').text,
+  'The tool makes calls> often, and the parameter is optional.',
+  'prose containing calls>/parameter survives',
+)
+assert.equal(
+  sanitizeOutput('The function calls invoke and parameter rows.').text,
+  'The function calls invoke and parameter rows.',
+  'a sentence using all three words is untouched',
+)
+assert.equal(
+  sanitizeOutput('A stray opener:\ncalls>\nthen ordinary prose continues.').text,
+  'A stray opener:\nthen ordinary prose continues.',
+  'a lone calls> line drops only itself, not the prose under it',
+)
+assert.equal(
+  sanitizeOutput('> a markdown quote\n> another one').text,
+  '> a markdown quote\n> another one',
+  'markdown blockquotes are prose',
+)
+
+// The turn-level result: nothing left, so the user sees the 0-tool notice.
+{
+  const clean = sanitizeOutput(SPACED).text
+  assert.deepEqual(
+    finalizeAssistantReply(clean, false),
+    { text: NO_TOOLS_NOTICE, notice: NO_TOOLS_NOTICE },
+    'the spaced block becomes the /tools notice, not blank text',
+  )
+}
+
 // ------------------------------------------------------ block inside prose
 assert.equal(
   sanitizeOutput(`I cannot run that.\n${BLOCK}\nDone.`).text,
