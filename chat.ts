@@ -34,6 +34,7 @@ import type {
 } from '/home/oleksii/Projects/z1-sdk/z1/packages/session/src/index.ts'
 
 import { ownStateText } from './workspace-state.ts'
+import { toolInventoryText } from './tool-inventory.ts'
 import { type ToolState } from './tool-policy.ts'
 import { ToolState as ToolStore } from './tool-state.ts'
 
@@ -2970,52 +2971,6 @@ const formatTokens = (value: number): string =>
   value < 1000 ? String(Math.round(value)) : `${(value / 1000).toFixed(1)}k`
 
 /**
- * A compact, authoritative list for the system prompt. The provider omits the
- * wire `tools` array when no tool is enabled, so without this block the model
- * has no way to know that it has none and tends to invent "basic" tools.
- *
- * Names only: the enabled tools' full JSON schemas already travel in the same
- * request, and short names keep the custom section negligible beside the
- * 6000-token prompt budget (the custom slot is dropped first when it overflows).
- */
-const toolInventoryText = (
-  enabled: readonly ToolSchema[],
-  total: number,
-  known: boolean,
-): string => {
-  const heading = '## Tools available this turn'
-  if (!known) {
-    // The guard reads the overlay on its own, so the request may well carry
-    // tools even though this read failed. Claiming "no tools" here told the
-    // model the opposite of what the wire said, so only promise the attached set.
-    return [
-      heading,
-      '',
-      'The tool inventory could not be read before this turn, so only the tools actually attached to this request are known. Do not claim or call any tool that is not offered to you. If the task needs a tool that is missing, say the tool service is unavailable.',
-    ].join('\n')
-  }
-  if (enabled.length === 0) {
-    return [
-      heading,
-      '',
-      'None. You have no tools this turn: you cannot read files, edit files, run commands, search, browse, or use any other tool. Do not claim to have done so. If the task needs a tool, say in one sentence which one, and ask the user to enable it with /tools.',
-    ].join('\n')
-  }
-  const names = enabled.map((tool) => `\`${tool.name}\``).join(', ')
-  const off = Math.max(0, total - enabled.length)
-  const count =
-    off > 0
-      ? `${String(enabled.length)} of ${String(total)} installed; ${String(off)} turned off`
-      : `all ${String(total)} installed`
-  return [
-    heading,
-    '',
-    `You have: ${names} (${count}).`,
-    'That list is the complete set. Never claim or call a tool not named here. Their schemas are attached to this request. If a task needs a missing tool, say which one and ask the user to enable it with /tools.',
-  ].join('\n')
-}
-
-/**
  * One user prompt: print `· working`, run the agent graph while reporting every
  * progress event, then keep the transcript for the next turn.
  */
@@ -3058,7 +3013,7 @@ const runTurn = async (
     model,
     maxSteps,
     system: [
-      toolInventoryText(enabledSchemas, snapshot.installedCount, snapshot.inventoryKnown),
+      toolInventoryText(snapshot),
       // Where z1 keeps its own state, in the same slot: without it the model
       // reads the transcript folder and `.z1/` as project files.
       options.cwd === undefined

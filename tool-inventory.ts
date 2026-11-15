@@ -1,0 +1,121 @@
+/**
+ * The one system-prompt section that tells the model which tools this turn has
+ * — and, just as importantly, which ones it does not.
+ *
+ * The provider omits the wire `tools` array when nothing is enabled, so without
+ * this block the model has no way to know it has none and invents "basic"
+ * tools. Naming only the enabled set was not enough: a session with `read`,
+ * `glob`, `grep` and `git.status` on and `write` off still let the model say
+ * "I'll check the workspace first, then build the file", run three read-only
+ * calls, and only then discover it could not write — then paste the whole file
+ * into the reply as a substitute. Naming the turned-off tools lets it say
+ * "writing files needs `write`, enable it with /tools" in the first sentence.
+ *
+ * Names only: the enabled tools' full JSON schemas already travel in the same
+ * request, and short names keep the section negligible beside the prompt budget
+ * (the custom slot is dropped first when it overflows).
+ *
+ * Pure: string building over a snapshot, no service calls. The caller decides
+ * what it knows; an unknown inventory still gets an honest, claim-free section.
+ */
+
+import type { ToolRecord, ToolSnapshot } from './tool-state.ts'
+
+/** The section heading, for callers that compose the slot themselves. */
+export const TOOL_INVENTORY_HEADING = '## Tools available this turn'
+
+/** A turned-off section that lists every name is a section that eats the prompt budget. */
+const MAX_OFF_NAMES = 24
+
+/**
+ * `` `a`, `b`, …, `x` and 6 more `` — record order, never truncated silently.
+ *
+ * `cap` is opt-in and only the turned-off line passes one: the enabled list is
+ * followed by "That list is the complete set", so capping it would make the
+ * prompt lie about a tool the request genuinely carries.
+ */
+const nameList = (records: readonly ToolRecord[], cap?: number): string => {
+  const kept = cap === undefined ? records : records.slice(0, cap)
+  const shown = kept.map((record) => `\`${record.name}\``)
+  const rest = records.length - shown.length
+  return rest > 0 ? `${shown.join(', ')} and ${String(rest)} more` : shown.join(', ')
+}
+
+/**
+ * Installed but not enabled: the tools the user could turn on with `/tools`.
+ * Orphan preferences (a decision about a tool no module ships now) are excluded,
+ * because `/tools on ghost` cannot make it callable.
+ */
+const turnedOff = (snapshot: ToolSnapshot): readonly ToolRecord[] =>
+  snapshot.records.filter((record) => record.installed && record.state !== 'enabled')
+
+const offLine = (snapshot: ToolSnapshot): string | undefined => {
+  const records = turnedOff(snapshot)
+  if (records.length === 0) return undefined
+  // A deleted tool is restorable, not merely disabled: `/tools on` refuses it.
+  const action = records.some((record) => record.state === 'deleted')
+    ? 'enable or restore with /tools'
+    : 'enable one with /tools'
+  return `Turned off: ${nameList(records, MAX_OFF_NAMES)} (${action}).`
+}
+
+/**
+ * The fail-fast rule. All four clauses matter: check before acting, name the
+ * missing tool in the first sentence, do not explore or promise first, and do
+ * not deliver the content inline instead of the file.
+ */
+const RULE =
+  'Before your first action, check the request against this list. If it needs a tool you do not have — creating or editing a file, running a command, reading a page — say so in your first sentence, name the missing tool, and ask the user to enable it with /tools. Do not explore first, do not promise the result, and do not paste the content as a substitute unless the user asks for it.'
+
+/** The same rule when the list is empty, so "this list" would name nothing. */
+const NO_TOOLS_RULE =
+  'Before your first action, check the request against what you have. If it needs any tool — creating or editing a file, running a command, reading a page — say so in your first sentence, name the tool you would need, and ask the user to enable it with /tools. Do not explore first, do not promise the result, and do not paste the content as a substitute unless the user asks for it.'
+
+/**
+ * The section body for the custom prompt slot.
+ *
+ * Four cases, each honest about what the request actually carries: an unknown
+ * inventory claims neither enabled nor disabled tools, an empty one says "no
+ * tools" plainly, and a partly enabled one names both halves.
+ */
+export function toolInventoryText(snapshot: ToolSnapshot): string {
+  if (!snapshot.inventoryKnown) {
+    // The guard reads the overlay on its own, so the request may well carry
+    // tools even though this read failed. Claiming "no tools" here told the
+    // model the opposite of what the wire said, so only promise the attached set.
+    return [
+      TOOL_INVENTORY_HEADING,
+      '',
+      'The tool inventory could not be read before this turn, so only the tools actually attached to this request are known. Do not claim or call any tool that is not offered to you. If the task needs a tool that is missing, say so in your first sentence and name it, before exploring, promising the result, or pasting the content as a substitute.',
+    ].join('\n')
+  }
+
+  if (snapshot.enabled.length === 0) {
+    const none = [
+      TOOL_INVENTORY_HEADING,
+      '',
+      'None. You have no tools this turn: you cannot read files, edit files, run commands, search, browse, or use any other tool. Do not claim to have done so.',
+    ]
+    const off = offLine(snapshot)
+    if (off !== undefined) none.push(off)
+    none.push(NO_TOOLS_RULE)
+    return none.join('\n')
+  }
+
+  const names = nameList(snapshot.enabled)
+  const off = Math.max(0, snapshot.installedCount - snapshot.enabled.length)
+  const count =
+    off > 0
+      ? `${String(snapshot.enabled.length)} of ${String(snapshot.installedCount)} installed; ${String(off)} turned off`
+      : `all ${String(snapshot.installedCount)} installed`
+  const body = [
+    TOOL_INVENTORY_HEADING,
+    '',
+    `You have: ${names} (${count}).`,
+    'That list is the complete set. Never claim or call a tool not named here. Their schemas are attached to this request.',
+  ]
+  const offNames = offLine(snapshot)
+  if (offNames !== undefined) body.push(offNames)
+  body.push(RULE)
+  return body.join('\n')
+}
