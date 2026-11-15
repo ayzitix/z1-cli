@@ -13,6 +13,13 @@
  * `z1-tools` may well allow `rm -rf z1`, so claiming the tools enforce this
  * would be a lie the model could discover.
  *
+ * The prohibition covers *changing* those directories, not reading them. A
+ * model asked "what session is this?" must be able to look, and since
+ * `z1-tools` 0.1.5 allows `read` there again (search still hides the store from
+ * `glob`/`grep`/`list`/`tree`), an over-broad rule only taught it to recite the
+ * rule and send the user to `/sessions`. So the section also states the chat's
+ * own identity when the caller knows it, and the answer costs no file read.
+ *
  * Pure: path arithmetic and string building only, no filesystem access. The
  * caller decides what it knows; an unknown root still gets the `.z1/` half.
  */
@@ -50,7 +57,12 @@ const displayRoot = (cwd: string, root: string): string => {
  * open — only the `.z1/` half is written, because a guessed transcript path is
  * worse than none: the model would describe the wrong directory as z1's state.
  */
-export function ownStateText(options: { cwd: string; sessionRoot?: string }): string {
+export function ownStateText(options: {
+  cwd: string
+  sessionRoot?: string
+  /** This chat's own identity, when the caller knows it; omitted from the text when absent. */
+  session?: { name: string; messageCount: number }
+}): string {
   const root: string =
     options.sessionRoot === undefined || options.sessionRoot.trim() === ''
       ? ''
@@ -61,10 +73,25 @@ export function ownStateText(options: { cwd: string; sessionRoot?: string }): st
       ? '`.z1/` is z1’s own state in this project: the todo list and spilled command output. It is not project content.'
       : `\`${root}\` is z1’s own state for this project: the saved chat transcripts. \`.z1/\` holds the todo list and spilled command output. Neither is project content.`
 
+  // The chat's own identity, so "what session is this?" is answered from the
+  // prompt instead of a file read or a recited rule. No id: it is long, and
+  // `/sessions` is the verb the user actually types.
+  const name = options.session?.name.trim() ?? ''
+  const count = options.session?.messageCount
+  const identity: string | undefined =
+    name === '' || count === undefined || !Number.isFinite(count) || count < 0
+      ? undefined
+      : `This chat is the session "${name}" with ${String(count)} ${count === 1 ? 'message' : 'messages'}; /sessions lists and switches.`
+
   const cleanup =
     root === ''
-      ? '- Do not read, edit, create, move or delete anything in `.z1/`, and never remove it to "clean up". This includes shell commands (`rm`, `mv`, `sed -i`, redirects).'
-      : '- Do not read, edit, create, move or delete anything in them, and never remove the folders to "clean up". This includes shell commands (`rm`, `mv`, `sed -i`, redirects).'
+      ? '- Do not edit, create, move or delete anything in `.z1/`, and never remove it to "clean up". This includes shell commands (`rm`, `mv`, `sed -i`, redirects).'
+      : '- Do not edit, create, move or delete anything in them, and never remove the folders to "clean up". This includes shell commands (`rm`, `mv`, `sed -i`, redirects).'
+
+  const allowed =
+    root === ''
+      ? '- Reading `.z1/` is allowed when the user asks about this chat; only changing it is out of bounds.'
+      : '- Reading them is allowed when the user asks about this chat: which session this is, how many messages, what was said earlier.'
 
   const describe =
     root === ''
@@ -75,9 +102,12 @@ export function ownStateText(options: { cwd: string; sessionRoot?: string }): st
     OWN_STATE_HEADING,
     '',
     where,
+    ...(identity === undefined ? [] : [identity]),
     cleanup,
+    allowed,
     describe,
-    root === ''
+    // `/sessions` is already named by the identity line; repeating it is noise.
+    root === '' || identity !== undefined
       ? '- The todo list is changed with `todo.write`, never by editing `.z1/todos.json`.'
       : '- The todo list is changed with `todo.write`, never by editing `.z1/todos.json`. The user switches transcripts with `/sessions`.',
   ].join('\n')

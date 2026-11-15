@@ -3030,6 +3030,8 @@ const runTurn = async (
     cwd?: string
     /** The store's absolute root, when one is known for this process. */
     sessionRoot?: string
+    /** This chat's own identity, so the prompt can answer "what session is this?". */
+    session?: { name: string; messageCount: number }
   } = {},
 ): Promise<TurnResult> => {
   const maxSteps = options.maxSteps ?? stepLimit(process.env['Z1_MAX_STEPS'])
@@ -3056,7 +3058,11 @@ const runTurn = async (
       // reads the transcript folder and `.z1/` as project files.
       options.cwd === undefined
         ? ''
-        : ownStateText({ cwd: options.cwd, sessionRoot: options.sessionRoot }),
+        : ownStateText({
+            cwd: options.cwd,
+            sessionRoot: options.sessionRoot,
+            session: options.session,
+          }),
     ]
       .filter(Boolean)
       .join('\n\n'),
@@ -4716,6 +4722,18 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
           // The store may have failed to open: the section then names `.z1/`
           // only, instead of a transcript directory this process never saw.
           sessionRoot: sessions?.root,
+          // `history` is the transcript this turn replays, so it is the count the
+          // user sees in `/sessions` and in the reopen banner — but `system`
+          // entries are not messages there: the store drops them before counting,
+          // and `outcome.history` hands them back, so an unfiltered length would
+          // run one (or more) ahead of every other count.
+          session:
+            activeSession === undefined
+              ? undefined
+              : {
+                  name: activeSession.meta.name,
+                  messageCount: history.filter((message) => message.role !== 'system').length,
+                },
         })
         forceCompact = false
         history = outcome.history

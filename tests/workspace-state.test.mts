@@ -41,11 +41,60 @@ assert.equal(ownStateText({ cwd, sessionRoot: '  ' }), none, 'a blank root is an
 
 // Shape: compact, bullet-only, and no claim that the tools enforce any of it.
 for (const text of [inside, nested, none]) {
-  assert.ok(bodyLines(text).length <= 9, 'the section stays under ten lines')
+  assert.ok(bodyLines(text).length <= 10, 'the section stays under ten lines')
   for (const line of bodyLines(text).slice(2)) {
     assert.ok(line.startsWith('- '), 'rules are plain bullets')
   }
   assert.ok(!/enforce|prevent|block/i.test(text), 'no claim that the tools enforce this')
+  assert.ok(!/do not read/i.test(text), 'reading is never forbidden')
+}
+
+// The chat's own identity: named, counted, and answered without a file read.
+const withSession = ownStateText({
+  cwd,
+  sessionRoot: join(cwd, 'z1'),
+  session: { name: 'Макет сайту аніме погоди', messageCount: 0 },
+})
+assert.ok(
+  withSession.includes(
+    'This chat is the session "Макет сайту аніме погоди" with 0 messages; /sessions lists and switches.',
+  ),
+  'the session line names this chat with its message count',
+)
+assert.ok(withSession.includes('`.z1/`'), 'the identity line does not replace the .z1/ half')
+assert.ok(bodyLines(withSession).length <= 10, 'the identity line fits the budget')
+assert.ok(
+  !/do not read/i.test(withSession),
+  'the prohibition covers changing, not reading',
+)
+assert.ok(
+  withSession.includes('Do not edit, create, move or delete'),
+  'changing the store is still forbidden',
+)
+assert.ok(
+  /do not list, count or reason/i.test(withSession),
+  'search still must not reason from the store',
+)
+// Only the identity line sits between the paragraph and the bullets.
+assert.equal(
+  bodyLines(withSession).filter((line) => !line.startsWith('- ')).length,
+  3,
+  'heading, paragraph and identity line: no second section',
+)
+
+const one = ownStateText({ cwd, session: { name: 'Tiny', messageCount: 1 } })
+assert.ok(one.includes('with 1 message;'), 'singular for one message')
+assert.ok(!one.includes('1 messages'), 'no plural after one')
+
+const many = ownStateText({ cwd, session: { name: 'Tiny', messageCount: 7 } })
+assert.ok(many.includes('with 7 messages;'), 'plural for many')
+
+// Unknown session: no line at all, never the word "undefined".
+const plain = ownStateText({ cwd, sessionRoot: join(cwd, 'z1') })
+for (const session of [undefined, { name: '   ', messageCount: 3 }, { name: 'X', messageCount: Number.NaN }]) {
+  const text = ownStateText({ cwd, sessionRoot: join(cwd, 'z1'), session })
+  assert.equal(text, plain, 'an unknown session drops the line')
+  assert.ok(!/undefined|NaN/.test(text), 'no placeholder leaks into the prompt')
 }
 
 console.log('workspace-state tests passed')
