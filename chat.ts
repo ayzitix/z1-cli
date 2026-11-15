@@ -263,7 +263,7 @@ interface Tail {
   idle(): void
   /** Forget the cached frame, e.g. after a status change. */
   repaint(): void
-  /** Clear the retained transcript in pinned mode; a no-op in native scrollback. */
+  /** Wipe the visible transcript (and, natively, the scrollback) and repaint the banner. */
   clear(): void
   /** Banner builder, rerun at the new width after a resize clears the view. */
   setHeader(build: () => string): void
@@ -2058,16 +2058,53 @@ const createTail = (options: { live?: boolean; pinned?: boolean } = {}): Tail =>
   }
 
   /**
-   * Opening another session should replace the visible transcript, not append
-   * a second copy of it. The alternate screen owns its history, so it can be
-   * cleared and repainted; the normal buffer's scrollback is the terminal's and
-   * is deliberately left alone.
+   * Opening another session, `/new` or `/clear` replaces the conversation, so
+   * the screen has to be replaced too: an emptied `history` above the old
+   * transcript reads as "nothing happened" (and a `/clear` right after `/new`
+   * answered "already empty" under the previous chat).
+   *
+   * Pinned mode owns the alternate screen, so dropping `history` and repainting
+   * is a full wipe there. Native mode does not own the terminal, so it wipes the
+   * viewport *and* the scrollback and reprints the banner, the same reset a
+   * width change performs: leaving the old screen one scroll up would put a
+   * second banner and a second conversation in scrollback, which is the bug the
+   * native `reflow` path exists to avoid. Without a live terminal there is
+   * nothing to wipe, and piped output must stay free of escapes.
    */
   const clear = (): void => {
-    if (!live || !pinned) return
+    if (!live) return
+    if (pinned) {
+      history = []
+      viewOffset = 0
+      frame = ''
+      paint()
+      return
+    }
+    // Erase the transient rows first: their absolute rows are about to go away.
+    clearPending()
+    clearActivity()
+    stdout.write('\x1b[r\x1b[2J\x1b[3J\x1b[1;1H')
     history = []
+    pending = ''
     viewOffset = 0
     frame = ''
+    drawn = false
+    regionSet = false
+    trayRows = 0
+    scrollBottom = 0
+    lastRows = 0
+    lastColumns = 0
+    pendingDrawn = 0
+    activityRow = undefined
+    // The banner is not part of `history` (the caller printed it once), so it
+    // has to be printed again before the first paint continues below it.
+    const rows = terminalRows()
+    const header = headerBuilder?.() ?? ''
+    const headerRows = header.length > 0 ? header.split('\n').length : 0
+    if (header.length > 0) {
+      stdout.write(`${header.split('\n').join('\r\n')}\r\n`)
+    }
+    outputRow = Math.min(rows, headerRows + 1)
     paint()
   }
 
@@ -3681,8 +3718,8 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       say(`session · ${loaded.meta.name} is already open`)
       return
     }
-    // Pinned mode owns its transcript; opening another chat replaces it. In
-    // native mode this is a no-op and the terminal's scrollback is left intact.
+    // Opening another chat replaces the visible one: the tail wipes the screen
+    // (and the scrollback) and reprints the banner before the new transcript.
     tail.clear()
     if (loaded.meta.color === undefined) {
       // Older transcripts predate the icon; persist a stable colour once so the
@@ -4448,6 +4485,8 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       lastContext = undefined
       lastTokens = 0
       forceCompact = false
+      // The state is gone; the screen has to say so before the confirmation.
+      tail.clear()
       say(
         'new conversation · nothing is saved until your first message · the previous session stays in /sessions',
       )
@@ -4461,16 +4500,23 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         lastTokens = 0
         forceCompact = false
       }
-      // No store: the transcript exists only in this process, so clearing it is
-      // real but nothing about it can be saved.
+      // The screen follows the transcript, so it is wiped in the same branch
+      // that empties it and never before: a store that refused to clear must
+      // leave the old chat visible, or the user reads "cleared" on an empty
+      // screen while the next prompt continues the conversation that is still
+      // on disk. Pinned mode and native scrollback both wipe here.
       if (sessions === undefined) {
+        // No store: the transcript exists only in this process, so clearing it
+        // is real but nothing about it can be saved.
         resetLive()
+        tail.clear()
         say('clear · cleared in this process only (sessions are not being saved)')
         refreshStatus()
         return 'continue'
       }
       if (currentSession === undefined) {
         resetLive()
+        tail.clear()
         say('clear · this conversation is already empty')
         refreshStatus()
         return 'continue'
@@ -4488,7 +4534,12 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         // Old text must not title a conversation that is now empty.
         pendingTitles.delete(id)
         resetLive()
+        // Only now: `sessions.clear(id)` returned, so the messages are gone and
+        // "this conversation is empty" is true on screen as well as on disk.
+        tail.clear()
       } catch (error) {
+        // The transcript still holds its messages, so the screen keeps showing
+        // them: the error is about a chat that is still there.
         sessionFailure(`could not clear ${id}`, error)
         refreshStatus()
         return 'continue'
