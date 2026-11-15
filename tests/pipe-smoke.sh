@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Pipe smoke: run the real console non-interactively (`/tools`, `/exit`) against
+# a temp DB and a temp tools.json, and assert the session exits cleanly with no
+# terminal escapes on stdout. Nothing here touches the real config or DB.
+set -u -o pipefail
+
+TSX="${Z1_SDK_REPO:-$HOME/Projects/z1-sdk}/node_modules/.bin/tsx"
+CHAT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/chat.ts"
+
+if [ ! -x "$TSX" ]; then
+  echo "FAIL: tsx not found at $TSX (set Z1_SDK_REPO)" >&2
+  exit 1
+fi
+if [ ! -f "$CHAT" ]; then
+  echo "FAIL: chat.ts not found at $CHAT" >&2
+  exit 1
+fi
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT INT TERM
+
+out="$tmp/stdout.txt"
+err="$tmp/stderr.txt"
+
+# Run from the temp dir so a repository config or workspace files can leak in.
+cd "$tmp" || exit 1
+printf '/tools\n/exit\n' | env \
+  Z1_DB="$tmp/runs.db" \
+  Z1_TOOLS_FILE="$tmp/tools.json" \
+  Z1_MODEL=mock/mock-1 \
+  Z1_PINNED=off \
+  Z1_TRAY=off \
+  Z1_MODULES_DIR="${Z1_MODULES_DIR:-$HOME/.local/share/z1/modules}" \
+  "$TSX" "$CHAT" >"$out" 2>"$err"
+code=$?
+
+if [ "$code" -ne 0 ]; then
+  echo "FAIL: chat exited $code" >&2
+  sed -n '1,20p' "$err" >&2
+  exit 1
+fi
+
+esc="$(grep -c $'\033' "$out" || true)"
+if [ "$esc" != "0" ]; then
+  echo "FAIL: stdout contains $esc lines with ESC bytes (piped output must be plain)" >&2
+  exit 1
+fi
+
+if ! grep -q 'tools ·' "$out"; then
+  echo "FAIL: /tools printed no 'tools ·' summary" >&2
+  sed -n '1,20p' "$out" >&2
+  exit 1
+fi
+
+echo "PASS: pipe smoke (exit 0, no ESC bytes, 'tools ·' present)"
