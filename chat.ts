@@ -2558,12 +2558,21 @@ const usage = (print: (line?: string) => void): void => {
 }
 
 /**
- * Replace the empty seed constant with the previous transcript. The agent
- * template starts the loop from `[]` and appends the new user message; seeding
- * the `a` input of that concat keeps tool calls and tool results intact.
+ * Seed the previous transcript while keeping the **current** system prompt.
+ *
+ * The loop seed is `[promptHead, [history, newUser]]`: `promptHead` is rebuilt
+ * from the prompt stack for this turn (memory, compaction, tool inventory). The
+ * old version replaced the `promptHead` input with the whole history, so every
+ * follow-up turn silently reused the previous system message — enabling a tool
+ * mid-chat changed the request but the model still read "no tools".
+ *
+ * The history's own system message is dropped; the fresh `promptHead` supplies
+ * it. Tool calls and tool results stay in order.
  */
 const seedHistory = (graph: unknown, history: readonly ChatMessage[]): unknown => {
   if (history.length === 0) return graph
+  const previous = history.filter((message) => message.role !== 'system')
+  if (previous.length === 0) return graph
   const g = structuredClone(graph) as MutableGraph
   const loop = g.nodes.find(node => node['type'] === 'z1.flow.loop')
   if (!loop) return graph
@@ -2573,17 +2582,24 @@ const seedHistory = (graph: unknown, history: readonly ChatMessage[]): unknown =
   const concat = g.nodes.find(node => node['id'] === seed.from.node)
   if (!concat || concat['type'] !== 'z1.core.concat') return graph
   const concatId = String(concat['id'])
-  const first = g.edges.find(edge => edge.to.node === concatId && edge.to.port === 'a')
-  if (!first) return graph
 
-  g.nodes.push({
-    id: 'historySeed',
-    type: 'z1.core.const',
-    version: '1.0.0',
-    config: { value: history },
-    position: { x: -260, y: 40 },
-  })
-  first.from = { node: 'historySeed', port: 'value' }
+  // `seed = concat(promptHead, seedUser)`, and `seedUser = concat(empty, user)`.
+  // Fill the empty constant; leave `promptHead` alone.
+  const userEdge = g.edges.find(edge => edge.to.node === concatId && edge.to.port === 'b')
+  if (!userEdge) return graph
+  const userConcat = g.nodes.find(node => node['id'] === userEdge.from.node)
+  if (!userConcat || userConcat['type'] !== 'z1.core.concat') return graph
+  const userConcatId = String(userConcat['id'])
+  const emptyEdge = g.edges.find(edge => edge.to.node === userConcatId && edge.to.port === 'a')
+  if (!emptyEdge) return graph
+  const empty = g.nodes.find(node => node['id'] === emptyEdge.from.node)
+  if (!empty || empty['type'] !== 'z1.core.const') return graph
+
+  const current = empty['config']
+  empty['config'] = {
+    ...(typeof current === 'object' && current !== null ? (current as Record<string, unknown>) : {}),
+    value: previous,
+  }
   return g
 }
 
