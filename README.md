@@ -175,7 +175,9 @@ In a terminal, `/sessions` opens the same kind of arrow picker as `/tools`:
 numbered text list instead. The first `z1` turn asks the current model for a
 2–6 word title from the first user message; a failed or too-long answer keeps
 the readable first-line fallback. Titles are stored in `meta.json`, so they
-survive a restart.
+survive a restart. Switching a session replays its user and assistant messages
+into the visible transcript (tool results stay in the JSONL), so the opened
+conversation is readable instead of a blank screen.
 
 ## Still raw
 

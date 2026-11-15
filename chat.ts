@@ -3534,6 +3534,54 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     return { ok: false, message: `sessions · no session "${wanted}" · /sessions --all lists everything` }
   }
 
+  /** A stored user turn, drawn with the same full-width bar as a live one. */
+  const printStoredUser = (text: string): void => {
+    for (const [index, part] of text.split('\n').entries()) {
+      const line = `${index === 0 ? '│ ' : '  '}${part}`
+      const bar = colorEnabled ? padTo(line, Math.max(1, terminalColumns() - 1)) : line
+      say(paint('48;5;237', bar))
+    }
+  }
+
+  /** A stored assistant turn: markdown for the text, compact rows for calls. */
+  const printStoredAssistant = (message: ChatMessage): void => {
+    let first = true
+    const printer = createMarkdownPrinter((line) => {
+      if (line.trim() === '' && first) return
+      say(first ? `${bold('⬢')} ${line}` : line)
+      first = false
+    })
+    if (message.content.length > 0) {
+      printer.push(message.content.endsWith('\n') ? message.content : `${message.content}\n`)
+      printer.flush()
+    }
+    for (const call of message.toolCalls ?? []) {
+      say(dim(`⬢ ${call.name}(${compactArgs(call.arguments)})`))
+    }
+  }
+
+  /**
+   * Replay a loaded transcript into the visible transcript. This is display
+   * only: `history` was already assigned, and the SDK builds a fresh system
+   * prompt on the next turn. Tool results are omitted because the assistant's
+   * call rows already say what ran; the stored JSONL keeps the full result.
+   */
+  const replaySession = (session: Session): void => {
+    say('')
+    if (session.messages.length === 0) {
+      say(dim('  (this session has no messages yet)'))
+      return
+    }
+    for (const message of session.messages) {
+      if (message.role === 'user') {
+        printStoredUser(message.content)
+      } else if (message.role === 'assistant') {
+        printStoredAssistant(message)
+        say('')
+      }
+    }
+  }
+
   /**
    * Make a stored transcript the live one. The runtime, its tools and its cwd
    * were built once for this directory, so a session from another checkout can
@@ -3582,6 +3630,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     say(
       `session · ${loaded.meta.name} · ${String(loaded.messages.length)} msgs${loaded.tornTail ? ' · the last line was incomplete and was dropped' : ''}`,
     )
+    replaySession(loaded)
     refreshStatus()
   }
 
