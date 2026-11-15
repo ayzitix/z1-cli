@@ -37,6 +37,7 @@ import type {
 import { ownStateText } from './workspace-state.ts'
 import { ensureWebSearch } from './web-service.ts'
 import { splitCommandAndPrompt, splitUnknownCommand } from './input.ts'
+import { createOutputSanitizer, finalizeAssistantReply, sanitizeOutput } from './output.ts'
 import { toolInventoryText } from './tool-inventory.ts'
 import { type ToolState } from './tool-policy.ts'
 import { ToolState as ToolStore } from './tool-state.ts'
@@ -3115,6 +3116,12 @@ const runTurn = async (
   progress.working('Thinking…')
 
   let streamed = false
+  // One sanitizer per turn: every streamed delta and the final text pass
+  // through it, so a block split across chunks cannot reach the screen or the
+  // saved transcript. Ordinary prose is returned immediately; only a markup
+  // candidate buffers.
+  const sanitizer = createOutputSanitizer()
+  let visible = ''
   const controller = new AbortController()
   activeAbort = controller
   let result: RunResult
@@ -3133,6 +3140,13 @@ const runTurn = async (
         onEvent: (event) => {
           if (event.type === 'node.stream' && event.port === 'text' && event.path.endsWith('/chat')) {
             streamed = true
+            const chunk = typeof event.chunk === 'string' ? event.chunk : ''
+            if (chunk.length === 0) return
+            const clean = sanitizer.push(chunk)
+            if (clean.length === 0) return
+            visible += clean
+            progress.event({ ...event, chunk: clean } as RunEvent)
+            return
           }
           progress.event(event)
         },
@@ -3154,10 +3168,27 @@ const runTurn = async (
   // A completed run's answer was streamed; print it only when nothing arrived
   // (a provider without streaming, or a mock that answers in one shot).
   activeAbort = undefined
-  const output = String(result.outputs['output'] ?? '')
-  if (result.status === 'completed' && !streamed && output.length > 0) {
-    progress.print(output)
+  const rest = sanitizer.flush()
+  if (rest.length > 0) {
+    visible += rest
+    progress.stream(rest)
   }
+  const rawOutput = String(result.outputs['output'] ?? '')
+  if (result.status === 'completed' && !streamed && rawOutput.length > 0) {
+    visible = sanitizer.push(rawOutput) + sanitizer.flush()
+    if (visible.length > 0) progress.print(visible)
+  }
+  // Empty after sanitizing: say what actually happened instead of leaving a
+  // blank turn (0 tools) or a silent one (markup with no tool call).
+  const toolsEnabled = snapshot.enabled.length > 0
+  const reply =
+    result.status === 'completed'
+      ? finalizeAssistantReply(visible, toolsEnabled)
+      : { text: visible, notice: undefined as string | undefined }
+  if (reply.notice !== undefined) {
+    progress.print(toolsEnabled ? reply.notice : dim(reply.notice))
+  }
+  const output = reply.text
 
   progress.settle(result.status, result.error)
 
@@ -3179,6 +3210,33 @@ const runTurn = async (
       const value = (event.outputs as Record<string, unknown> | undefined)?.['value']
       if (Array.isArray(value) && value.length > 0) next = value as ChatMessage[]
       if (next.length > 0) break
+    }
+  }
+  // The saved transcript is the other place markup could survive: apply the
+  // same rules to every assistant text the journal hands back, then make sure
+  // a markup-only turn is recorded as the notice the user actually saw.
+  if (next.length > 0) {
+    next = next.map((message) => {
+      if (message.role !== 'assistant') return message
+      const clean = sanitizeOutput(message.content).text
+      return clean === message.content ? message : { ...message, content: clean }
+    })
+    if (reply.notice !== undefined) {
+      let lastAssistant = -1
+      for (let index = next.length - 1; index >= 0; index -= 1) {
+        if (next[index]?.role === 'assistant') {
+          lastAssistant = index
+          break
+        }
+      }
+      if (lastAssistant >= 0) {
+        const last = next[lastAssistant]!
+        if (last.content.trim().length === 0) {
+          next[lastAssistant] = { ...last, content: reply.text }
+        }
+      } else if (result.status === 'completed') {
+        next.push({ role: 'assistant', content: reply.text })
+      }
     }
   }
   if (next.length === 0) {

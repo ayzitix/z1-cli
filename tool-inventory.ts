@@ -71,6 +71,17 @@ const RULE =
 const NO_TOOLS_RULE =
   'Before your first action, check the request against what you have. If it needs any tool — creating or editing a file, running a command, reading a page — say so in your first sentence, name the tool you would need, and ask the user to enable it with /tools. Do not explore first, do not promise the result, and do not paste the content as a substitute unless the user asks for it.'
 
+/**
+ * The no-markup rule. The fail-fast rule above still let a 0-of-27 session
+ * answer with raw provider syntax — `<|DSML| calls>`, `<invoke>`, `parameter`
+ * rows — which the terminal rendered verbatim. Naming the shapes keeps the
+ * model from imitating a call it cannot make, and the last sentence gives it
+ * the one honest alternative: a plain sentence and the /tools pointer.
+ */
+const NO_MARKUP_RULE =
+  'Do not write tool-call markup of any kind — no `<|...|>` tokens, no XML/DSML, no `invoke`/`parameter`/`function_call`/`tool_call` blocks, and no JSON that imitates a call. Answer in plain language. If the request needs a tool, say in one sentence which tool and ask the user to enable it with /tools.'
+
+
 /** The two tool names this rule is about; nothing else in this module names a tool. */
 const WEB_SEARCH = 'web.search'
 const WEB_FETCH = 'web.fetch'
@@ -135,6 +146,7 @@ export function toolInventoryText(snapshot: ToolSnapshot): string {
     ]
     const off = offLine(snapshot)
     if (off !== undefined) none.push(off)
+    none.push(NO_MARKUP_RULE)
     none.push(NO_TOOLS_RULE)
     return none.join('\n')
   }

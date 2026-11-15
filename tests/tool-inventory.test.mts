@@ -98,6 +98,36 @@ assert.ok(
 assert.ok(hasRule(none), 'the rule is adapted, not dropped, when nothing is enabled')
 assert.ok(!none.includes('You have:'), 'no enabled list to show')
 
+// The 0-of-27 failure: with no tools the model answered in raw DSML instead of
+// prose. The prompt now forbids the syntax, names its shapes, and gives the one
+// honest alternative.
+const NO_MARKUP_CLAUSES = [
+  'Do not write tool-call markup of any kind',
+  'no `<|...|>` tokens',
+  'no XML/DSML',
+  '`invoke`/`parameter`/`function_call`/`tool_call` blocks',
+  'no JSON that imitates a call',
+  'Answer in plain language',
+  'say in one sentence which tool and ask the user to enable it with /tools',
+]
+for (const clause of NO_MARKUP_CLAUSES) {
+  assert.ok(none.includes(clause), `the no-markup rule keeps: ${clause}`)
+}
+// Worst case is the 24-name cap plus "and N more": the none section must still
+// fit the slot budget the all-enabled case is measured against.
+const noneMany = toolInventoryText(
+  snapshot({ enabled: [], off: Array.from({ length: 30 }, (_, index) => `tool${String(index + 1)}`) }),
+)
+assert.ok(
+  noneMany.split(/\s+/).filter(Boolean).length < 220,
+  `the none branch stays under 220 words with a capped off line (got ${String(noneMany.split(/\s+/).filter(Boolean).length)})`,
+)
+assert.ok(
+  !toolInventoryText(snapshot({ enabled: ['read', 'write', 'shell'] })).includes('Do not write tool-call markup'),
+  'the clause belongs to the no-tools case',
+)
+
+
 // ----------------------------------------------------------------- all enabled
 const all = toolInventoryText(snapshot({ enabled: ['read', 'write', 'shell'] }))
 assert.ok(all.includes('You have: `read`, `write`, `shell` (all 3 installed).'), 'all-installed count')

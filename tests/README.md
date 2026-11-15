@@ -1,6 +1,6 @@
 # z1 CLI tests
 
-Eight dependency-free checks: no test framework, no network, nothing installed —
+Nine dependency-free checks: no test framework, no network, nothing installed —
 and deliberately **not** a full CLI suite.
 
 Prerequisites: `z1-sdk` at `~/Projects/z1-sdk` (or `Z1_SDK_REPO`), Node 24.9+,
@@ -16,6 +16,7 @@ From the repo root:
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/tool-inventory.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/workspace-state.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/input.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/output.test.mts
 tests/pipe-smoke.sh
 tests/session-smoke.sh
 tests/clear-wipe.sh
@@ -36,6 +37,10 @@ timeout, and the no-hang guarantee for `--once`. `input.test.mts` covers the
 unknown-command-plus-prompt split: `/foo` followed by text is reported as unknown
 and the text under it is still sent as a prompt, while an unknown command with
 nothing under it stays a single line.
+
+`output.test.mts`: the assistant-text sanitizer — a leaked `<|DSML| …>` tool-call
+block at every chunk split, end-of-sentence tokens, a partial token at flush,
+fenced code and ordinary `<div>` untouched, and the zero-tools notice policy.
 
 `tool-state.test.mts`: startup revision, same-order reload keeps it, a real change
 bumps/stales, `markListed`, orphan `installed: false`, guard frozen list vs
