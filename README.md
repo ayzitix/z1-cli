@@ -183,6 +183,8 @@ into the visible transcript (tool results stay in the JSONL), so the opened
 conversation is readable instead of a blank screen. Selecting the session that
 is already open is a no-op — it does not append a second copy — and opening a
 different session replaces the pinned transcript instead of stacking both.
+With `Z1_PINNED=off` the terminal owns scrollback, so switching appends there;
+selecting the same session is still a no-op.
 
 ## Still raw
 

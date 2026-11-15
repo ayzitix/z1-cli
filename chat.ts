@@ -3505,8 +3505,9 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       const model = shortModel(row.model.model)
       const updated = dim(relativeTime(row.updatedAt))
       const archived = row.archived ? dim(' · archived') : ''
+      const otherCwd = resolve(row.cwd) !== resolve(config.cwd) ? dim(' · other cwd') : ''
       say(
-        `  ${mark} ${String(index + 1).padStart(indexWidth)}  ${sessionIcon(row)} ${padTo(fit(row.name, nameWidth), nameWidth)}  ${String(row.messageCount).padStart(3)} msgs  ${dim(fit(model, 18))}  ${updated}${archived}`,
+        `  ${mark} ${String(index + 1).padStart(indexWidth)}  ${sessionIcon(row)} ${padTo(fit(row.name, nameWidth), nameWidth)}  ${String(row.messageCount).padStart(3)} msgs  ${dim(fit(model, 18))}  ${updated}${archived}${otherCwd}`,
       )
     }
     if (!includeArchived) say(dim('  /sessions --all includes archived · /sessions new [name] starts one'))
@@ -3614,11 +3615,18 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     }
   }
 
+  /** A stored tool result, clipped to one readable row. */
+  const printStoredTool = (message: ChatMessage): void => {
+    const text = message.content.replace(/\s+/g, ' ').trim()
+    if (text.length === 0) return
+    say(dim(`  ⎿ ${clip(text, Math.max(20, terminalColumns() - 5))}`))
+  }
+
   /**
    * Replay a loaded transcript into the visible transcript. This is display
    * only: `history` was already assigned, and the SDK builds a fresh system
-   * prompt on the next turn. Tool results are omitted because the assistant's
-   * call rows already say what ran; the stored JSONL keeps the full result.
+   * prompt on the next turn. Tool results are clipped to one row; the stored
+   * JSONL keeps the full result.
    */
   const replaySession = (session: Session): void => {
     say('')
@@ -3632,6 +3640,8 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       } else if (message.role === 'assistant') {
         printStoredAssistant(message)
         say('')
+      } else if (message.role === 'tool') {
+        printStoredTool(message)
       }
     }
   }
@@ -3751,16 +3761,18 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   }
 
   /** Strip quotes/labels so a model reply becomes a plain one-line title. */
-  const cleanTitle = (raw: string): string =>
-    raw
+  const cleanTitle = (raw: string): string => {
+    const cleaned = raw
       .trim()
       .replace(/^(?:title|session)\s*[:\-]\s*/i, '')
       .replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, '')
       .replace(/\s+/g, ' ')
       .replace(/[.!?。！？]+$/g, '')
       .trim()
-      .slice(0, 60)
-      .trim()
+    // `slice` is UTF-16-based; a cut inside a surrogate pair would store half
+    // an emoji as the session name. Take whole code points instead.
+    return Array.from(cleaned).slice(0, 60).join('').trim()
+  }
 
   /**
    * Ask the current model for a short title from the first user message. This
@@ -4218,7 +4230,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         rows.map((row) => ({
           id: row.id,
           name: row.name,
-          detail: `${String(row.messageCount)} msgs · ${shortModel(row.model.model)} · ${relativeTime(row.updatedAt)}`,
+          detail: `${String(row.messageCount)} msgs · ${shortModel(row.model.model)} · ${relativeTime(row.updatedAt)}${resolve(row.cwd) !== resolve(config.cwd) ? ' · other cwd' : ''}`,
           current: row.id === currentSession?.meta.id,
           archived: row.archived,
           color: sessionColorOf(row),
