@@ -313,12 +313,25 @@ const terminalRows = (): number => {
 
 type DisplayRow = { text: string; start: number; end: number }
 
-/** One slash command: the menu, `/help`, and Tab all read the same list. */
+/** One slash command: the menu, `/help`, dispatch, and Tab all read the same list. */
 interface CommandSpec {
   name: string
   description: string
   /** Present when the command takes arguments; Enter completes instead of running. */
   args?: string
+  /**
+   * The exact `usage: …` body, when the grammar is longer than `args` (for
+   * example an example value). Bare calls print this, so it is written once.
+   */
+  usage?: string
+  /**
+   * Any arguments belong to the handler instead of being a shape error. Only
+   * `/tools` needs this: its sub-grammar is parsed by `handleTools`, and it has
+   * no `args` so Enter runs the picker.
+   */
+  rest?: true
+  /** Extra `/help` rows under the command, one indented line each. */
+  help?: readonly string[]
 }
 
 /**
@@ -2571,23 +2584,56 @@ const stepLabel = (value: number): string =>
 const COMMANDS: readonly CommandSpec[] = [
   { name: '/help', description: 'show this help' },
   { name: '/new', description: 'start a fresh conversation' },
-  { name: '/model', description: 'switch the model', args: '<provider/model>' },
-  // No `args` here: Enter on a bare `/tools` must list, not complete. The
-  // toggle grammar is shown in the description and in `/help`.
-  { name: '/tools', description: 'tool picker; on/off/delete/restore <n|name>' },
+  {
+    name: '/model',
+    description: 'switch the model',
+    args: '<provider/model>',
+    usage: '/model provider/model',
+  },
+  // No `args` here: Enter on a bare `/tools` must run the picker, not
+  // complete. The sub-grammar lives in `handleTools`; `/help` spells it out.
+  {
+    name: '/tools',
+    description: 'tool picker; on/off/delete/restore <n|name>',
+    usage: '/tools [on|off|delete|restore|reset] <n|name> | /tools refresh | /tools --all',
+    rest: true,
+    help: ['reset · refresh · --all (all also shows stale entries)'],
+  },
   { name: '/context', description: 'show context usage' },
   { name: '/compact', description: 'compact the next turn' },
-  { name: '/window', description: 'set the context window', args: '<tokens>' },
-  { name: '/steps', description: 'set the step limit', args: '<n|off>' },
+  {
+    name: '/window',
+    description: 'set the context window',
+    args: '<tokens>',
+    usage: '/window <tokens>, e.g. /window 200000',
+  },
+  {
+    name: '/steps',
+    description: 'set the step limit',
+    args: '<n|off>',
+    usage: '/steps <n> | /steps off',
+  },
   { name: '/exit', description: 'quit z1' },
   { name: '/quit', description: 'quit z1 (same as /exit)' },
 ]
 
-const usage = (print: (line?: string) => void): void => {
+/** The spec behind a name; dispatch and usage text both start here. */
+const commandSpec = (name: string): CommandSpec | undefined =>
+  COMMANDS.find((command) => command.name === name)
+
+/** The body of `usage: …` for a known command, written only in the table. */
+const usageText = (name: string): string => {
+  const spec = commandSpec(name)
+  if (spec === undefined) return name
+  return spec.usage ?? (spec.args === undefined ? spec.name : `${spec.name} ${spec.args}`)
+}
+
+const printHelp = (print: (line?: string) => void): void => {
   print('')
   for (const command of COMMANDS) {
     const label = command.args === undefined ? command.name : `${command.name} ${command.args}`
     print(`  ${label.padEnd(24)} ${dim(command.description)}`)
+    for (const extra of command.help ?? []) print(`${' '.repeat(26)}${dim(extra)}`)
   }
   print(`\n  ${dim('Type / for the menu; Ctrl-D also exits.')}\n`)
 }
@@ -3278,7 +3324,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     const verb = (words[0] ?? '').toLowerCase()
     const selector = words.slice(1).join(' ').trim()
     if (!['on', 'off', 'delete', 'restore', 'reset'].includes(verb)) {
-      say('usage: /tools [on|off|delete|restore|reset] <n|name> | /tools refresh | /tools --all')
+      say(`usage: ${usageText('/tools')}`)
       return
     }
 
@@ -3388,6 +3434,84 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     say(`tools · ${name} on`)
   }
 
+  type CommandResult = 'continue' | 'exit'
+  type CommandHandler = (raw: string, rest: string) => CommandResult | Promise<CommandResult>
+
+  /**
+   * One handler per name; `COMMANDS` above is the only list. The dispatcher
+   * checks the shape from the same spec, so a bare call and a malformed one
+   * both report the table's text instead of a second copy of it.
+   */
+  const handlers: Record<string, CommandHandler> = {
+    '/help': () => {
+      printHelp(say)
+      return 'continue'
+    },
+    '/exit': () => 'exit',
+    '/quit': () => 'exit',
+    '/new': () => {
+      history = []
+      say('conversation cleared')
+      return 'continue'
+    },
+    '/model': (_raw, rest) => {
+      if (rest === '') {
+        say(`usage: ${usageText('/model')}`)
+        return 'continue'
+      }
+      const parsed = parseModelRef(rest)
+      if (!parsed.ok) {
+        // Same helper as `--model`/`Z1_MODEL`, but a bad `/model` keeps the
+        // session running: it is a command error, not a startup error.
+        say(`model · ${parsed.error}`)
+        return 'continue'
+      }
+      model = parsed.model
+      say(`model · ${modelLabel(model)}`)
+      return 'continue'
+    },
+    '/tools': async (raw) => {
+      await handleTools(raw)
+      return 'continue'
+    },
+    '/context': () => {
+      if (lastContext === undefined) {
+        say('context · no completed turn yet')
+      } else {
+        say(
+          `context · ${formatTokens(lastContext.tokens)}/${formatTokens(lastContext.window)} (${String(Math.round(lastContext.ratio * 100))}%)${lastContext.compactedTurns > 0 ? ` · compacted ${String(lastContext.compactedTurns)} turns` : ''}`,
+        )
+      }
+      return 'continue'
+    },
+    '/compact': () => {
+      forceCompact = true
+      lastTokens = lastContext?.tokens ?? lastTokens
+      say('context · compaction forced for the next turn')
+      return 'continue'
+    },
+    '/window': (_raw, rest) => {
+      const value = Number(rest)
+      if (!Number.isFinite(value) || value <= 0) {
+        say(`usage: ${usageText('/window')}`)
+        return 'continue'
+      }
+      contextWindow = Math.floor(value)
+      say(`window · ${formatTokens(contextWindow)}`)
+      return 'continue'
+    },
+    '/steps': (_raw, rest) => {
+      const value = Number(rest)
+      if (rest !== 'off' && (!Number.isInteger(value) || value < 1)) {
+        say(`usage: ${usageText('/steps')}`)
+        return 'continue'
+      }
+      maxSteps = rest === 'off' ? STEP_CEILING : Math.min(STEP_CEILING, value)
+      say(`steps · ${stepLabel(maxSteps)}`)
+      return 'continue'
+    },
+  }
+
   // A terminal drag emits many SIGWINCH events; clear and repaint once.
   let resizeTimer: NodeJS.Timeout | undefined
   process.on('SIGWINCH', () => {
@@ -3444,90 +3568,28 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         })
       }
 
-      if (line === '/exit' || line === '/quit') break
-      if (line === '/help') { usage(say); continue }
-      if (line === '/new') {
-        history = []
-        say('conversation cleared')
-        continue
-      }
-      if (line === '/context') {
-        if (lastContext === undefined) {
-          say('context · no completed turn yet')
-        } else {
-          say(
-            `context · ${formatTokens(lastContext.tokens)}/${formatTokens(lastContext.window)} (${Math.round(lastContext.ratio * 100)}%)${lastContext.compactedTurns > 0 ? ` · compacted ${lastContext.compactedTurns} turns` : ''}`,
-          )
-        }
-        continue
-      }
-      if (line.startsWith('/window ')) {
-        const value = Number(line.slice('/window '.length).trim())
-        if (!Number.isFinite(value) || value <= 0) {
-          say('usage: /window <tokens>, e.g. /window 200000')
-          continue
-        }
-        contextWindow = Math.floor(value)
-        say(`window · ${formatTokens(contextWindow)}`)
-        continue
-      }
-      if (line.startsWith('/steps ')) {
-        const raw = line.slice('/steps '.length).trim()
-        const value = Number(raw)
-        if (raw !== 'off' && (!Number.isInteger(value) || value < 1)) {
-          say('usage: /steps <n> | /steps off')
-          continue
-        }
-        maxSteps = raw === 'off' ? STEP_CEILING : Math.min(STEP_CEILING, value)
-        say(`steps · ${stepLabel(maxSteps)}`)
-        continue
-      }
-      if (line === '/compact') {
-        forceCompact = true
-        lastTokens = lastContext?.tokens ?? lastTokens
-        say('context · compaction forced for the next turn')
-        continue
-      }
-      if (line === '/tools' || line.startsWith('/tools ')) {
-        await handleTools(line)
-        continue
-      }
-      if (line === '/window') {
-        say('usage: /window <tokens>, e.g. /window 200000')
-        continue
-      }
-      if (line === '/steps') {
-        say('usage: /steps <n> | /steps off')
-        continue
-      }
-      if (line.startsWith('/model ')) {
-        const parsed = parseModelRef(line.slice('/model '.length))
-        if (!parsed.ok) {
-          // Same helper as `--model`/`Z1_MODEL`, but a bad `/model` keeps the
-          // session running: it is a command error, not a startup error.
-          say(`model · ${parsed.error}`)
-          continue
-        }
-        model = parsed.model
-        say(`model · ${modelLabel(model)}`)
-        continue
-      }
-      if (line === '/model') {
-        say('usage: /model provider/model')
-        continue
-      }
+      // One lookup for every slash command (see `COMMANDS` and `handlers`
+      // above). A handler runs when the spec's shape allows the arguments:
+      // `/exit now` is a shape error, and bare `/window` reaches its own
+      // handler so the usage text exists once, in the table.
       if (line.startsWith('/')) {
-        // A slash command is never sent to the model. A known name with the
-        // wrong shape gets its usage; anything else is a menu miss.
         const name = line.split(/\s+/, 1)[0] ?? line
-        const spec = COMMANDS.find((command) => command.name === name)
+        const rest = line.slice(name.length).trim()
+        const spec = commandSpec(name)
+        const handler = handlers[name]
+        const shapeOk = rest === '' || spec?.args !== undefined || spec?.rest === true
+        if (handler !== undefined && shapeOk) {
+          if ((await handler(line, rest)) === 'exit') break
+          continue
+        }
         if (spec !== undefined) {
-          say(spec.args === undefined ? `${name} takes no arguments` : `usage: ${name} ${spec.args}`)
+          say(spec.args === undefined ? `${name} takes no arguments` : `usage: ${usageText(name)}`)
         } else {
           say(`unknown command ${name} · type / for the menu`)
         }
         continue
       }
+
 
       composer?.setBusy(true)
       // A queued prompt may start while the picker is open; a running turn
