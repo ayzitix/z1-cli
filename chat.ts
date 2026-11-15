@@ -11,6 +11,7 @@
 import { execFileSync } from 'node:child_process'
 import { appendFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
+import { resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import { argv, stdin, stdout } from 'node:process'
 
@@ -21,6 +22,15 @@ import type { ChatMessage } from '/home/oleksii/Projects/z1-sdk/z1/packages/node
 import { runGraph } from '/home/oleksii/Projects/z1-sdk/z1/packages/runtime/src/index.ts'
 import type { ApprovalService, RunEvent, RunResult } from '/home/oleksii/Projects/z1-sdk/z1/packages/runtime/src/index.ts'
 import { graphDigest } from '/home/oleksii/Projects/z1-sdk/z1/packages/graph/src/index.ts'
+import {
+  SessionTooNewError,
+  createSessionStore,
+} from '/home/oleksii/Projects/z1-sdk/z1/packages/session/src/index.ts'
+import type {
+  Session,
+  SessionStore,
+  SessionSummary,
+} from '/home/oleksii/Projects/z1-sdk/z1/packages/session/src/index.ts'
 
 import { type ToolState } from './tool-policy.ts'
 import { ToolState as ToolStore } from './tool-state.ts'
@@ -2659,6 +2669,19 @@ const COMMANDS: readonly CommandSpec[] = [
     help: ['reset · refresh · --all (all also shows stale entries)'],
   },
   { name: '/context', description: 'show context usage' },
+  // Same shape as `/tools`: no `args`, so Enter on a bare `/sessions` lists
+  // instead of completing. `handleSessions` parses the sub-grammar.
+  {
+    name: '/sessions',
+    description: 'list, switch, rename, delete, archive',
+    usage:
+      '/sessions [--all | new [name] | <n|id|prefix> | rename <n|id> <name> | delete <n|id> | archive <n|id> | unarchive <n|id>]',
+    rest: true,
+    help: [
+      'bare lists the project’s sessions · a number switches',
+      'new · rename · delete (asks) · archive · unarchive · --all',
+    ],
+  },
   { name: '/compact', description: 'compact the next turn' },
   {
     name: '/window',
@@ -2726,6 +2749,8 @@ interface TurnResult {
   output: string
   error: string | undefined
   history: ChatMessage[]
+  /** The journal run this turn wrote; links the session turn to its provenance. */
+  runId: string
   context?: TurnContext
 }
 
@@ -2966,7 +2991,7 @@ const runTurn = async (
     }
   }
 
-  return { status: result.status, output, error: result.error, history: next, ...(context === undefined ? {} : { context }) }
+  return { status: result.status, output, error: result.error, history: next, runId, ...(context === undefined ? {} : { context }) }
 }
 
 interface Options {
@@ -3099,6 +3124,9 @@ const statusBar = (input: {
 
 const interactive = async (explicitModel: string | undefined): Promise<void> => {
   let model = startModel(explicitModel)
+  // `--model` and `/model` are instructions that survive a session switch; a
+  // model read from a transcript must not silently replace them.
+  let modelPinned = explicitModel !== undefined && explicitModel.trim().length > 0
   const config = loadRuntimeConfig({ cwd: process.cwd(), env: process.env, overrides: { live: true } })
   const runtime = await createRuntime(config)
   let history: ChatMessage[] = []
@@ -3181,6 +3209,271 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     say(dim(`  ${note} · /tools reset rewrites the file`))
   }
   reportPrefsError()
+
+  /**
+   * Project-local transcripts. The store is opened once — `list()` must work
+   * before the first prompt, otherwise a returning user could not resume — but
+   * no session is created or resumed until the user actually says something.
+   *
+   * Every store failure is caught: a read-only checkout, a corrupt transcript
+   * or a session from a newer z1 must leave a working chat, not a crash.
+   */
+  let reportedSessionError: string | undefined
+  const sessionFailure = (what: string, error: unknown): void => {
+    const line =
+      error instanceof SessionTooNewError
+        ? `session · ${what}: written by a newer z1 (schemaVersion ${String(error.schemaVersion)}) and not readable here`
+        : `session · ${what}: ${error instanceof Error ? error.message : String(error)}`
+    // Report once per distinct problem: a read-only root would otherwise print
+    // the same line before every turn.
+    if (reportedSessionError === line) return
+    reportedSessionError = line
+    say(red(line))
+    say(dim('  the chat keeps working, but this conversation is not being saved'))
+  }
+
+  let sessions: SessionStore | undefined
+  try {
+    sessions = createSessionStore({ cwd: config.cwd, env: process.env })
+  } catch (error) {
+    sessions = undefined
+    sessionFailure('could not open the store', error)
+  }
+
+  let currentSession: Session | undefined
+  /** The rows of the last printed listing; numbers resolve against it. */
+  let listedSessions: readonly SessionSummary[] = []
+
+  const relativeTime = (ms: number): string => {
+    const delta = Date.now() - ms
+    if (!Number.isFinite(delta) || delta < 45_000) return 'just now'
+    const minutes = Math.round(delta / 60_000)
+    if (minutes < 60) return `${String(minutes)}m ago`
+    const hours = Math.round(delta / 3_600_000)
+    if (hours < 24) return `${String(hours)}h ago`
+    const days = Math.round(delta / 86_400_000)
+    if (days < 7) return `${String(days)}d ago`
+    const date = new Date(ms)
+    const pad = (value: number): string => String(value).padStart(2, '0')
+    return `${String(date.getFullYear())}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+  }
+
+  const shortModel = (name: string): string => name.slice(name.lastIndexOf('/') + 1)
+
+  /**
+   * `/sessions`: one header with the root and its mode, then one row per
+   * session. `*` is the one this process is talking to. Numbers are bound to
+   * this printing, like `/tools` numbers are bound to their revision.
+   */
+  const printSessions = (includeArchived: boolean): void => {
+    if (sessions === undefined) {
+      say(red('sessions · the store is unavailable (see above)'))
+      return
+    }
+    let rows: readonly SessionSummary[]
+    try {
+      rows = sessions.list({ includeArchived })
+    } catch (error) {
+      sessionFailure('could not list', error)
+      return
+    }
+    listedSessions = rows
+    const noun = rows.length === 1 ? 'session' : 'sessions'
+    say(
+      `${bold('sessions')} · ${String(rows.length)} ${noun} in ${shortPath(sessions.root)} (${sessions.mode})`,
+    )
+    if (rows.length === 0) {
+      say(
+        dim(
+          includeArchived
+            ? '  none yet · one starts with your next prompt'
+            : '  none active · /sessions --all also shows archived ones',
+        ),
+      )
+      return
+    }
+    const currentId = currentSession?.meta.id
+    const indexWidth = String(rows.length).length
+    const nameWidth = Math.min(34, Math.max(4, ...rows.map((row) => displayCells(row.name))))
+    for (const [index, row] of rows.entries()) {
+      const mark = row.id === currentId ? green('*') : ' '
+      const model = shortModel(row.model.model)
+      const updated = dim(relativeTime(row.updatedAt))
+      const archived = row.archived ? dim(' · archived') : ''
+      say(
+        `  ${mark} ${String(index + 1).padStart(indexWidth)}  ${padTo(fit(row.name, nameWidth), nameWidth)}  ${String(row.messageCount).padStart(3)} msgs  ${dim(fit(model, 18))}  ${updated}${archived}`,
+      )
+    }
+    if (!includeArchived) say(dim('  /sessions --all includes archived · /sessions new [name] starts one'))
+  }
+
+  /** Every session, archived included — resolution must not miss one. */
+  const allSessions = (): readonly SessionSummary[] => {
+    if (sessions === undefined) return []
+    try {
+      return sessions.list({ includeArchived: true })
+    } catch (error) {
+      sessionFailure('could not list', error)
+      return []
+    }
+  }
+
+  type SessionRef = { ok: true; summary: SessionSummary } | { ok: false; message: string }
+
+  /**
+   * `n` from the last listing, else an id, else a unique id prefix, else a
+   * name. Ambiguity is an error: picking the wrong transcript silently is worse
+   * than making the user type six more characters.
+   */
+  const resolveSessionRef = (selector: string): SessionRef => {
+    const wanted = selector.trim()
+    if (wanted === '') return { ok: false, message: 'sessions · which one? /sessions shows the numbers' }
+    if (/^\d+$/.test(wanted)) {
+      // A fresh process has no printed listing, but `/sessions 1` is the first
+      // thing a returning user types. Treat the current active list as the
+      // implicit listing until a real print pins one.
+      if (listedSessions.length === 0) {
+        try {
+          listedSessions = sessions?.list({ includeArchived: false }) ?? []
+        } catch (error) {
+          sessionFailure('could not list', error)
+          listedSessions = []
+        }
+      }
+      const number = Number(wanted)
+      const hit = number >= 1 ? listedSessions[number - 1] : undefined
+      if (hit === undefined) {
+        return {
+          ok: false,
+          message:
+            listedSessions.length === 0
+              ? 'sessions · none yet · one starts with your next prompt'
+              : `sessions · ${wanted} is not in the list (1–${String(listedSessions.length)})`,
+        }
+      }
+      return { ok: true, summary: hit }
+    }
+    const pool = allSessions()
+    const exact = pool.find((row) => row.id === wanted)
+    if (exact !== undefined) return { ok: true, summary: exact }
+    const prefixed = pool.filter((row) => row.id.startsWith(wanted))
+    if (prefixed.length === 1) return { ok: true, summary: prefixed[0]! }
+    if (prefixed.length > 1) {
+      return {
+        ok: false,
+        message: `sessions · "${wanted}" matches ${String(prefixed.length)} ids · use more characters`,
+      }
+    }
+    const named = pool.filter((row) => row.name === wanted)
+    if (named.length === 1) return { ok: true, summary: named[0]! }
+    if (named.length > 1) {
+      return {
+        ok: false,
+        message: `sessions · ${String(named.length)} sessions are named "${wanted}" · use an id instead`,
+      }
+    }
+    const loose = pool.filter((row) => row.name.toLowerCase().includes(wanted.toLowerCase()))
+    if (loose.length === 1) return { ok: true, summary: loose[0]! }
+    if (loose.length > 1) {
+      return {
+        ok: false,
+        message: `sessions · "${wanted}" matches ${String(loose.length)} names · be more specific`,
+      }
+    }
+    return { ok: false, message: `sessions · no session "${wanted}" · /sessions --all lists everything` }
+  }
+
+  /**
+   * Make a stored transcript the live one. The runtime, its tools and its cwd
+   * were built once for this directory, so a session from another checkout can
+   * only be refused — never silently run against the wrong repository.
+   */
+  const switchSession = (summary: SessionSummary): void => {
+    if (sessions === undefined) {
+      say(red('sessions · the store is unavailable (see above)'))
+      return
+    }
+    if (summary.archived) {
+      say(`sessions · ${summary.name} is archived · /sessions unarchive ${summary.id} first`)
+      return
+    }
+    let loaded: Session | undefined
+    try {
+      loaded = sessions.load(summary.id)
+    } catch (error) {
+      sessionFailure(`could not read ${summary.id}`, error)
+      return
+    }
+    if (loaded === undefined) {
+      say(red(`sessions · ${summary.id} disappeared while it was being opened`))
+      return
+    }
+    if (resolve(loaded.meta.cwd) !== resolve(config.cwd)) {
+      say(red(`session · belongs to ${loaded.meta.cwd}`))
+      say(dim('  this process is bound to the directory it started in'))
+      return
+    }
+    currentSession = loaded
+    history = [...loaded.messages]
+    lastContext = undefined
+    lastTokens = 0
+    forceCompact = false
+    contextWindow = loaded.meta.contextWindow
+    maxSteps = loaded.meta.maxSteps
+    // An explicit `--model` or `/model` outlives a switch; otherwise the
+    // transcript's model comes back with it.
+    if (!modelPinned) model = { provider: loaded.meta.model.provider, model: loaded.meta.model.model }
+    try {
+      sessions.setCurrent(loaded.meta.id)
+    } catch (error) {
+      sessionFailure('could not mark the current session', error)
+    }
+    say(
+      `session · ${loaded.meta.name} · ${String(loaded.messages.length)} msgs${loaded.tornTail ? ' · the last line was incomplete and was dropped' : ''}`,
+    )
+    refreshStatus()
+  }
+
+  /**
+   * The first prompt of a conversation creates its session. A failed create
+   * (read-only root, deleted parent) leaves the chat running without one.
+   */
+  const ensureSession = (prompt: string): Session | undefined => {
+    if (currentSession !== undefined) return currentSession
+    if (sessions === undefined) return undefined
+    try {
+      const created = sessions.create({
+        name: prompt.replace(/\s+/g, ' ').trim().slice(0, 60) || undefined,
+        cwd: config.cwd,
+        gitBranch: branch,
+        model: { provider: model.provider, model: model.model },
+        contextWindow,
+        maxSteps,
+        toolPolicyRevision: tools.current.revision,
+      })
+      sessions.setCurrent(created.meta.id)
+      currentSession = created
+      return created
+    } catch (error) {
+      sessionFailure('could not save this conversation', error)
+      return undefined
+    }
+  }
+
+  /**
+   * Autosave one turn. Called for completed, failed and cancelled runs alike:
+   * the store appends only the new tail (or one snapshot when the transcript
+   * was rewritten by compaction) and ignores a no-op.
+   */
+  const saveTurn = (session: Session, messages: readonly ChatMessage[], runId: string): void => {
+    if (sessions === undefined) return
+    try {
+      sessions.appendTurn(session.meta.id, messages, { runId })
+      currentSession = sessions.load(session.meta.id) ?? session
+    } catch (error) {
+      sessionFailure('could not save this turn', error)
+    }
+  }
 
   const complete = (value: string, cursor: number): { value: string; cursor: number; message?: string } | undefined => {
     const before = value.slice(0, cursor)
@@ -3493,6 +3786,172 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     say(`tools · ${name} on`)
   }
 
+  /**
+   * `/sessions` — the whole sub-grammar, declared once in `COMMANDS`. Bare and
+   * `--all` list; everything else is a verb or a selector.
+   */
+  const handleSessions = async (line: string): Promise<void> => {
+    const rest = line.slice('/sessions'.length).trim()
+    if (rest === '') {
+      printSessions(false)
+      return
+    }
+    if (rest === '--all' || rest === 'all') {
+      printSessions(true)
+      return
+    }
+
+    const words = rest.split(/\s+/)
+    const verb = (words[0] ?? '').toLowerCase()
+    const tail = rest.slice((words[0] ?? '').length).trim()
+
+    if (verb === 'new') {
+      if (sessions === undefined) {
+        say(red('sessions · the store is unavailable (see above)'))
+        return
+      }
+      try {
+        const created = sessions.create({
+          name: tail === '' ? undefined : tail,
+          cwd: config.cwd,
+          gitBranch: branch,
+          model: { provider: model.provider, model: model.model },
+          contextWindow,
+          maxSteps,
+          toolPolicyRevision: tools.current.revision,
+        })
+        sessions.setCurrent(created.meta.id)
+        currentSession = created
+        history = []
+        lastContext = undefined
+        lastTokens = 0
+        forceCompact = false
+        say(`session · started "${created.meta.name}" · ${created.meta.id}`)
+        refreshStatus()
+        printSessions(false)
+      } catch (error) {
+        sessionFailure('could not create a session', error)
+      }
+      return
+    }
+
+    if (verb === 'rename') {
+      const space = tail.search(/\s/)
+      if (space < 0) {
+        say(`usage: /sessions rename <n|id> <name>`)
+        return
+      }
+      const ref = tail.slice(0, space)
+      const name = tail.slice(space).trim()
+      const resolved = resolveSessionRef(ref)
+      if (!resolved.ok) {
+        say(resolved.message)
+        return
+      }
+      if (sessions === undefined) return
+      try {
+        sessions.rename(resolved.summary.id, name)
+        if (currentSession?.meta.id === resolved.summary.id) {
+          currentSession = { ...currentSession, meta: { ...currentSession.meta, name } }
+        }
+        say(`sessions · renamed to "${name}"`)
+        printSessions(false)
+      } catch (error) {
+        sessionFailure('could not rename', error)
+      }
+      return
+    }
+
+    if (verb === 'delete') {
+      if (tail === '') {
+        say(`usage: /sessions delete <n|id>`)
+        return
+      }
+      const resolved = resolveSessionRef(tail)
+      if (!resolved.ok) {
+        say(resolved.message)
+        return
+      }
+      const target = resolved.summary
+      // Destructive and irreversible from inside the chat (the directory moves
+      // to `.trash`, but nothing here restores it), so it always asks first.
+      const answer = await askLine(`delete session "${target.name}" (${target.id})? [y/N]`)
+      if (!answer.trim().toLowerCase().startsWith('y')) {
+        say(dim('sessions · not deleted'))
+        return
+      }
+      if (sessions === undefined) return
+      try {
+        sessions.remove(target.id)
+      } catch (error) {
+        sessionFailure(`could not delete ${target.id}`, error)
+        return
+      }
+      if (currentSession?.meta.id === target.id) {
+        // The live transcript is gone: the next prompt starts a new session.
+        currentSession = undefined
+        history = []
+        lastContext = undefined
+        lastTokens = 0
+        forceCompact = false
+        refreshStatus()
+      }
+      say(`sessions · deleted "${target.name}" · moved to .trash`)
+      printSessions(false)
+      return
+    }
+
+    if (verb === 'archive' || verb === 'unarchive') {
+      if (tail === '') {
+        say(`usage: /sessions ${verb} <n|id>`)
+        return
+      }
+      const resolved = resolveSessionRef(tail)
+      if (!resolved.ok) {
+        say(resolved.message)
+        return
+      }
+      if (sessions === undefined) return
+      const archived = verb === 'archive'
+      if (archived === resolved.summary.archived) {
+        say(
+          `sessions · "${resolved.summary.name}" is already ${archived ? 'archived' : 'active'}`,
+        )
+        return
+      }
+      try {
+        sessions.archive(resolved.summary.id, archived)
+      } catch (error) {
+        sessionFailure(`could not ${verb} ${resolved.summary.id}`, error)
+        return
+      }
+      if (archived && currentSession?.meta.id === resolved.summary.id) {
+        // Archiving the live transcript takes it out of the list, so this
+        // process stops writing to it; the next prompt starts a new session.
+        currentSession = undefined
+        history = []
+        lastContext = undefined
+        lastTokens = 0
+        forceCompact = false
+        refreshStatus()
+        say(`sessions · archived "${resolved.summary.name}" · a new session starts with your next prompt`)
+      } else {
+        say(`sessions · ${archived ? 'archived' : 'restored'} "${resolved.summary.name}"`)
+      }
+      printSessions(archived ? false : true)
+      return
+    }
+
+    // No verb: the whole of `rest` is a selector, so ids and numbers work
+    // exactly as they were printed.
+    const resolved = resolveSessionRef(rest)
+    if (!resolved.ok) {
+      say(resolved.message)
+      return
+    }
+    switchSession(resolved.summary)
+  }
+
   type CommandResult = 'continue' | 'exit'
   type CommandHandler = (raw: string, rest: string) => CommandResult | Promise<CommandResult>
 
@@ -3509,8 +3968,15 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     '/exit': () => 'exit',
     '/quit': () => 'exit',
     '/new': () => {
+      // A fresh conversation is a fresh session: this one stays on disk and
+      // stays listed, and the next prompt creates its replacement.
       history = []
-      say('conversation cleared')
+      currentSession = undefined
+      lastContext = undefined
+      lastTokens = 0
+      forceCompact = false
+      say('conversation cleared · a new session starts with your next prompt')
+      refreshStatus()
       return 'continue'
     },
     '/model': (_raw, rest) => {
@@ -3526,7 +3992,13 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         return 'continue'
       }
       model = parsed.model
+      // An explicit choice outlives a `/sessions` switch.
+      modelPinned = true
       say(`model · ${modelLabel(model)}`)
+      return 'continue'
+    },
+    '/sessions': async (raw) => {
+      await handleSessions(raw)
       return 'continue'
     },
     '/tools': async (raw) => {
@@ -3656,6 +4128,9 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       composer?.closeToolMenu()
       const progress = createProgress(tail)
       const handle = await runtime.beginRun({ approval })
+      // The first prompt of a conversation creates its session; later prompts
+      // keep using it. A store failure returns undefined and the turn still runs.
+      const activeSession = ensureSession(line)
       try {
         const outcome = await runTurn(runtime, handle, model, history, line, progress, {
           forceCompact,
@@ -3666,6 +4141,9 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         })
         forceCompact = false
         history = outcome.history
+        // A failed or cancelled turn is saved too: the store writes whichever
+        // transcript this turn produced and no-ops when nothing changed.
+        if (activeSession !== undefined) saveTurn(activeSession, outcome.history, outcome.runId)
         if (outcome.context !== undefined) {
           lastContext = outcome.context
           lastTokens = outcome.context.tokens

@@ -99,6 +99,7 @@ repo.
 | `Z1_CONTEXT_WINDOW` | Context window in tokens (default `128000`). |
 | `Z1_MAX_STEPS` | Max graph steps per turn; `0`/`off` means the SDK ceiling (10000). |
 | `Z1_TOOLS_FILE` | Tool enablement overlay. Default `$XDG_CONFIG_HOME/z1/tools.json` (usually `~/.config/z1/tools.json`). |
+| `Z1_SESSIONS_DIR` | Override the session root. Default: the nearest repo’s `z1/`, else `~/.local/share/z1/projects/<name>-<hash>/z1`. |
 | `NO_COLOR` | Disable all colour when set (any value). |
 | `Z1_TRAY=off` | Plain readline UI instead of the pinned tray; also used for pipes. |
 | `Z1_PINNED=off` | Keep the tray but use normal scrollback instead of the alternate screen. |
@@ -137,8 +138,35 @@ repo.
   enabled the key is absent from the request. The model can now answer "what
   tools do you have?" and cannot invent a disabled one. Names only, so the block
   is about 40 tokens.
+- **Sessions**: every turn is appended to `z1/sessions/<id>/{meta,events.jsonl}`
+  in the project (ignored through `.git/info/exclude`). `/sessions` lists,
+  switches, renames, archives and deletes; the next prompt after `/new` or a
+  delete starts a new one. The transcript is authoritative; `runs.db` is only
+  provenance. `--once` never creates a session.
 - **Pipes and `Z1_TRAY=off`**: readline path with `\` line continuation, no
   alternate screen and no escape sequences emitted; `Ctrl-C` cancels a run.
+
+## Sessions
+
+The transcript lives with the project:
+
+```
+<project>/z1/
+  .gitignore          # "*" + "!.gitignore"
+  .z1-sessions        # ownership marker
+  latest.json
+  sessions/<id>/
+    meta.json         # model, cwd, context, max steps, run ids, message count
+    events.jsonl      # append-only user/assistant/tool messages, or one snapshot
+  .trash/             # deleted sessions, never erased by /sessions delete
+```
+
+`z1/` is added to `.git/info/exclude`, so sessions never dirty `git status`.
+If a repo already has a non-session `z1/` (the SDK source tree is the real
+example), the store falls back to
+`~/.local/share/z1/projects/<name>-<hash>/z1` instead of writing into it.
+`Z1_SESSIONS_DIR` overrides both. Messages are the source of truth; `runs.db`
+is linked through `meta.runs` but is never replayed to rebuild a chat.
 
 ## Still raw
 
@@ -174,6 +202,9 @@ repo.
   re-enable one tool if a provider rejects it.
 - Slash commands are interactive. `--once "/tools ..."` is rejected with exit
   code 2 instead of being sent to the model.
+- Session storage is M1: a text list, no picker yet; no lock file, blob spill
+  for huge tool output, rebuildable index, fork or retention. A session from a
+  different `cwd` is refused because the runtime is bound to this directory.
 
 ## Keys
 
@@ -196,7 +227,7 @@ repo.
 
 ```
 /help              show help
-/new               start a fresh conversation
+/new               start a fresh conversation (a new session on the next prompt)
 /model <p/m>       switch model
 /tools             interactive picker: ↑↓, Enter toggle, Delete remove, Esc close
 /tools off <n|name|all>  hide a tool (or all) from the agent
@@ -206,6 +237,12 @@ repo.
 /tools reset             clear every tool preference
 /tools refresh           re-read the installed module inventory
 /tools --all             include stale entries for tools no longer installed
+/sessions          list saved sessions; a number switches (or a full id/prefix)
+/sessions --all    include archived sessions
+/sessions new [name]     create and switch to a new session
+/sessions rename <n|id> <name>  rename
+/sessions delete <n|id>  confirm, then move to .trash
+/sessions archive <n|id> / unarchive <n|id>
 /context           show context usage
 /compact           compact the next turn
 /window <tokens>   set the context window
@@ -215,17 +252,20 @@ repo.
 
 ## Tests
 
-Two dependency-free checks live in `tests/` (no framework, no network):
+Three dependency-free checks live in `tests/` (no framework, no network):
 
 ```bash
 tests/pipe-smoke.sh
+tests/session-smoke.sh
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/tool-state.test.mts
 ```
 
 `pipe-smoke.sh` pipes `/tools` and `/exit` through the console with a temp
 database and tool overlay and fails on a non-zero exit, any ESC byte, or a
-missing `tools ·`. `tool-state.test.mts` covers snapshot revisions, orphan
-entries, guard `list()`/`call()` parity, failed writes and corrupt-file reset.
+missing `tools ·`. `session-smoke.sh` saves, lists and resumes a session in a
+temp git repo, checks `git status` stays clean and that `--once` leaves no
+`z1/`. `tool-state.test.mts` covers snapshot revisions, orphan entries, guard
+`list()`/`call()` parity, failed writes and corrupt-file reset.
 See `tests/README.md` for what is not covered.
 
 Manual checks:
