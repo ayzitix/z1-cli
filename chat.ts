@@ -417,6 +417,7 @@ interface SessionMenuItem {
   detail: string
   current: boolean
   archived: boolean
+  color: number
 }
 
 interface SessionMenu {
@@ -424,6 +425,8 @@ interface SessionMenu {
   items: readonly SessionMenuItem[]
   index: number
   onSelect: (id: string) => void
+  /** `r`/`d` in the picker, passed through to the command layer. */
+  onAction?: (action: 'rename' | 'delete', id: string) => void
 }
 
 interface ToolMenu {
@@ -551,6 +554,7 @@ class Composer {
     items: readonly SessionMenuItem[],
     onSelect: (id: string) => void,
     index = 0,
+    onAction?: (action: 'rename' | 'delete', id: string) => void,
   ): void {
     if (this.asking !== undefined) {
       throw new Error('openSessionMenu: an approval question is pending; answer or cancel it first')
@@ -560,6 +564,7 @@ class Composer {
       items,
       index: Math.max(0, Math.min(index, Math.max(0, items.length - 1))),
       onSelect,
+      ...(onAction === undefined ? {} : { onAction }),
     }
     this.changed()
   }
@@ -793,6 +798,9 @@ class Composer {
       if (code === 4) return this.ctrlD()
       if (code === 14 && this.sessionStep(1)) return
       if (code === 16 && this.sessionStep(-1)) return
+      if (code === 114 || code === 82) return this.actionSessionNow('rename')
+      if (code === 100 || code === 68) return this.actionSessionNow('delete')
+      if (code === 127 || code === 8) return this.actionSessionNow('delete')
       return
     }
     if (this.toolsMenu !== undefined) {
@@ -839,6 +847,8 @@ class Composer {
         case 'up': return void this.sessionStep(-1)
         case 'down': return void this.sessionStep(1)
         case 'escape': return this.escape()
+        case 'delete': return this.actionSessionNow('delete')
+        case 'backspace': return this.actionSessionNow('delete')
         case 'pageup': return void this.scroll?.('pageUp')
         case 'pagedown': return void this.scroll?.('pageDown')
         default: return
@@ -1079,6 +1089,15 @@ class Composer {
     if (menu !== undefined && item !== undefined) menu.onSelect(item.id)
   }
 
+  /** `r`/`d`: close the picker and hand the selected id to the command layer. */
+  private actionSessionNow(action: 'rename' | 'delete'): void {
+    const menu = this.sessionsMenu
+    const item = this.selectedSession()
+    this.sessionsMenu = undefined
+    this.changed()
+    if (menu !== undefined && item !== undefined) menu.onAction?.(action, item.id)
+  }
+
   /** Send the draft as one turn, leaving the composer ready for the next one. */
   private submitText(): void {
     const text = this.value
@@ -1186,12 +1205,13 @@ class Composer {
       const selected = start + offset === menu.index
       const pointer = selected ? `${cyan('❯')} ` : '  '
       const mark = item.current ? green('*') : ' '
+      const icon = paint(`38;5;${String(item.color)}`, '⬢')
       const name = padTo(fit(item.name, nameWidth), nameWidth)
       const label = selected ? bold(cyan(name)) : name
       const archived = item.archived ? dim(' · archived') : ''
       lines.push(
         clip(
-          `${pointer}${mark} ${label}  ${dim(item.detail)}${archived}`,
+          `${pointer}${mark} ${icon} ${label}  ${dim(item.detail)}${archived}`,
           Math.max(1, columns - 1),
         ),
       )
@@ -1425,7 +1445,7 @@ class Composer {
 
   private hint(menuOpen: boolean): string {
     if (this.asking !== undefined) return this.asking.label
-    if (this.sessionsMenu !== undefined) return '↑↓ · ⏎ switch · esc'
+    if (this.sessionsMenu !== undefined) return '↑↓ · ⏎ switch · r rename · d delete · esc'
     if (this.toolsMenu !== undefined) {
       return this.toolsMenu.confirmDelete !== undefined
         ? '⏎ yes · esc cancel'
@@ -3429,6 +3449,23 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   const shortModel = (name: string): string => name.slice(name.lastIndexOf('/') + 1)
 
   /**
+   * Distinct, readable ANSI-256 colours for session hexagons. A new session
+   * stores one in `meta.color`; an older transcript without one gets a stable
+   * colour derived from its id, so reopening it never changes the icon.
+   */
+  const SESSION_COLORS = [39, 45, 51, 75, 81, 105, 111, 141, 170, 204, 209, 214, 220, 117, 123, 159] as const
+  const pickSessionColor = (): number =>
+    SESSION_COLORS[Math.floor(Math.random() * SESSION_COLORS.length)] ?? 45
+  const sessionColorOf = (row: { id: string; color?: number }): number => {
+    if (row.color !== undefined) return row.color
+    let hash = 0
+    for (const char of row.id) hash = (hash * 31 + (char.codePointAt(0) ?? 0)) >>> 0
+    return SESSION_COLORS[hash % SESSION_COLORS.length] ?? 45
+  }
+  const sessionIcon = (row: { id: string; color?: number }): string =>
+    paint(`38;5;${String(sessionColorOf(row))}`, '⬢')
+
+  /**
    * `/sessions`: one header with the root and its mode, then one row per
    * session. `*` is the one this process is talking to. Numbers are bound to
    * this printing, like `/tools` numbers are bound to their revision.
@@ -3469,7 +3506,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       const updated = dim(relativeTime(row.updatedAt))
       const archived = row.archived ? dim(' · archived') : ''
       say(
-        `  ${mark} ${String(index + 1).padStart(indexWidth)}  ${padTo(fit(row.name, nameWidth), nameWidth)}  ${String(row.messageCount).padStart(3)} msgs  ${dim(fit(model, 18))}  ${updated}${archived}`,
+        `  ${mark} ${String(index + 1).padStart(indexWidth)}  ${sessionIcon(row)} ${padTo(fit(row.name, nameWidth), nameWidth)}  ${String(row.messageCount).padStart(3)} msgs  ${dim(fit(model, 18))}  ${updated}${archived}`,
       )
     }
     if (!includeArchived) say(dim('  /sessions --all includes archived · /sessions new [name] starts one'))
@@ -3638,6 +3675,16 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     // Pinned mode owns its transcript; opening another chat replaces it. In
     // native mode this is a no-op and the terminal's scrollback is left intact.
     tail.clear()
+    if (loaded.meta.color === undefined) {
+      // Older transcripts predate the icon; persist a stable colour once so the
+      // hexagon cannot change on a later open.
+      try {
+        sessions.setMeta(loaded.meta.id, { color: sessionColorOf(loaded.meta) })
+        loaded = sessions.load(loaded.meta.id) ?? loaded
+      } catch (error) {
+        sessionFailure('could not save the session colour', error)
+      }
+    }
     currentSession = loaded
     history = [...loaded.messages]
     lastContext = undefined
@@ -3654,7 +3701,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       sessionFailure('could not mark the current session', error)
     }
     say(
-      `session · ${loaded.meta.name} · ${String(loaded.messages.length)} msgs${loaded.tornTail ? ' · the last line was incomplete and was dropped' : ''}`,
+      `session · ${sessionIcon(loaded.meta)} ${loaded.meta.name} · ${String(loaded.messages.length)} msgs${loaded.tornTail ? ' · the last line was incomplete and was dropped' : ''}`,
     )
     replaySession(loaded)
     refreshStatus()
@@ -3676,6 +3723,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         contextWindow,
         maxSteps,
         toolPolicyRevision: tools.current.revision,
+        color: pickSessionColor(),
       })
       sessions.setCurrent(created.meta.id)
       currentSession = created
@@ -4078,6 +4126,69 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   }
 
   /**
+   * `r`/`d` in the session picker. The picker closes first, so the question uses
+   * the normal composer; the refreshed text list is printed afterwards.
+   */
+  const handleSessionPickerAction = async (
+    action: 'rename' | 'delete',
+    id: string,
+  ): Promise<void> => {
+    if (sessions === undefined) return
+    let summary: SessionSummary | undefined
+    try {
+      summary = sessions.list({ includeArchived: true }).find((row) => row.id === id)
+    } catch (error) {
+      sessionFailure('could not read the session', error)
+      return
+    }
+    if (summary === undefined) {
+      say(red(`sessions · ${id} disappeared`))
+      return
+    }
+    if (action === 'rename') {
+      const name = (await askLine(`rename session "${summary.name}" to:`)).trim()
+      if (name === '') {
+        say(dim('sessions · not renamed'))
+        return
+      }
+      try {
+        sessions.rename(id, name)
+        pendingTitles.delete(id)
+        if (currentSession?.meta.id === id) {
+          currentSession = { ...currentSession, meta: { ...currentSession.meta, name } }
+        }
+        say(`sessions · renamed to "${name}"`)
+        printSessions(false)
+      } catch (error) {
+        sessionFailure('could not rename', error)
+      }
+      return
+    }
+    const answer = await askLine(`delete session "${summary.name}" (${id})? [y/N]`)
+    if (!answer.trim().toLowerCase().startsWith('y')) {
+      say(dim('sessions · not deleted'))
+      return
+    }
+    try {
+      sessions.remove(id)
+    } catch (error) {
+      sessionFailure(`could not delete ${id}`, error)
+      return
+    }
+    pendingTitles.delete(id)
+    if (currentSession?.meta.id === id) {
+      currentSession = undefined
+      history = []
+      lastContext = undefined
+      lastTokens = 0
+      forceCompact = false
+      refreshStatus()
+    }
+    say(`sessions · deleted "${summary.name}" · moved to .trash`)
+    printSessions(false)
+  }
+
+  /**
    * Interactive `/sessions`: the same arrow picker as `/tools`. Selecting a row
    * closes the menu and switches; the text list stays for pipes and `--all`.
    */
@@ -4110,12 +4221,16 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
           detail: `${String(row.messageCount)} msgs · ${shortModel(row.model.model)} · ${relativeTime(row.updatedAt)}`,
           current: row.id === currentSession?.meta.id,
           archived: row.archived,
+          color: sessionColorOf(row),
         })),
         (id) => {
           const summary = rows.find((row) => row.id === id)
           if (summary !== undefined) switchSession(summary)
         },
         currentIndex >= 0 ? currentIndex : 0,
+        (action, id) => {
+          void handleSessionPickerAction(action, id)
+        },
       )
     } catch (error) {
       // A pending approval owns the keyboard; the text list is still useful.
@@ -4158,6 +4273,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
           contextWindow,
           maxSteps,
           toolPolicyRevision: tools.current.revision,
+          color: pickSessionColor(),
         })
         sessions.setCurrent(created.meta.id)
         currentSession = created

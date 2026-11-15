@@ -171,8 +171,11 @@ example), the store falls back to
 is linked through `meta.runs` but is never replayed to rebuild a chat.
 
 In a terminal, `/sessions` opens the same kind of arrow picker as `/tools`:
-`↑`/`↓` select, `Enter` switches, `Esc` closes. Pipes and `Z1_TRAY=off` get the
-numbered text list instead. The first `z1` turn asks the current model for a
+`↑`/`↓` select, `Enter` switches, `r` renames, `d`/`Delete` deletes (after a
+confirmation), `Esc` closes. Pipes and `Z1_TRAY=off` get the numbered text list
+instead. Each row starts with a coloured `⬢`; a new session stores its colour in
+`meta.color`, and an older transcript gets a stable colour derived from its id
+on first open. The first `z1` turn asks the current model for a
 2–6 word title from the first user message; a failed or too-long answer keeps
 the readable first-line fallback. Titles are stored in `meta.json`, so they
 survive a restart. Switching a session replays its user and assistant messages
@@ -215,10 +218,10 @@ different session replaces the pinned transcript instead of stacking both.
   re-enable one tool if a provider rejects it.
 - Slash commands are interactive. `--once "/tools ..."` is rejected with exit
   code 2 instead of being sent to the model.
-- Session storage is M1: the picker only switches; management is still the
-  text subcommands. No lock file, blob spill for huge tool output, rebuildable
-  index, fork or retention. A session from a different `cwd` is refused because
-  the runtime is bound to this directory.
+- Session storage is M1: the picker switches, renames and deletes; `archive`,
+  `unarchive` and `--all` are still text subcommands. No lock file, blob spill
+  for huge tool output, rebuildable index, fork or retention. A session from a
+  different `cwd` is refused because the runtime is bound to this directory.
 
 ## Keys
 
@@ -251,7 +254,7 @@ different session replaces the pinned transcript instead of stacking both.
 /tools reset             clear every tool preference
 /tools refresh           re-read the installed module inventory
 /tools --all             include stale entries for tools no longer installed
-/sessions          arrow picker: ↑↓ select, Enter switch, Esc close (text list in a pipe)
+/sessions          arrow picker: ↑↓ select, Enter switch, r rename, d delete, Esc close
 /sessions --all    include archived sessions
 /sessions new [name]     create and switch to a new session
 /sessions rename <n|id> <name>  rename
