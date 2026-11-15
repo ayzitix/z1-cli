@@ -139,10 +139,12 @@ repo.
   tools do you have?" and cannot invent a disabled one. Names only, so the block
   is about 40 tokens.
 - **Sessions**: every turn is appended to `z1/sessions/<id>/{meta,events.jsonl}`
-  in the project (ignored through `.git/info/exclude`). `/sessions` lists,
-  switches, renames, archives and deletes; the next prompt after `/new` or a
-  delete starts a new one. The transcript is authoritative; `runs.db` is only
-  provenance. `--once` never creates a session.
+  in the project (ignored through `.git/info/exclude`). `/sessions` opens an
+  arrow picker; `new`, `rename`, `delete`, `archive` and `--all` are the text
+  subcommands. A new session is named by the model from its first message (the
+  first 60 characters are the fallback if that call fails). The next prompt
+  after `/new` or a delete starts a new one. The transcript is authoritative;
+  `runs.db` is only provenance. `--once` never creates a session.
 - **Pipes and `Z1_TRAY=off`**: readline path with `\` line continuation, no
   alternate screen and no escape sequences emitted; `Ctrl-C` cancels a run.
 
@@ -167,6 +169,13 @@ example), the store falls back to
 `~/.local/share/z1/projects/<name>-<hash>/z1` instead of writing into it.
 `Z1_SESSIONS_DIR` overrides both. Messages are the source of truth; `runs.db`
 is linked through `meta.runs` but is never replayed to rebuild a chat.
+
+In a terminal, `/sessions` opens the same kind of arrow picker as `/tools`:
+`↑`/`↓` select, `Enter` switches, `Esc` closes. Pipes and `Z1_TRAY=off` get the
+numbered text list instead. The first `z1` turn asks the current model for a
+2–6 word title from the first user message; a failed or too-long answer keeps
+the readable first-line fallback. Titles are stored in `meta.json`, so they
+survive a restart.
 
 ## Still raw
 
@@ -202,9 +211,10 @@ is linked through `meta.runs` but is never replayed to rebuild a chat.
   re-enable one tool if a provider rejects it.
 - Slash commands are interactive. `--once "/tools ..."` is rejected with exit
   code 2 instead of being sent to the model.
-- Session storage is M1: a text list, no picker yet; no lock file, blob spill
-  for huge tool output, rebuildable index, fork or retention. A session from a
-  different `cwd` is refused because the runtime is bound to this directory.
+- Session storage is M1: the picker only switches; management is still the
+  text subcommands. No lock file, blob spill for huge tool output, rebuildable
+  index, fork or retention. A session from a different `cwd` is refused because
+  the runtime is bound to this directory.
 
 ## Keys
 
@@ -237,7 +247,7 @@ is linked through `meta.runs` but is never replayed to rebuild a chat.
 /tools reset             clear every tool preference
 /tools refresh           re-read the installed module inventory
 /tools --all             include stale entries for tools no longer installed
-/sessions          list saved sessions; a number switches (or a full id/prefix)
+/sessions          arrow picker: ↑↓ select, Enter switch, Esc close (text list in a pipe)
 /sessions --all    include archived sessions
 /sessions new [name]     create and switch to a new session
 /sessions rename <n|id> <name>  rename

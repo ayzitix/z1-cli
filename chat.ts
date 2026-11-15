@@ -408,6 +408,22 @@ interface ToolMenuItem {
 
 type ToolMenuAction = 'toggle' | 'delete'
 
+/** One row of the `/sessions` picker; `detail` is rendered dim. */
+interface SessionMenuItem {
+  id: string
+  name: string
+  detail: string
+  current: boolean
+  archived: boolean
+}
+
+interface SessionMenu {
+  label: string
+  items: readonly SessionMenuItem[]
+  index: number
+  onSelect: (id: string) => void
+}
+
 interface ToolMenu {
   items: readonly ToolMenuItem[]
   index: number
@@ -449,6 +465,8 @@ class Composer {
   private menuDismissed: string | undefined
   /** Interactive `/tools` picker, independent of the slash menu. */
   private toolsMenu: ToolMenu | undefined
+  /** Interactive `/sessions` picker, independent of `/tools`. */
+  private sessionsMenu: SessionMenu | undefined
   private buffer = ''
   private escTimer: NodeJS.Timeout | undefined
   private closed = false
@@ -522,6 +540,32 @@ class Composer {
   closeToolMenu(): void {
     if (this.toolsMenu === undefined) return
     this.toolsMenu = undefined
+    this.changed()
+  }
+
+  /** Open the interactive `/sessions` picker; Enter switches, Escape closes. */
+  openSessionMenu(
+    label: string,
+    items: readonly SessionMenuItem[],
+    onSelect: (id: string) => void,
+    index = 0,
+  ): void {
+    if (this.asking !== undefined) {
+      throw new Error('openSessionMenu: an approval question is pending; answer or cancel it first')
+    }
+    this.sessionsMenu = {
+      label,
+      items,
+      index: Math.max(0, Math.min(index, Math.max(0, items.length - 1))),
+      onSelect,
+    }
+    this.changed()
+  }
+
+  /** Hide the session picker. */
+  closeSessionMenu(): void {
+    if (this.sessionsMenu === undefined) return
+    this.sessionsMenu = undefined
     this.changed()
   }
 
@@ -740,6 +784,15 @@ class Composer {
 
   private keyChar(char: string): void {
     const code = char.charCodeAt(0)
+    if (this.sessionsMenu !== undefined) {
+      // The session picker owns the keyboard; typing cannot edit the draft.
+      if (code === 13) return this.submit()
+      if (code === 3) return this.ctrlC()
+      if (code === 4) return this.ctrlD()
+      if (code === 14 && this.sessionStep(1)) return
+      if (code === 16 && this.sessionStep(-1)) return
+      return
+    }
     if (this.toolsMenu !== undefined) {
       // The picker owns the keyboard: typing cannot edit the draft underneath.
       if (code === 13) return this.submit()
@@ -779,6 +832,16 @@ class Composer {
   }
 
   private key(name: string): void {
+    if (this.sessionsMenu !== undefined) {
+      switch (name) {
+        case 'up': return void this.sessionStep(-1)
+        case 'down': return void this.sessionStep(1)
+        case 'escape': return this.escape()
+        case 'pageup': return void this.scroll?.('pageUp')
+        case 'pagedown': return void this.scroll?.('pageDown')
+        default: return
+      }
+    }
     if (this.toolsMenu !== undefined) {
       // The picker owns the keyboard; the draft below never moves or edits.
       switch (name) {
@@ -812,6 +875,10 @@ class Composer {
   }
 
   private escape(): void {
+    if (this.sessionsMenu !== undefined) {
+      this.closeSessionMenu()
+      return
+    }
     if (this.toolsMenu !== undefined) {
       if (this.toolsMenu.confirmDelete !== undefined) {
         const rest = { ...this.toolsMenu }
@@ -852,6 +919,10 @@ class Composer {
   }
 
   private ctrlC(): void {
+    if (this.sessionsMenu !== undefined) {
+      this.closeSessionMenu()
+      return
+    }
     if (this.toolsMenu !== undefined) {
       this.closeToolMenu()
       return
@@ -877,6 +948,10 @@ class Composer {
   }
 
   private ctrlD(): void {
+    if (this.sessionsMenu !== undefined) {
+      this.closeSessionMenu()
+      return
+    }
     if (this.toolsMenu !== undefined) {
       this.closeToolMenu()
       return
@@ -903,6 +978,10 @@ class Composer {
   private submit(): void {
     if (this.asking !== undefined) {
       this.endAsk(this.value)
+      return
+    }
+    if (this.sessionsMenu !== undefined) {
+      this.selectSessionNow()
       return
     }
     if (this.toolsMenu !== undefined) {
@@ -971,6 +1050,31 @@ class Composer {
     const last = Math.max(0, menu.items.length - 1)
     if (menu.index <= last) return
     this.toolsMenu = { ...menu, index: last }
+  }
+
+  private selectedSession(): SessionMenuItem | undefined {
+    const menu = this.sessionsMenu
+    if (menu === undefined || menu.items.length === 0) return undefined
+    return menu.items[Math.max(0, Math.min(menu.index, menu.items.length - 1))]
+  }
+
+  private sessionStep(delta: number): boolean {
+    const menu = this.sessionsMenu
+    if (menu === undefined || menu.items.length === 0) return false
+    this.sessionsMenu = {
+      ...menu,
+      index: (menu.index + delta + menu.items.length) % menu.items.length,
+    }
+    this.changed()
+    return true
+  }
+
+  private selectSessionNow(): void {
+    const menu = this.sessionsMenu
+    const item = this.selectedSession()
+    this.sessionsMenu = undefined
+    this.changed()
+    if (menu !== undefined && item !== undefined) menu.onSelect(item.id)
   }
 
   /** Send the draft as one turn, leaving the composer ready for the next one. */
@@ -1056,6 +1160,44 @@ class Composer {
   }
 
   /**
+   * The `/sessions` picker: a title with the store label, then a scrolling
+   * window of `name · detail` rows. The current session is marked `*`; the
+   * pointer and selection colours match the slash and tool menus.
+   */
+  private renderSessionMenu(columns: number): string[] {
+    const menu = this.sessionsMenu
+    if (menu === undefined) return []
+    const items = menu.items
+    const lines: string[] = [
+      clip(`  ${bold('sessions')} · ${menu.label}`, Math.max(1, columns - 1)),
+    ]
+    if (items.length === 0) {
+      lines.push(dim('  none yet · one starts with your next prompt'))
+      return lines
+    }
+    const maxRows = Math.max(1, Math.min(items.length, terminalRows() - 12))
+    let start = Math.max(0, menu.index - Math.floor(maxRows / 2))
+    start = Math.min(start, Math.max(0, items.length - maxRows))
+    const slice = items.slice(start, start + maxRows)
+    const nameWidth = Math.min(34, Math.max(4, ...items.map((item) => displayCells(item.name))))
+    for (const [offset, item] of slice.entries()) {
+      const selected = start + offset === menu.index
+      const pointer = selected ? `${cyan('❯')} ` : '  '
+      const mark = item.current ? green('*') : ' '
+      const name = padTo(fit(item.name, nameWidth), nameWidth)
+      const label = selected ? bold(cyan(name)) : name
+      const archived = item.archived ? dim(' · archived') : ''
+      lines.push(
+        clip(
+          `${pointer}${mark} ${label}  ${dim(item.detail)}${archived}`,
+          Math.max(1, columns - 1),
+        ),
+      )
+    }
+    return lines
+  }
+
+  /**
    * The `/tools` picker: a title with counts, an optional delete confirmation,
    * then a scrolling window of `on/off/del` rows. It reuses the slash menu's
    * pointer and selection colours so the two read as one control.
@@ -1115,7 +1257,7 @@ class Composer {
   }
 
   private insert(text: string): void {
-    if (this.toolsMenu !== undefined) return
+    if (this.toolsMenu !== undefined || this.sessionsMenu !== undefined) return
     const clean = text.replace(/\r\n?/g, '\n').replace(/\t/g, '  ').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
     if (clean.length === 0) return
     this.value = `${this.value.slice(0, this.cursor)}${clean}${this.value.slice(this.cursor)}`
@@ -1281,6 +1423,7 @@ class Composer {
 
   private hint(menuOpen: boolean): string {
     if (this.asking !== undefined) return this.asking.label
+    if (this.sessionsMenu !== undefined) return '↑↓ · ⏎ switch · esc'
     if (this.toolsMenu !== undefined) {
       return this.toolsMenu.confirmDelete !== undefined
         ? '⏎ yes · esc cancel'
@@ -1312,6 +1455,7 @@ class Composer {
     const menu = this.menu()
     const menuLines = this.renderMenu(width, menu)
     const toolLines = this.renderToolMenu(width)
+    const sessionLines = this.renderSessionMenu(width)
     // The composer is a full sharp box: top/bottom rules and vertical sides.
     // It is accented only while the field is active (idle, asking, or a draft
     // is being edited); during a run with an empty draft it stays dim.
@@ -1359,7 +1503,7 @@ class Composer {
         footer += `${' '.repeat(Math.max(0, available - stripAnsi(left).length - stripAnsi(rightText).length))}${rightText}`
       }
     }
-    const lines = [...toolLines, ...menuLines, header, ...input, footerRule, dim(footer)]
+    const lines = [...sessionLines, ...toolLines, ...menuLines, header, ...input, footerRule, dim(footer)]
     const key = [
       this.value,
       String(this.cursor),
@@ -1369,12 +1513,17 @@ class Composer {
       this.hint(menu.open),
       menu.open ? `${String(menu.index)}:${menuLines.join('\n')}` : '',
       toolLines.join('\n'),
+      sessionLines.join('\n'),
+      this.sessionsMenu === undefined
+        ? ''
+        : `${String(this.sessionsMenu.index)}:${this.sessionsMenu.label}`,
       this.toolsMenu === undefined ? '' : String(this.toolsMenu.confirmDelete ?? ''),
       String(width),
     ].join('\u0000')
     return {
       lines,
-      cursorRow: toolLines.length + menuLines.length + 1 + (position.row - start),
+      cursorRow:
+        sessionLines.length + toolLines.length + menuLines.length + 1 + (position.row - start),
       cursorCol: 2 + position.col,
       key,
     }
@@ -3241,6 +3390,8 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   }
 
   let currentSession: Session | undefined
+  /** Sessions created here without an explicit name; the first turn titles them. */
+  const pendingTitles = new Set<string>()
   /** The rows of the last printed listing; numbers resolve against it. */
   let listedSessions: readonly SessionSummary[] = []
 
@@ -3453,6 +3604,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       })
       sessions.setCurrent(created.meta.id)
       currentSession = created
+      pendingTitles.add(created.meta.id)
       return created
     } catch (error) {
       sessionFailure('could not save this conversation', error)
@@ -3472,6 +3624,70 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       currentSession = sessions.load(session.meta.id) ?? session
     } catch (error) {
       sessionFailure('could not save this turn', error)
+    }
+  }
+
+  /** Strip quotes/labels so a model reply becomes a plain one-line title. */
+  const cleanTitle = (raw: string): string =>
+    raw
+      .trim()
+      .replace(/^(?:title|session)\s*[:\-]\s*/i, '')
+      .replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, '')
+      .replace(/\s+/g, ' ')
+      .replace(/[.!?。！？]+$/g, '')
+      .trim()
+      .slice(0, 60)
+      .trim()
+
+  /**
+   * Ask the current model for a short title from the first user message. This
+   * runs after the first successful turn, so it never delays the answer; a
+   * failure leaves the readable fallback name in place. One attempt per session.
+   */
+  const titleSession = async (handle: RunHandle, session: Session): Promise<void> => {
+    if (sessions === undefined || !pendingTitles.has(session.meta.id)) return
+    pendingTitles.delete(session.meta.id)
+    const first = session.messages.find((message) => message.role === 'user')?.content?.trim()
+    if (first === undefined || first === '') return
+    try {
+      const result = await handle.services.llm.chat({
+        model,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You name chat sessions. Do not answer the user’s message. Reply with only a short title of 2 to 6 words, no quotes, no trailing punctuation, in the same language as the user.\nExamples:\nUser: "Explain what a monorepo is" -> Monorepo basics\nUser: "Fix the flaky auth test" -> Flaky auth test\nUser: "Як налаштувати CI?" -> Налаштування CI',
+          },
+          {
+            role: 'user',
+            content: `Name the chat that starts with this message. Reply with the title only.\n\nMessage:\n"""${first.slice(0, 2000)}"""\n\nTitle:`,
+          },
+        ],
+        maxTokens: 24,
+        temperature: 0,
+      })
+      const title = cleanTitle(result.message.content)
+      const words = title.split(/\s+/).filter((word) => word.length > 0)
+      const promptText = first.replace(/\s+/g, ' ').trim()
+      if (
+        title.length === 0 ||
+        title.length > 60 ||
+        words.length > 8 ||
+        title.toLowerCase() === promptText.toLowerCase() ||
+        promptText.toLowerCase().startsWith(title.toLowerCase())
+      ) {
+        // A provider that answered the message instead of naming it would
+        // otherwise store a paragraph as the session name; keep the fallback.
+        debugLog(`session title rejected: ${JSON.stringify(title.slice(0, 80))}`)
+        return
+      }
+      sessions.rename(session.meta.id, title)
+      const updated = sessions.load(session.meta.id)
+      if (updated !== undefined && currentSession?.meta.id === session.meta.id) {
+        currentSession = updated
+      }
+    } catch (error) {
+      debugLog(`session title failed: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
 
@@ -3787,13 +4003,61 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   }
 
   /**
+   * Interactive `/sessions`: the same arrow picker as `/tools`. Selecting a row
+   * closes the menu and switches; the text list stays for pipes and `--all`.
+   */
+  const openSessionsPicker = (): boolean => {
+    if (composer === undefined) return false
+    if (sessions === undefined) {
+      printSessions(false)
+      return true
+    }
+    let rows: readonly SessionSummary[]
+    try {
+      rows = sessions.list({ includeArchived: false })
+    } catch (error) {
+      sessionFailure('could not list', error)
+      return true
+    }
+    if (rows.length === 0) {
+      printSessions(false)
+      return true
+    }
+    listedSessions = rows
+    const currentIndex = rows.findIndex((row) => row.id === currentSession?.meta.id)
+    const noun = rows.length === 1 ? 'session' : 'sessions'
+    try {
+      composer.openSessionMenu(
+        `${String(rows.length)} ${noun} in ${shortPath(sessions.root)} (${sessions.mode})`,
+        rows.map((row) => ({
+          id: row.id,
+          name: row.name,
+          detail: `${String(row.messageCount)} msgs · ${shortModel(row.model.model)} · ${relativeTime(row.updatedAt)}`,
+          current: row.id === currentSession?.meta.id,
+          archived: row.archived,
+        })),
+        (id) => {
+          const summary = rows.find((row) => row.id === id)
+          if (summary !== undefined) switchSession(summary)
+        },
+        currentIndex >= 0 ? currentIndex : 0,
+      )
+    } catch (error) {
+      // A pending approval owns the keyboard; the text list is still useful.
+      sessionFailure('could not open the session picker', error)
+      printSessions(false)
+    }
+    return true
+  }
+
+  /**
    * `/sessions` — the whole sub-grammar, declared once in `COMMANDS`. Bare and
-   * `--all` list; everything else is a verb or a selector.
+   * `--all` list; bare opens the arrow picker in a terminal.
    */
   const handleSessions = async (line: string): Promise<void> => {
     const rest = line.slice('/sessions'.length).trim()
     if (rest === '') {
-      printSessions(false)
+      if (!openSessionsPicker()) printSessions(false)
       return
     }
     if (rest === '--all' || rest === 'all') {
@@ -3822,6 +4086,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         })
         sessions.setCurrent(created.meta.id)
         currentSession = created
+        if (tail === '') pendingTitles.add(created.meta.id)
         history = []
         lastContext = undefined
         lastTokens = 0
@@ -4126,6 +4391,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       // A queued prompt may start while the picker is open; a running turn
       // owns the transcript, so the picker must not float over it.
       composer?.closeToolMenu()
+      composer?.closeSessionMenu()
       const progress = createProgress(tail)
       const handle = await runtime.beginRun({ approval })
       // The first prompt of a conversation creates its session; later prompts
@@ -4143,7 +4409,14 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         history = outcome.history
         // A failed or cancelled turn is saved too: the store writes whichever
         // transcript this turn produced and no-ops when nothing changed.
-        if (activeSession !== undefined) saveTurn(activeSession, outcome.history, outcome.runId)
+        if (activeSession !== undefined) {
+          saveTurn(activeSession, outcome.history, outcome.runId)
+          // Only a new, unnamed session gets an AI title; a loaded transcript
+          // keeps the name it already has.
+          if (outcome.status === 'completed' && currentSession !== undefined) {
+            await titleSession(handle, currentSession)
+          }
+        }
         if (outcome.context !== undefined) {
           lastContext = outcome.context
           lastTokens = outcome.context.tokens
