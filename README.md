@@ -132,9 +132,10 @@ repo.
   Pipes and `Z1_TRAY=off` keep a numbered text list instead of the picker.
 - **Tool awareness**: every turn's system prompt lists the enabled tool names
   with a count, or says `None` when everything is off. The wire `tools` array
-  still carries the full schemas, but the model can now answer "what tools do
-  you have?" and cannot invent a disabled one. Names only, so the block is about
-  40 tokens.
+  carries the full schemas only when at least one tool is enabled; with none
+  enabled the key is absent from the request. The model can now answer "what
+  tools do you have?" and cannot invent a disabled one. Names only, so the block
+  is about 40 tokens.
 - **Pipes and `Z1_TRAY=off`**: readline path with `\` line continuation, no
   alternate screen and no escape sequences emitted; `Ctrl-C` cancels a run.
 

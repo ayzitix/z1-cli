@@ -26,8 +26,12 @@ export type ToolState = 'enabled' | 'disabled' | 'deleted'
 /** One stored decision. Absent entries are enabled, so upgrades keep working. */
 export interface ToolPreference {
   state: Exclude<ToolState, 'enabled'>
-  /** When the decision was made; diagnostics only. */
-  at: number
+  /**
+   * When the decision was made; diagnostics only. Optional: a legacy entry that
+   * never carried one keeps it absent (or borrows the file's `updatedAt`),
+   * because stamping "now" on every read poisons any later merge on `at`.
+   */
+  at?: number
 }
 
 export interface ToolPreferences {
@@ -39,8 +43,15 @@ export interface ToolPreferences {
 export interface LoadedToolPreferences {
   prefs: ToolPreferences
   path: string
-  /** Set when the file exists but could not be read or parsed. */
+  /** Set when the file exists but could not be read, parsed, or fully understood. */
   error?: string
+  /**
+   * What `prefs` means when `error` is set:
+   * - `last-good` — a previous successful read from this process;
+   * - `empty` — no good read exists, so the fresh-install default (all enabled);
+   * - `partial` — the overlay parsed, but bad entries were made safe (`disabled`).
+   */
+  degraded?: 'last-good' | 'empty' | 'partial'
 }
 
 export const emptyToolPreferences = (): ToolPreferences => ({ schemaVersion: 1, tools: {} })
@@ -75,28 +86,62 @@ export const toolPreferencesPath = (env: Record<string, string | undefined> = pr
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
-/** Accept only the fields this version understands; ignore anything else. */
-const normalize = (value: unknown): ToolPreferences => {
-  if (!isRecord(value) || !isRecord(value['tools'])) return emptyToolPreferences()
-  const tools: Record<string, ToolPreference> = {}
-  for (const [name, entry] of Object.entries(value['tools'])) {
-    if (!isRecord(entry)) continue
-    const state = entry['state']
-    if (state !== 'disabled' && state !== 'deleted') continue
-    const at = entry['at']
-    tools[name] = { state, at: typeof at === 'number' && Number.isFinite(at) ? at : Date.now() }
+/**
+ * Accept only the fields this version understands; ignore anything else.
+ *
+ * Returns the normalized overlay plus an error for anything that had to be
+ * guessed. An unrecognised `state` is *not* dropped: dropping it would make the
+ * entry look absent, i.e. silently re-enable a tool that a hand edit or a newer
+ * version turned off. It is kept as `disabled` and reported instead.
+ */
+const normalize = (value: unknown): { prefs: ToolPreferences; error?: string; fatal?: boolean } => {
+  if (!isRecord(value) || !isRecord(value['tools'])) {
+    return {
+      prefs: emptyToolPreferences(),
+      error: 'not an object with a "tools" table',
+      // A file that lost its shape is not a partially understood overlay: an
+      // empty one would re-enable everything, so prefer the last good snapshot.
+      fatal: true,
+    }
   }
   const updatedAt = value['updatedAt']
-  return {
+  // A missing `at` falls back to the file's own stamp when it has one; it is
+  // never invented, so a legacy file does not claim every decision was made now.
+  const fileAt = typeof updatedAt === 'number' && Number.isFinite(updatedAt) ? updatedAt : undefined
+  const tools: Record<string, ToolPreference> = {}
+  const unknown: string[] = []
+  for (const [name, entry] of Object.entries(value['tools'])) {
+    if (!isRecord(entry)) {
+      unknown.push(name)
+      tools[name] = { state: 'disabled' }
+      continue
+    }
+    const raw = entry['state']
+    const at = entry['at']
+    const stamp = typeof at === 'number' && Number.isFinite(at) ? at : fileAt
+    let state: ToolPreference['state']
+    if (raw === 'disabled' || raw === 'deleted') {
+      state = raw
+    } else {
+      state = 'disabled'
+      unknown.push(name)
+    }
+    tools[name] = stamp === undefined ? { state } : { state, at: stamp }
+  }
+  const prefs: ToolPreferences = {
     schemaVersion: 1,
-    ...(typeof updatedAt === 'number' && Number.isFinite(updatedAt) ? { updatedAt } : {}),
+    ...(fileAt === undefined ? {} : { updatedAt: fileAt }),
     tools,
   }
+  return unknown.length === 0
+    ? { prefs }
+    : { prefs, error: `unknown state for ${unknown.join(', ')}; treated as disabled` }
 }
 
 /**
  * Read the overlay. A broken file is reported, not thrown: the console can keep
- * working with the default (everything enabled) and tell the user how to fix it.
+ * working with the last policy it read (or, with no good read at all, the
+ * default of everything enabled) and tell the user how to fix it.
  */
 export const loadToolPreferences = (
   env: Record<string, string | undefined> = process.env,
@@ -107,19 +152,36 @@ export const loadToolPreferences = (
     lastGood.set(path, prefs)
     return { prefs, path }
   }
+  let normalized: { prefs: ToolPreferences; error?: string; fatal?: boolean }
   try {
-    const prefs = normalize(JSON.parse(readFileSync(path, 'utf8')))
-    lastGood.set(path, prefs)
-    return { prefs, path }
+    normalized = normalize(JSON.parse(readFileSync(path, 'utf8')))
   } catch (error) {
+    const fallback = lastGood.get(path)
     return {
       // Keep the last policy this process successfully read. At startup there
       // is none, so the file's fresh-install default (all enabled) applies and
-      // `/tools` reports the problem.
-      prefs: lastGood.get(path) ?? emptyToolPreferences(),
+      // the session reports the problem.
+      prefs: fallback ?? emptyToolPreferences(),
       path,
+      degraded: fallback === undefined ? 'empty' : 'last-good',
       error: error instanceof Error ? error.message : String(error),
     }
+  }
+  const fallback = lastGood.get(path)
+  if (normalized.fatal === true && fallback !== undefined) {
+    // The file is no longer an overlay at all; an empty default would silently
+    // re-enable tools, so keep enforcing the last policy that parsed.
+    return { prefs: fallback, path, degraded: 'last-good', error: normalized.error }
+  }
+  // A partly understood file still yields a safe (fail-closed) overlay, so it
+  // becomes the last good snapshot; the error asks the user to repair it.
+  lastGood.set(path, normalized.prefs)
+  return {
+    prefs: normalized.prefs,
+    path,
+    ...(normalized.error === undefined
+      ? {}
+      : { error: normalized.error, degraded: 'partial' as const }),
   }
 }
 

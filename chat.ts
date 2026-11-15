@@ -2500,18 +2500,55 @@ const nextLine = (prompt: string): Promise<string> => {
   return new Promise(resolve => { lineWaiter = resolve })
 }
 
-const defaultModel = (): ModelHandle => {
-  const explicit = process.env['Z1_MODEL']?.trim()
-  const raw = explicit && explicit.length > 0
-    ? explicit
-    : process.env['RIVER_API_KEY']
-      ? 'river/deepseek-ai/DeepSeek-V4.1-Flash'
-      : process.env['OPENAI_API_KEY']
-        ? 'openai/gpt-4.1-mini'
-        : 'mock/mock-1'
-  const slash = raw.indexOf('/')
-  if (slash < 0) return { provider: 'mock', model: raw }
-  return { provider: raw.slice(0, slash), model: raw.slice(slash + 1) }
+/**
+ * Parse `provider/model` — the one place a model reference becomes a handle.
+ *
+ * A reference without a provider is rejected instead of guessed: the old
+ * fallback turned `Z1_MODEL=gpt-4.1` into `mock/gpt-4.1`, so the console
+ * answered from the in-process mock and the reply looked real. Every built-in
+ * default contains a slash, so this can only fail on user input.
+ */
+const parseModelRef = (raw: string): { ok: true; model: ModelHandle } | { ok: false; error: string } => {
+  const value = raw.trim()
+  const slash = value.indexOf('/')
+  if (slash <= 0 || slash === value.length - 1) {
+    return { ok: false, error: `model must be provider/model, got "${raw.trim()}"` }
+  }
+  return { ok: true, model: { provider: value.slice(0, slash), model: value.slice(slash + 1) } }
+}
+
+/** The model for this process: `--model`, then `Z1_MODEL`, then the defaults. */
+const startModel = (explicit: string | undefined): ModelHandle => {
+  const flag = explicit?.trim()
+  if (flag !== undefined && flag.length > 0) {
+    const parsed = parseModelRef(flag)
+    if (!parsed.ok) {
+      console.error(`chat: --model: ${parsed.error}`)
+      process.exit(2)
+    }
+    return parsed.model
+  }
+  const fromEnv = process.env['Z1_MODEL']?.trim()
+  if (fromEnv !== undefined && fromEnv.length > 0) {
+    const parsed = parseModelRef(fromEnv)
+    if (!parsed.ok) {
+      // An explicitly requested model must never silently become the mock.
+      console.error(`chat: Z1_MODEL: ${parsed.error}`)
+      process.exit(2)
+    }
+    return parsed.model
+  }
+  const fallback = process.env['RIVER_API_KEY']
+    ? 'river/deepseek-ai/DeepSeek-V4.1-Flash'
+    : process.env['OPENAI_API_KEY']
+      ? 'openai/gpt-4.1-mini'
+      : 'mock/mock-1'
+  const parsed = parseModelRef(fallback)
+  if (!parsed.ok) {
+    console.error(`chat: ${parsed.error}`)
+    process.exit(2)
+  }
+  return parsed.model
 }
 
 const modelLabel = (model: ModelHandle): string => `${model.provider}/${model.model}`
@@ -2573,7 +2610,9 @@ const seedHistory = (graph: unknown, history: readonly ChatMessage[]): unknown =
   if (history.length === 0) return graph
   const previous = history.filter((message) => message.role !== 'system')
   if (previous.length === 0) return graph
-  const g = structuredClone(graph) as MutableGraph
+  // The caller builds this graph for one turn and does not share it, so it is
+  // mutated in place: the caller owns the graph and discards it after the run.
+  const g = graph as MutableGraph
   const loop = g.nodes.find(node => node['type'] === 'z1.flow.loop')
   if (!loop) return graph
   const loopId = String(loop['id'])
@@ -2678,10 +2717,13 @@ const toolInventoryText = (
 ): string => {
   const heading = '## Tools available this turn'
   if (!known) {
+    // The guard reads the overlay on its own, so the request may well carry
+    // tools even though this read failed. Claiming "no tools" here told the
+    // model the opposite of what the wire said, so only promise the attached set.
     return [
       heading,
       '',
-      'The tool inventory could not be read in this run. Do not claim or call any tool. If the task needs one, say the tool service is unavailable.',
+      'The tool inventory could not be read before this turn, so only the tools actually attached to this request are known. Do not claim or call any tool that is not offered to you. If the task needs a tool that is missing, say the tool service is unavailable.',
     ].join('\n')
   }
   if (enabled.length === 0) {
@@ -2739,8 +2781,13 @@ const runTurn = async (
     totalTools = installed.length
     const { prefs } = loadToolPreferences()
     enabledTools = installed.filter((tool) => toolState(prefs, tool.name) === 'enabled')
-  } catch {
+  } catch (error) {
+    // Reported in the prompt as "inventory unknown" rather than "no tools": the
+    // guarded service may still attach tools to this very request.
     inventoryKnown = false
+    debugLog(
+      `tool inventory unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    )
   }
 
   let built: unknown = buildAgentGraph({
@@ -2766,27 +2813,39 @@ const runTurn = async (
   let streamed = false
   const controller = new AbortController()
   activeAbort = controller
-  const result: RunResult = await runGraph({
-    signal: controller.signal,
-    graph: graph as never,
-    input: prompt,
-    registry: handle.registry,
-    services: {
-      ...handle.services,
-      // One policy for both the advertised list and execution. The model sees
-      // only enabled tools, and a hallucinated name is rejected as a tool error
-      // (z1.tool.call turns a throw into data), so it cannot run hidden tools.
-      tools: guardedTools,
-      onEvent: (event) => {
-        if (event.type === 'node.stream' && event.port === 'text' && event.path.endsWith('/chat')) {
-          streamed = true
-        }
-        progress.event(event)
+  let result: RunResult
+  try {
+    result = await runGraph({
+      signal: controller.signal,
+      graph: graph as never,
+      input: prompt,
+      registry: handle.registry,
+      services: {
+        ...handle.services,
+        // One policy for both the advertised list and execution. The model sees
+        // only enabled tools, and a hallucinated name is rejected as a tool error
+        // (z1.tool.call turns a throw into data), so it cannot run hidden tools.
+        tools: guardedTools,
+        onEvent: (event) => {
+          if (event.type === 'node.stream' && event.port === 'text' && event.path.endsWith('/chat')) {
+            streamed = true
+          }
+          progress.event(event)
+        },
       },
-    },
-    runId,
-    journal: runtime.journal,
-  })
+      runId,
+      journal: runtime.journal,
+    })
+  } catch (error) {
+    // The row was created as `running` before the run; without this it would
+    // stay running forever in the journal (the SDK's runGraph does not reconcile).
+    activeAbort = undefined
+    runtime.journal.updateRun(runId, { status: 'failed', updatedAt: Date.now() })
+    throw error
+  }
+  // A failed/cancelled run also finishes here: `runGraph` returns the status
+  // instead of throwing for a failed node, so the row must record it.
+  runtime.journal.updateRun(runId, { status: result.status, updatedAt: Date.now() })
 
   // A completed run's answer was streamed; print it only when nothing arrived
   // (a provider without streaming, or a mock that answers in one shot).
@@ -2819,10 +2878,17 @@ const runTurn = async (
     }
   }
   if (next.length === 0) {
-    next = [
-      { role: 'user', content: prompt },
-      { role: 'assistant', content: output },
-    ]
+    // Never fabricate an empty assistant message: some providers reject empty
+    // content, and a failed/cancelled turn has no answer to keep. A completed
+    // run with a one-shot answer still records the exchange; anything else
+    // leaves the previous transcript untouched (as a fresh array).
+    next =
+      result.status === 'completed' && output.length > 0
+        ? [
+            { role: 'user', content: prompt },
+            { role: 'assistant', content: output },
+          ]
+        : [...history]
   }
 
   // Context telemetry: the budget node is in the loop body, so its last
@@ -2886,15 +2952,6 @@ const parseArgs = (): Options => {
   return options
 }
 
-const modelFrom = (raw: string): ModelHandle => {
-  const slash = raw.indexOf('/')
-  if (slash <= 0 || slash === raw.length - 1) {
-    console.error(`chat: model must be provider/model, got "${raw}"`)
-    process.exit(2)
-  }
-  return { provider: raw.slice(0, slash), model: raw.slice(slash + 1) }
-}
-
 /**
  * One shot: no banner, no prompt loop. Same progress, final answer, exit 0 on a
  * completed run and 1 otherwise.
@@ -2908,11 +2965,11 @@ const oneShot = async (prompt: string, explicitModel: string | undefined): Promi
     console.error(`chat --once: ${command} is an interactive command; run z1 without --once`)
     return 2
   }
+  const model = startModel(explicitModel)
   const config = loadRuntimeConfig({ cwd: process.cwd(), env: process.env, overrides: { live: true } })
   const runtime = await createRuntime(config)
   const tail = createTail()
   const progress = createProgress(tail)
-  const model = explicitModel === undefined ? defaultModel() : modelFrom(explicitModel)
   progress.print(`› ${prompt}`)
   // Without a terminal an approval would block forever, so it is declined and
   // reported instead of silently hanging the run.
@@ -2986,9 +3043,9 @@ const statusBar = (input: {
 }
 
 const interactive = async (explicitModel: string | undefined): Promise<void> => {
+  let model = startModel(explicitModel)
   const config = loadRuntimeConfig({ cwd: process.cwd(), env: process.env, overrides: { live: true } })
   const runtime = await createRuntime(config)
-  let model = explicitModel === undefined ? defaultModel() : modelFrom(explicitModel)
   let history: ChatMessage[] = []
   let lastTokens = 0
   let lastContext: TurnContext | undefined
@@ -3003,6 +3060,12 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   // that probe asks for approval, so a rejecting stub is enough.
   const probeApproval: ApprovalService = { request: async () => 'rejected' }
   let tools: readonly ToolSchema[] = []
+  /**
+   * Bumped on every successful reload of the installed inventory. Numeric
+   * selectors are bound to it: a listing printed before a refresh must not
+   * resolve a number against a different module order.
+   */
+  let toolRev = 0
   const refreshTools = async (): Promise<void> => {
     const probe = await runtime.beginRun({ approval: probeApproval })
     try {
@@ -3010,6 +3073,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     } finally {
       await probe.dispose()
     }
+    toolRev += 1
   }
   try {
     await refreshTools()
@@ -3023,9 +3087,16 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   const loadedPrefs = loadToolPreferences()
   let toolPrefs: ToolPreferences = loadedPrefs.prefs
   let toolPrefsError = loadedPrefs.error
+  let toolPrefsDegraded = loadedPrefs.degraded
   const prefsPath = loadedPrefs.path
-  /** Names in the order of the last printed `/tools` list, for `off 3`. */
-  let toolListing: string[] | undefined
+  /**
+   * Names in the order of the last `/tools` list or picker, for `off 3`.
+   * The startup inventory is the first implicit listing; a refresh bumps
+   * `toolRev`, so old numbers become stale instead of rebinding silently.
+   */
+  let toolListing: string[] | undefined = tools.map((tool) => tool.name)
+  /** `toolRev` when that listing was shown; numbers from another rev are stale. */
+  let toolListingRev = toolRev
 
   // The model, directory and limits live in the composer footer, so the welcome
   // box only has to greet and point at the commands.
@@ -3051,6 +3122,32 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   tail.setHeader(buildBanner)
   /** Everything the user sees from here on goes through the tail. */
   const say = (line = ''): void => tail.print(line)
+
+  /**
+   * An unreadable overlay degrades the whole session's policy, so it is reported
+   * once at startup and not only inside `/tools`. The second line states which
+   * of the two recoveries is in force: after a good read this process keeps it
+   * (`lastGood`), while a fresh process with no good read really does treat
+   * every tool as enabled. `/tools reset` is the repair in both cases.
+   */
+  let reportedPrefsError: string | undefined
+  const reportPrefsError = (): void => {
+    if (toolPrefsError === undefined) {
+      reportedPrefsError = undefined
+      return
+    }
+    if (reportedPrefsError === toolPrefsError) return
+    reportedPrefsError = toolPrefsError
+    say(red(`tools · preferences problem (${prefsPath}): ${toolPrefsError}`))
+    const note =
+      toolPrefsDegraded === 'last-good'
+        ? 'keeping the last policy this process read'
+        : toolPrefsDegraded === 'partial'
+          ? 'unreadable entries are treated as disabled'
+          : 'no readable policy in this process, so every tool is enabled until the file is fixed'
+    say(dim(`  ${note} · /tools reset rewrites the file`))
+  }
+  reportPrefsError()
 
   const complete = (value: string, cursor: number): { value: string; cursor: number; message?: string } | undefined => {
     const before = value.slice(0, cursor)
@@ -3114,6 +3211,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     const loaded = loadToolPreferences()
     toolPrefs = loaded.prefs
     toolPrefsError = loaded.error
+    toolPrefsDegraded = loaded.degraded
   }
   const enabledToolCount = (): number =>
     tools.filter((tool) => toolState(toolPrefs, tool.name) === 'enabled').length
@@ -3133,9 +3231,10 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   }
 
   /**
-   * `/tools` keeps a numbered list so `off 3` is easy. Numbers resolve against
-   * the last printed list, so a stale index cannot silently hit another tool
-   * after the module set changes; names always resolve against the live list.
+   * `/tools` keeps a numbered list so `off 3` is easy. Numbers resolve only
+   * against the last printed list *at the current inventory revision*: after a
+   * refresh a stale number is rejected instead of silently hitting whatever the
+   * module happens to return third. Names always resolve against the live list.
    */
   const printTools = (includeOrphans: boolean): void => {
     reloadToolPrefs()
@@ -3153,6 +3252,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       }
     }
     toolListing = rows.map((row) => row.name)
+    toolListingRev = toolRev
 
     const live = rows.filter((row) => row.installed)
     const off = live.filter((row) => row.state === 'disabled').length
@@ -3163,10 +3263,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     if (deleted > 0) parts.push(`${red(String(deleted))} deleted`)
     if (stale > 0) parts.push(`${String(stale)} stale`)
     say(`${bold('tools')} · ${String(tools.length)} installed · ${parts.join(' · ')}`)
-    if (toolPrefsError !== undefined) {
-      say(red(`tools · preferences unreadable (${prefsPath}): ${toolPrefsError}`))
-      say(dim('  every tool is treated as enabled until the file is fixed or replaced'))
-    }
+    reportPrefsError()
     if (rows.length === 0) {
       say(dim('  none installed'))
       return
@@ -3190,16 +3287,50 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     }
   }
 
-  const findToolName = (selector: string): string | undefined => {
+  /**
+   * Resolve a `/tools` selector to a tool name.
+   *
+   * Numbers are bound to the last printed listing *and* to the inventory
+   * revision it was printed at; a number with no listing, or one printed before
+   * a refresh, is an error rather than a guess. Names are looked up live, and an
+   * unknown name triggers one inventory refresh so a tool installed since
+   * startup can be toggled without a manual `/tools refresh`.
+   */
+  const resolveToolName = async (
+    selector: string,
+  ): Promise<{ ok: true; name: string } | { ok: false; message: string }> => {
     if (/^\d+$/.test(selector)) {
-      const listing = toolListing ?? tools.map((tool) => tool.name)
-      return listing[Number(selector) - 1]
+      if (toolListing === undefined || toolListingRev !== toolRev) {
+        return { ok: false, message: 'tools · the tool list changed; run /tools again' }
+      }
+      const index = Number(selector)
+      if (index < 1 || index > toolListing.length) {
+        return {
+          ok: false,
+          message: `tools · no tool at position ${selector} · /tools for the list`,
+        }
+      }
+      return { ok: true, name: toolListing[index - 1]! }
     }
-    if (tools.some((tool) => tool.name === selector)) return selector
+    if (tools.some((tool) => tool.name === selector)) return { ok: true, name: selector }
     // A deleted tool that is no longer installed still has a preference entry,
     // and must remain selectable for `restore`.
-    if (Object.hasOwn(toolPrefs.tools, selector)) return selector
-    return undefined
+    if (Object.hasOwn(toolPrefs.tools, selector)) return { ok: true, name: selector }
+    // The startup probe can predate the module directory, so retry once.
+    try {
+      await refreshTools()
+    } catch (error) {
+      debugLog(
+        `tool refresh for "${selector}" failed: ${error instanceof Error ? error.message : String(error)}`,
+      )
+      return {
+        ok: false,
+        message: `tools · no tool "${selector}" · refresh failed · /tools refresh to retry`,
+      }
+    }
+    reloadToolPrefs()
+    if (tools.some((tool) => tool.name === selector)) return { ok: true, name: selector }
+    return { ok: false, message: `tools · no tool "${selector}" · /tools for the list` }
   }
 
   const applyToolState = (names: readonly string[], state: ToolState): boolean => {
@@ -3220,6 +3351,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     }
     toolPrefs = next
     toolPrefsError = undefined
+    toolPrefsDegraded = undefined
     refreshStatus()
     return true
   }
@@ -3241,6 +3373,10 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       return
     }
     reloadToolPrefs()
+    // The picker is the interactive form of the numbered list; bind its order
+    // once so `off 12` after closing it resolves to the row the user saw.
+    toolListing = tools.map((tool) => tool.name)
+    toolListingRev = toolRev
     composer.openToolMenu(toolMenuItems(), (action, name) => {
       reloadToolPrefs()
       const current = toolState(toolPrefs, name)
@@ -3264,7 +3400,6 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     if (rest === 'refresh') {
       try {
         await refreshTools()
-        toolListing = undefined
         reloadToolPrefs()
         say(`tools · refreshed · ${String(tools.length)} installed`)
       } catch (error) {
@@ -3297,15 +3432,18 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       )
       return
     }
-    if (selector === '') {
+    if (selector === '' || (selector === 'all' && verb === 'delete')) {
       const all = verb === 'on' || verb === 'off' || verb === 'restore' ? '|all' : ''
       say(`usage: /tools ${verb} <n|name>${all}`)
       return
     }
     if (verb === 'off' && selector === 'all') {
+      // Only `enabled` becomes `disabled`: a tombstone must stay a tombstone, or
+      // `restore all` has nothing left to find. Keep the result explicit today
+      // instead of relying on `disabled` and `deleted` being equally hidden.
       const names = tools
         .map((tool) => tool.name)
-        .filter((name) => toolState(toolPrefs, name) !== 'disabled')
+        .filter((name) => toolState(toolPrefs, name) === 'enabled')
       if (names.length === 0) {
         say('tools · every tool is already off')
         return
@@ -3336,23 +3474,24 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       return
     }
 
-    const name = findToolName(selector)
-    if (name === undefined) {
-      say(`tools · no tool "${selector}" · /tools for the list`)
+    const resolved = await resolveToolName(selector)
+    if (!resolved.ok) {
+      say(resolved.message)
       return
     }
+    const name = resolved.name
     const current = toolState(toolPrefs, name)
     if (verb === 'off') {
+      if (current === 'deleted') {
+        say(`tools · ${name} is already deleted · /tools restore ${name} brings it back`)
+        return
+      }
       if (current === 'disabled') {
         say(`tools · ${name} is already off`)
         return
       }
       if (!applyToolState([name], 'disabled')) return
-      say(
-        current === 'deleted'
-          ? `tools · ${name} deleted → off · still hidden from the agent`
-          : `tools · ${name} off · hidden from the agent`,
-      )
+      say(`tools · ${name} off · hidden from the agent`)
       return
     }
     if (verb === 'delete') {
@@ -3495,13 +3634,14 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         continue
       }
       if (line.startsWith('/model ')) {
-        const raw = line.slice('/model '.length).trim()
-        const slash = raw.indexOf('/')
-        if (slash <= 0 || slash === raw.length - 1) {
-          say('usage: /model provider/model')
+        const parsed = parseModelRef(line.slice('/model '.length))
+        if (!parsed.ok) {
+          // Same helper as `--model`/`Z1_MODEL`, but a bad `/model` keeps the
+          // session running: it is a command error, not a startup error.
+          say(`model · ${parsed.error}`)
           continue
         }
-        model = { provider: raw.slice(0, slash), model: raw.slice(slash + 1) }
+        model = parsed.model
         say(`model · ${modelLabel(model)}`)
         continue
       }
