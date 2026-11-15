@@ -23,8 +23,9 @@ re-read `call()`, failed write leaves the snapshot, corrupt-file `reset()`.
 fails on a non-zero exit, any ESC byte, or a missing `tools ·`.
 
 `session-smoke.sh`: creates a temp git repo, saves a turn under `z1/`, lists
-and resumes it, asserts four messages survive, `git status` is clean, and
-`--once` creates no `z1/`.
+and resumes it, asserts four messages survive, `git status` is clean, drives the
+generation guard that refuses a turn read before a concurrent `/clear` in
+another process, and `--once` creates no `z1/`.
 
 Not covered: prompt↔wire agreement, history/seed, the full `/tools` and
 `/sessions` grammar matrices, pty/composer, foreign-cwd refusal and corrupt

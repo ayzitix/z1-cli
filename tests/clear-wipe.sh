@@ -182,4 +182,57 @@ if os.path.getsize(sys.argv[2]) == 0:
 PY
 fi
 
-echo "PASS: pipe stays escape-free, Z1_TRAY=off is inert on a tty, /new + /clear wipe screen+scrollback and reprint the banner, pinned mode intact, a failed store clear keeps the transcript visible"
+# --- 6. a wipe settles the geometry the next reflow is compared against -------
+# `/new` replaces the screen at the *current* size, so the tail has to record
+# that size. When a SIGWINCH arrives just before the wipe and its 250 ms
+# debounce fires just after, the old code answered with a correction computed
+# from the pre-wipe rows (`oldTrayTop = oldRows - trayRows + 1`) — row addresses
+# for a screen that no longer exists, which is how banner rows survived a wipe.
+# The bytes alone cannot show it (the wipe erases its own evidence), so the
+# layout is read from the `Z1_UI_DEBUG` log: after the wipe repaint every
+# reflow must start from the wiped geometry, either as a no-op or as a
+# height-only step whose `old` is the wiped row count.
+printf '@resize 30x80\n/new\n/exit\n' >"$tmp/resize-input.txt"
+: >"$tmp/resize.dbg"
+( cd "$repo" && PTY_INPUT_FILE="$tmp/resize-input.txt" PTY_SIZE=24x80 PTY_GAP=0.12 \
+    python3 "$PTY" "$tmp/resize.raw" 40 \
+    env "${env_args[@]}" "Z1_DB=$tmp/resize.db" "Z1_TOOLS_FILE=$tmp/tools.json" \
+    "Z1_UI_DEBUG=$tmp/resize.dbg" Z1_PINNED=off "$TSX" "$CHAT" ) || {
+  echo "FAIL: the wipe+resize pty run did not exit" >&2
+  exit 1
+}
+python3 - "$tmp/resize.raw" "$tmp/resize.dbg" <<'PY' || exit 1
+import re, sys
+raw = open(sys.argv[1], 'rb').read()
+log = [line.rstrip('\n') for line in open(sys.argv[2], encoding='utf-8') if line.strip()]
+wipe = b'\x1b[r\x1b[2J\x1b[3J\x1b[1;1H'
+if raw.count(wipe) != 1:
+    raise SystemExit(f'expected the one `/new` wipe, found {raw.count(wipe)}')
+if not any('sigwinch rows=30 cols=80' in line for line in log):
+    raise SystemExit('the resize never reached the console')
+after = raw[raw.find(wipe):]
+banners = after.count('\u2b21'.encode())
+if banners != 1:
+    raise SystemExit(f'the wipe + resize left {banners} banner rows, expected 1')
+anchor = max((i for i, line in enumerate(log) if ' paint ' in line and 'prevRows=0' in line), default=-1)
+if anchor < 0:
+    raise SystemExit('the wipe did not repaint the screen')
+wiped = re.search(r'rows=(\d+)', log[anchor])
+cols = re.search(r'cols=(\d+)', log[anchor])
+if wiped is None or cols is None:
+    raise SystemExit(f'the wipe repaint did not record its layout: {log[anchor]}')
+rows, columns = wiped.group(1), cols.group(1)
+if rows != '30' or columns != '80':
+    raise SystemExit(f'the wipe repainted at {rows}x{columns}, not the resized 30x80')
+for line in log[anchor + 1:]:
+    if ' reflow ' not in line:
+        continue
+    if 'reflow height-only' in line:
+        if f'old={rows} ' not in line:
+            raise SystemExit(f'the reflow repaired a layout the wipe replaced: {line}')
+        continue
+    if 'changed=false' not in line or f'screenRows={rows} ' not in line or f'screenCols={columns} ' not in line:
+        raise SystemExit(f'the reflow did not start from the wiped layout: {line}')
+PY
+
+echo "PASS: pipe stays escape-free, Z1_TRAY=off is inert on a tty, /new + /clear wipe screen+scrollback and reprint the banner, pinned mode intact, a failed store clear keeps the transcript visible, a wipe followed by a resize reflows from the wiped layout"

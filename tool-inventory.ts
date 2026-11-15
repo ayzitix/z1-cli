@@ -31,8 +31,8 @@ const MAX_OFF_NAMES = 24
  * `` `a`, `b`, …, `x` and 6 more `` — record order, never truncated silently.
  *
  * `cap` is opt-in and only the turned-off line passes one: the enabled list is
- * followed by "That list is the complete set", so capping it would make the
- * prompt lie about a tool the request genuinely carries.
+ * followed by "the complete set of tools you can call", so capping it would
+ * make the prompt lie about a tool the request genuinely carries.
  */
 const nameList = (records: readonly ToolRecord[], cap?: number): string => {
   const kept = cap === undefined ? records : records.slice(0, cap)
@@ -112,7 +112,7 @@ export function toolInventoryText(snapshot: ToolSnapshot): string {
     TOOL_INVENTORY_HEADING,
     '',
     `You have: ${names} (${count}).`,
-    'That list is the complete set. Never claim or call a tool not named here. Their schemas are attached to this request.',
+    'That is the complete set of tools you can call this turn: the ones in the You have list. Never claim or call anything else, including the turned-off names below. Their schemas are attached to this request.',
   ]
   const offNames = offLine(snapshot)
   if (offNames !== undefined) body.push(offNames)

@@ -23,6 +23,7 @@ import { runGraph } from '/home/oleksii/Projects/z1-sdk/z1/packages/runtime/src/
 import type { ApprovalService, RunEvent, RunResult } from '/home/oleksii/Projects/z1-sdk/z1/packages/runtime/src/index.ts'
 import { graphDigest } from '/home/oleksii/Projects/z1-sdk/z1/packages/graph/src/index.ts'
 import {
+  SessionClearedError,
   SessionTooNewError,
   createSessionStore,
   findRepoRoot,
@@ -2099,6 +2100,20 @@ const createTail = (options: { live?: boolean; pinned?: boolean } = {}): Tail =>
     // The banner is not part of `history` (the caller printed it once), so it
     // has to be printed again before the first paint continues below it.
     const rows = terminalRows()
+    const columns = terminalColumns()
+    // The wipe replaced the screen *and* the scrollback, so the layout the tail
+    // remembers has to be the wiped one. Leaving the pre-wipe `screenRows`/
+    // `screenColumns` (or a `resizeDirty` raised by a SIGWINCH that arrived just
+    // before the wipe) makes the next `reflow` diff the live size against a
+    // screen that no longer exists: it can take the height-only branch, which
+    // addresses the *old* tray rows (`oldTrayTop = screenRows - trayRows + 1`)
+    // and erases above the new banner instead of replaying the screen, and a
+    // stale `resizeDirty` forces a second full wipe of a screen that is already
+    // clean. Recording the geometry that was actually painted is what the
+    // `reflow` branch decision was always meant to compare against.
+    screenRows = rows
+    screenColumns = columns
+    resizeDirty = false
     const header = headerBuilder?.() ?? ''
     const headerRows = header.length > 0 ? header.split('\n').length : 0
     if (header.length > 0) {
@@ -3796,15 +3811,76 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
    * Autosave one turn. Called for completed, failed and cancelled runs alike:
    * the store appends only the new tail (or one snapshot when the transcript
    * was rewritten by compaction) and ignores a no-op.
+   *
+   * Returns `false` only when the transcript was cleared elsewhere while the
+   * turn ran, so the caller must not feed this turn's context back into the
+   * conversation state.
    */
-  const saveTurn = (session: Session, messages: readonly ChatMessage[], runId: string): void => {
-    if (sessions === undefined) return
+  const saveTurn = (session: Session, messages: readonly ChatMessage[], runId: string): boolean => {
+    if (sessions === undefined) return true
     try {
-      sessions.appendTurn(session.meta.id, messages, { runId })
-      currentSession = sessions.load(session.meta.id) ?? session
+      sessions.appendTurn(session.meta.id, messages, {
+        runId,
+        // The generation this handle's `messages` were read at. The store
+        // refuses the append when the transcript moved on: those messages are
+        // no longer a prefix of what is on disk, and appending them would
+        // resurrect a conversation somebody deliberately emptied.
+        generation: session.meta.generation ?? 0,
+      })
     } catch (error) {
+      if (error instanceof SessionClearedError) {
+        // The transcript's generation moved on while this turn ran, so it was
+        // cleared elsewhere: another z1 process on this repository, or a
+        // hand-edited file. (`/clear` here cannot be it — a turn owns the
+        // prompt.) The turn is dropped: no append, no snapshot, no
+        // `sessionFailure`, because nothing failed — the conversation is gone.
+        // The handle and the in-memory copy are reloaded/emptied so the next
+        // prompt cannot carry the stale messages back into the fresh transcript.
+        let reloaded: Session | undefined
+        try {
+          reloaded = sessions.load(session.meta.id)
+        } catch {
+          reloaded = undefined
+        }
+        currentSession = reloaded
+        history = []
+        lastContext = undefined
+        lastTokens = 0
+        forceCompact = false
+        say(
+          yellow(
+            'session · this conversation was cleared elsewhere; this turn was not saved · the next prompt starts fresh',
+          ),
+        )
+        return false
+      }
       sessionFailure('could not save this turn', error)
+      return true
     }
+    let reloaded: Session | undefined
+    try {
+      reloaded = sessions.load(session.meta.id)
+    } catch {
+      // A corrupt or too-new transcript is reported by the append above; the
+      // handle is dropped below for the same reason as a missing one.
+      reloaded = undefined
+    }
+    if (reloaded !== undefined) {
+      currentSession = reloaded
+      return true
+    }
+    // The append landed, but the session it landed in can no longer be read
+    // back. Keeping `session` would pin a handle whose `messages` stop at the
+    // previous turn (and whose `messageCount` is one turn short) — the same lie
+    // the `/clear` path guards against, and `titleSession` would look for the
+    // first user message in that stale array. The in-memory transcript is not
+    // touched: `history` still holds the whole conversation, so dropping the
+    // handle means the next prompt creates a session and `appendTurn` writes
+    // that full transcript into it rather than continuing beside it.
+    currentSession = undefined
+    say(red('session · saved this turn, but the session can no longer be read'))
+    say(dim('  the next prompt starts a new session; this one is left as it is on disk'))
+    return true
   }
 
   /** Strip quotes/labels so a model reply becomes a plain one-line title. */
@@ -4535,8 +4611,13 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         removed = sessions.load(id)?.messages.length ?? currentSession.meta.messageCount
         sessions.clear(id)
         // `clear` keeps id, name, colour, model and folder; the next prompt
-        // must append here, so the handle has to stay pointed at this id.
-        currentSession = sessions.load(id) ?? currentSession
+        // must append here, so the handle has to stay pointed at this id. The
+        // reload is also the only proof the directory survived `clear`: if it
+        // did not, keeping the pre-clear handle would keep its old `messages`
+        // and `messageCount`, `ensureSession()` would hand that lying object to
+        // the next turn, and `appendTurn` on a vanished id fails every time —
+        // one reported error, then a chat that silently saves nothing.
+        currentSession = sessions.load(id)
         // Old text must not title a conversation that is now empty.
         pendingTitles.delete(id)
         resetLive()
@@ -4550,10 +4631,16 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         refreshStatus()
         return 'continue'
       }
+      const count = `${String(removed)} ${removed === 1 ? 'message' : 'messages'} removed`
+      // After a clear the handle is only valid if the directory is still there;
+      // `undefined` here means `load` found nothing, so the next prompt creates
+      // a fresh session instead of appending to this one.
       say(
-        removed === 0
-          ? `clear · "${name}" is already empty · same session`
-          : `cleared "${name}" · ${String(removed)} ${removed === 1 ? 'message' : 'messages'} removed · same session · next prompt starts fresh`,
+        currentSession === undefined
+          ? `cleared "${name}" · ${count} · the session directory is gone; the next prompt starts a new one`
+          : removed === 0
+            ? `clear · "${name}" is already empty · same session`
+            : `cleared "${name}" · ${count} · same session · next prompt starts fresh`,
       )
       refreshStatus()
       return 'continue'
@@ -4738,16 +4825,22 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         forceCompact = false
         history = outcome.history
         // A failed or cancelled turn is saved too: the store writes whichever
-        // transcript this turn produced and no-ops when nothing changed.
+        // transcript this turn produced and no-ops when nothing changed. A
+        // `false` means the transcript was cleared elsewhere mid-turn, so
+        // `history` and the context below were reset and none of this turn's
+        // state may be carried into the next prompt.
+        const kept =
+          activeSession === undefined
+            ? true
+            : saveTurn(activeSession, outcome.history, outcome.runId)
         if (activeSession !== undefined) {
-          saveTurn(activeSession, outcome.history, outcome.runId)
           // Only a new, unnamed session gets an AI title; a loaded transcript
           // keeps the name it already has.
-          if (outcome.status === 'completed' && currentSession !== undefined) {
+          if (kept && outcome.status === 'completed' && currentSession !== undefined) {
             await titleSession(handle, currentSession)
           }
         }
-        if (outcome.context !== undefined) {
+        if (outcome.context !== undefined && kept) {
           lastContext = outcome.context
           lastTokens = outcome.context.tokens
           // The footer shows the percentage on every prompt; only a compaction

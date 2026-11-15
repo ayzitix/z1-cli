@@ -71,6 +71,22 @@ assert.ok(hasRule(some), 'the fail-fast rule keeps all four clauses')
 // The screenshot case: the model must be able to name `write` from the prompt.
 assert.ok(/Turned off: [^\n]*`write`/.test(some), 'only `write` being off is still reported')
 
+// Callable vs named-but-off: a literal reader must not think `write` is callable
+// just because the section names it.
+const callable = some.split('\n').filter((line) => line.includes('tools you can call'))
+assert.equal(callable.length, 1, 'exactly one line defines what is callable')
+assert.ok(callable[0].includes('the ones in the You have list'), 'it points at the You have list')
+assert.ok(callable[0].includes('including the turned-off names below'), 'named-but-off tools are excluded explicitly')
+assert.ok(!some.includes('not named here'), 'the old absolute wording is gone')
+// Every turned-off name sits after the off-line marker, never in the callable set.
+const offIndex = some.indexOf('\nTurned off: ')
+assert.ok(offIndex > 0, 'the off line exists')
+const beforeOff = some.slice(0, offIndex)
+for (const name of OFF) {
+  assert.ok(!beforeOff.includes(`\`${name}\``), `${name} is not named before the off line`)
+}
+assert.ok(some.indexOf('`write`') > offIndex, '`write` is only named as turned off')
+
 // ------------------------------------------------------------------ none enabled
 const none = toolInventoryText(snapshot({ enabled: [], off: READ_ONLY }))
 assert.ok(none.includes('You have no tools this turn'), 'the empty case says so plainly')

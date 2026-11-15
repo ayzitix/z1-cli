@@ -204,6 +204,95 @@ if [ -d "$empty/z1/sessions" ] && find "$empty/z1/sessions" -name meta.json -pri
   exit 1
 fi
 
+# A turn is read at one transcript generation and saved at the end of the run.
+# If another z1 process clears the conversation in between, that save must be
+# refused rather than resurrecting the cleared turns — this is the guard the
+# CLI's autosave relies on. The real race (two processes, one turn) cannot be
+# timed from a shell, so the guard is driven directly with saveTurn's own calls:
+# append at the generation the handle was read at, clear from "the other
+# process", then re-offer the stale transcript.
+SDK="${Z1_SDK_REPO:-$HOME/Projects/z1-sdk}"
+guard="$tmp/guard"
+mkdir -p "$guard"
+git -C "$guard" init -q
+cat >"$tmp/generation-guard.mts" <<MTS
+import {
+  SessionClearedError,
+  createSessionStore,
+} from '$SDK/z1/packages/session/src/index.ts'
+
+const cwd = process.argv[2]
+if (cwd === undefined) throw new Error('usage: generation-guard.mts <cwd>')
+const store = createSessionStore({ cwd, env: process.env })
+const created = store.create({
+  name: 'generation guard',
+  cwd,
+  model: { provider: 'mock', model: 'mock-1' },
+  contextWindow: 1000,
+  maxSteps: 4,
+})
+const id = created.meta.id
+const first = [
+  { role: 'user', content: 'first question' },
+  { role: 'assistant', content: 'first answer' },
+]
+store.appendTurn(id, first, { runId: 'run_a', generation: 0 })
+const saved = store.load(id)
+if (saved === undefined || saved.messages.length !== 2) throw new Error('first turn did not save')
+if ((saved.meta.generation ?? 0) !== 0) throw new Error('an ordinary save advanced the generation')
+
+// "the other process": the same id, emptied while this handle still holds 0.
+store.clear(id)
+const cleared = store.load(id)
+if (cleared === undefined) throw new Error('clear dropped the session')
+if ((cleared.meta.generation ?? 0) !== 1) throw new Error('clear did not advance the generation')
+if (cleared.messages.length !== 0) throw new Error('clear left messages behind')
+
+const stale = [
+  ...first,
+  { role: 'user', content: 'second question' },
+  { role: 'assistant', content: 'second answer' },
+]
+let rejected: SessionClearedError | undefined
+try {
+  store.appendTurn(id, stale, { runId: 'run_b', generation: 0 })
+} catch (error) {
+  if (!(error instanceof SessionClearedError)) throw error
+  rejected = error
+}
+if (rejected === undefined) throw new Error('a stale append resurrected the cleared transcript')
+if (rejected.id !== id) throw new Error('SessionClearedError named ' + rejected.id)
+if (rejected.generation !== 1) throw new Error('SessionClearedError reported generation ' + rejected.generation)
+const afterStale = store.load(id)
+if (afterStale === undefined || afterStale.messages.length !== 0) {
+  throw new Error('the rejected turn was written to disk anyway')
+}
+
+// What saveTurn does next: reload, then the next prompt saves at the new
+// generation — from ord 0, not on top of the cleared turns.
+const reloaded = store.load(id)
+if (reloaded === undefined) throw new Error('reload after a clear returned nothing')
+store.appendTurn(id, first, { runId: 'run_c', generation: reloaded.meta.generation ?? 0 })
+const final = store.load(id)
+if (final === undefined || final.messages.length !== 2) throw new Error('the reloaded handle could not append')
+if (final.messages[0]?.content !== 'first question') throw new Error('the reloaded append did not start at ord 0')
+console.log('generation guard ok')
+MTS
+if ! (cd "$guard" && "$TSX" "$tmp/generation-guard.mts" "$guard" >"$tmp/guard.out" 2>"$tmp/guard.err"); then
+  echo "FAIL: the generation guard did not reject a stale append" >&2
+  sed -n '1,20p' "$tmp/guard.err" >&2
+  exit 1
+fi
+for needle in \
+  'generation: session.meta.generation ?? 0' \
+  'error instanceof SessionClearedError' \
+  'this conversation was cleared elsewhere'; do
+  if ! grep -qF "$needle" "$CHAT"; then
+    echo "FAIL: chat.ts no longer guards the autosave with the generation ('$needle')" >&2
+    exit 1
+  fi
+done
+
 # `--once` is a one-liner and must not leave a z1/ directory.
 once="$tmp/once"
 mkdir -p "$once"
@@ -214,4 +303,4 @@ if [ -e "$once/z1" ]; then
   exit 1
 fi
 
-echo "PASS: sessions save, list, resume, /clear in place, /new unnamed, stay out of git; --once leaves no z1/"
+echo "PASS: sessions save, list, resume, /clear in place, /new unnamed, a stale turn is refused after a concurrent clear, stay out of git; --once leaves no z1/"

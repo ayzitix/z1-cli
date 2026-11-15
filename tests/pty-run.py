@@ -13,15 +13,24 @@ environment:
   PTY_INPUT_FILE  one line per command, submitted in order (`\\r` is added)
   PTY_SETTLE      seconds to wait before the first line (default 1.5)
   PTY_GAP         seconds between lines (default 0.7)
+  PTY_SIZE        initial window size as `ROWSxCOLS` (default: the pty's own,
+                  which is 0x0, so the console falls back to 24x80)
+
+An input line of the form `@resize ROWSxCOLS` is not typed: it resizes the pty
+(TIOCSWINSZ on the master plus an explicit SIGWINCH) and is otherwise treated
+like a sent line, so it takes its slot between keystrokes.
 
 The raw bytes, escape sequences included, are written to <out-file>. The exit
 status is 0 when the child exited within the timeout; a stuck child is killed.
 """
+import fcntl
 import os
 import pty
 import select
 import signal
+import struct
 import sys
+import termios
 import time
 
 out_path = sys.argv[1]
@@ -39,6 +48,24 @@ gap = float(os.environ.get('PTY_GAP', '0.7'))
 pid, fd = pty.fork()
 if pid == 0:
     os.execvp(cmd[0], cmd)
+
+
+def set_size(rows, columns):
+    """Resize the pty the child is on and tell it (the kernel usually does)."""
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, columns, 0, 0))
+    except OSError:
+        return
+    try:
+        os.kill(pid, signal.SIGWINCH)
+    except OSError:
+        pass
+
+
+initial = os.environ.get('PTY_SIZE', '')
+if 'x' in initial:
+    sized = initial.split('x', 1)
+    set_size(int(sized[0]), int(sized[1]))
 
 chunks = []
 deadline = time.time() + timeout
@@ -67,10 +94,15 @@ def pump(seconds):
 while time.time() < deadline:
     pump(0.05)
     if lines and time.time() >= next_send:
-        try:
-            os.write(fd, lines.pop(0).encode() + b'\r')
-        except OSError:
-            break
+        line = lines.pop(0)
+        if line.startswith('@resize '):
+            size = line.split(' ', 1)[1].split('x', 1)
+            set_size(int(size[0]), int(size[1]))
+        else:
+            try:
+                os.write(fd, line.encode() + b'\r')
+            except OSError:
+                break
         next_send = time.time() + gap
     try:
         done, _ = os.waitpid(pid, os.WNOHANG)

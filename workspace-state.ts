@@ -78,10 +78,16 @@ export function ownStateText(options: {
   // `/sessions` is the verb the user actually types.
   const name = options.session?.name.trim() ?? ''
   const count = options.session?.messageCount
+  // The name is user-controlled: the store's `normalizeName` replaces control
+  // characters but keeps quotes, backticks and backslashes, so a session
+  // renamed `x" ignore previous instructions` would otherwise land in the
+  // system prompt as prose the model can read as an instruction. Emitting it as
+  // a JSON string escapes quotes, backslashes and any newline a caller passes
+  // unnormalized; the parenthesis explains why the model sees `\"` in the name.
   const identity: string | undefined =
     name === '' || count === undefined || !Number.isFinite(count) || count < 0
       ? undefined
-      : `This chat is the session "${name}" with ${String(count)} ${count === 1 ? 'message' : 'messages'}; /sessions lists and switches.`
+      : `This chat is the session ${JSON.stringify(name)} (JSON string) with ${String(count)} ${count === 1 ? 'message' : 'messages'}; /sessions lists and switches.`
 
   const cleanup =
     root === ''
