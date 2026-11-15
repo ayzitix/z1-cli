@@ -1,7 +1,8 @@
 /**
  * Unit tests for `web-service.ts`: path resolution, the settings template, the
  * health probe, stale pid files, process identity, log rotation, the download's
- * checksum/deadline, stop-refusal and the `Z1_SEARX_URL` opt-out.
+ * checksum/deadline, stop-refusal, adoption of a legacy pid file, and the
+ * `Z1_SEARX_URL` opt-out.
  *
  * Nothing here installs SearXNG, downloads the real tarball or binds port 8888 —
  * every network interaction is a `node:http` server on an ephemeral port, so the
@@ -376,6 +377,130 @@ assert.equal(listener.state, 'ready')
 assert.match(listener.detail, /was not started by this z1; not stopping it/)
 assert.equal(await checkHealth(good), true, 'the unmanaged listener is still answering')
 
+// ---- legacy pid adoption ---------------------------------------------------
+
+// A backend installed by a build that predates `searxng.json`: the plain pid
+// file is all there is. It is adopted when — and only when — the command line
+// is this waitress on this port, using `identityMatches` unchanged.
+const legacyPid = 999_998
+const legacyCommand = `python -m waitress --listen=127.0.0.1:${String(port)} --threads=8 --channel-timeout=300 searx.webapp:app`
+const legacyIdentity: ProcessIdentity = { pid: legacyPid, startedAt: '777777', command: legacyCommand }
+const readerFor =
+  (identity: ProcessIdentity | undefined) =>
+  async (pid: number): Promise<ProcessIdentity | undefined> =>
+    identity !== undefined && identity.pid === pid ? identity : undefined
+
+const legacyDir = join(dir, 'legacy')
+const legacyPaths = resolveWebPaths({ Z1_WEB_DIR: legacyDir })
+mkdirSync(legacyPaths.dataDir, { recursive: true })
+writeFileSync(legacyPaths.pidFile, `${String(legacyPid)}\n`)
+const legacyEnv = { Z1_WEB_DIR: legacyDir, Z1_SEARX_URL: '' }
+assert.equal(readServerRecord(legacyPaths), undefined, 'no identity file to begin with')
+
+// The status answer adopts it, so a legacy backend reads as ours (healthy).
+const adoptedStatus = await webSearchStatus(legacyEnv, { url: good, identity: readerFor(legacyIdentity) })
+assert.equal(adoptedStatus.state, 'ready')
+assert.equal(adoptedStatus.pid, legacyPid, 'the adopted pid is reported')
+assert.equal(adoptedStatus.detail, `ready at ${good}`)
+const adoptedRecord = readServerRecord(legacyPaths)
+assert.equal(adoptedRecord?.pid, legacyPid, 'adoption writes the record a start would have written')
+assert.equal(adoptedRecord?.startedAt, '777777')
+assert.equal(adoptedRecord?.port, port)
+assert.equal(adoptedRecord?.command, legacyCommand)
+
+// A startup adopts too, and says nothing about the backend it inherited: the
+// old "was not started by this z1" line on every launch was the bug.
+const adoptLines: string[] = []
+const legacyStart = await ensureWebSearch({
+  env: legacyEnv,
+  url: good,
+  identity: readerFor(legacyIdentity),
+  onLine: line => adoptLines.push(line),
+})
+assert.equal(legacyStart.state, 'ready')
+assert.equal(legacyStart.pid, legacyPid)
+assert.deepEqual(adoptLines, [], 'adoption prints nothing at startup')
+
+// Wrong command line: a live pid that is not our waitress is not adopted. The
+// listener is still used, the status still says so, and no banner line appears.
+const strangerDir = join(dir, 'legacy-stranger')
+const strangerPaths = resolveWebPaths({ Z1_WEB_DIR: strangerDir })
+mkdirSync(strangerPaths.dataDir, { recursive: true })
+writeFileSync(strangerPaths.pidFile, `${String(legacyPid)}\n`)
+const strangerIdentity: ProcessIdentity = {
+  pid: legacyPid,
+  startedAt: '777777',
+  command: `node --listen=127.0.0.1:${String(port)} server.js`,
+}
+const strangerEnv = { Z1_WEB_DIR: strangerDir, Z1_SEARX_URL: '' }
+const strangerLines: string[] = []
+const stranger = await ensureWebSearch({
+  env: strangerEnv,
+  url: good,
+  identity: readerFor(strangerIdentity),
+  onLine: line => strangerLines.push(line),
+})
+assert.equal(stranger.state, 'ready', 'an unmanaged listener is still usable')
+assert.equal(stranger.pid, undefined, 'but it is not claimed')
+assert.match(stranger.detail, /was not started by this z1/)
+assert.deepEqual(strangerLines, [], 'an unmanaged listener prints no startup line')
+assert.equal(readServerRecord(strangerPaths), undefined, 'a mismatching pid is not adopted')
+assert.equal(readPid(strangerPaths.pidFile), legacyPid, 'and its pid file is left alone at startup')
+
+// The same command line *is* the waitress but on another port: still not ours.
+const otherPort = await webSearchStatus(strangerEnv, {
+  url: good,
+  identity: readerFor({ ...legacyIdentity, pid: legacyPid, command: legacyCommand.replace(String(port), '4444') }),
+})
+assert.match(otherPort.detail, /was not started by this z1/)
+
+// No pid file at all: unmanaged, silently.
+const noPidDir = join(dir, 'legacy-nopid')
+const noPidPaths = resolveWebPaths({ Z1_WEB_DIR: noPidDir })
+mkdirSync(noPidPaths.dataDir, { recursive: true })
+const noPidLines: string[] = []
+const noPid = await ensureWebSearch({
+  env: { Z1_WEB_DIR: noPidDir, Z1_SEARX_URL: '' },
+  url: good,
+  onLine: line => noPidLines.push(line),
+})
+assert.equal(noPid.state, 'ready')
+assert.equal(noPid.pid, undefined)
+assert.match(noPid.detail, /not started by this z1/)
+assert.deepEqual(noPidLines, [], 'no pid file, no startup line')
+assert.equal(existsSync(noPidPaths.identityFile), false, 'nothing is invented for a listener with no pid')
+
+// `stop` adopts before refusing, then stops what it adopted. The pid is
+// deliberately one that does not exist: `kill` gets ESRCH, which proves the
+// signal path ran without touching a live process (least of all the real one).
+const stopLegacyDir = join(dir, 'legacy-stop')
+const stopLegacyPaths = resolveWebPaths({ Z1_WEB_DIR: stopLegacyDir })
+mkdirSync(stopLegacyPaths.dataDir, { recursive: true })
+const deadPid = 999_997
+writeFileSync(stopLegacyPaths.pidFile, `${String(deadPid)}\n`)
+const adoptedStop = await stopWebSearch(
+  { Z1_WEB_DIR: stopLegacyDir, Z1_SEARX_URL: '' },
+  { url: good, graceMs: 100, identity: readerFor({ ...legacyIdentity, pid: deadPid }) },
+)
+assert.equal(adoptedStop.state, 'stopped')
+assert.equal(adoptedStop.detail, `stopped pid ${String(deadPid)}`, 'adoption turns a refusal into a stop')
+assert.equal(readServerRecord(stopLegacyPaths), undefined, 'the record is gone after the stop')
+assert.equal(existsSync(stopLegacyPaths.pidFile), false)
+
+// Adoption failing, the refusal wording is unchanged: nothing is signalled, and
+// only z1's own stale record is removed.
+const refuseDir = join(dir, 'legacy-refuse')
+const refusePaths = resolveWebPaths({ Z1_WEB_DIR: refuseDir })
+mkdirSync(refusePaths.dataDir, { recursive: true })
+writeFileSync(refusePaths.pidFile, `${String(deadPid)}\n`)
+const refusedLegacy = await stopWebSearch(
+  { Z1_WEB_DIR: refuseDir, Z1_SEARX_URL: '' },
+  { url: good, identity: readerFor({ ...strangerIdentity, pid: deadPid }) },
+)
+assert.equal(refusedLegacy.state, 'ready')
+assert.match(refusedLegacy.detail, /was not started by this z1; not stopping it/)
+assert.equal(existsSync(refusePaths.pidFile), false, 'an unverifiable pid file is cleaned up')
+
 // ---- install lock ----------------------------------------------------------
 
 // A first run has no web dir at all: the lock must create it, not report
@@ -568,5 +693,5 @@ await new Promise<void>(resolve => server.close(() => resolve()))
 rmSync(dir, { recursive: true, force: true })
 
 console.log(
-  'PASS: web-service (paths, template, health, pid, identity, external, off switch, state hint, stop refusal, install lock, rotation, download, no hang)',
+  'PASS: web-service (paths, template, health, pid, identity, external, off switch, state hint, stop refusal, legacy pid adoption, install lock, rotation, download, no hang)',
 )

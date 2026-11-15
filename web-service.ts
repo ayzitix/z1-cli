@@ -41,6 +41,15 @@
  * instead. Only a *verified* process is ever sent SIGTERM, and only a verified
  * process that ignored SIGTERM is sent SIGKILL.
  *
+ * Adoption: a build older than the identity file left only `searxng.pid` behind,
+ * and its waitress is still answering. Rather than treating that listener as a
+ * stranger forever (one noisy line on every launch, and a `stop` that refuses),
+ * z1 reads the pid, verifies it *with the same rule* (`identityMatches`: this
+ * waitress, `searx.webapp:app`, on our port) and writes the record it would have
+ * written at spawn time. Adoption can therefore never accept a process a normal
+ * start would reject, and a pid it cannot verify stays unmanaged — silently: the
+ * unmanaged detail belongs in a status answer, not in a startup banner.
+ *
  * `Z1_SEARX_URL` means "someone else runs the backend": when it is set this
  * module only reports health and never installs, starts or stops anything.
  * `Z1_WEB_AUTOSTART=off` disables provisioning for a session.
@@ -496,6 +505,52 @@ export function identityMatches(record: ServerRecord, current: ProcessIdentity |
   )
 }
 
+/** How a caller reads a pid's identity; injectable so tests never spawn a backend. */
+export type IdentityReader = (pid: number) => Promise<ProcessIdentity | undefined>
+
+/**
+ * Adopt the process a legacy `searxng.pid` names, when it really is our
+ * waitress on `port`. Returns the record now on disk, or `undefined`.
+ *
+ * Only the pid file is consulted: an existing `searxng.json` is authoritative
+ * (a start wrote it, so there is nothing to adopt), and a stale one is the
+ * caller's business, not this function's. The candidate record is built from
+ * what the kernel reports and then put through `identityMatches` unchanged, so
+ * the acceptance rule is exactly the one `stop` uses before signalling.
+ */
+export async function adoptLegacyRecord(
+  paths: WebPaths,
+  port: number,
+  options: { identity?: IdentityReader } = {},
+): Promise<ServerRecord | undefined> {
+  if (readServerRecord(paths) !== undefined) return undefined
+  const pid = readPid(paths.pidFile)
+  if (pid === undefined) return undefined
+  const read = options.identity ?? processIdentity
+  const current = await read(pid)
+  if (current !== undefined && current.pid !== pid) return undefined
+  const candidate: ServerRecord = {
+    pid,
+    startedAt: current?.startedAt ?? '',
+    port,
+    command: current?.command ?? '',
+  }
+  if (!identityMatches(candidate, current)) return undefined
+  writeServerRecord(paths, candidate)
+  return candidate
+}
+
+/** The record z1 should act on: the one on disk, else an adoptable legacy pid. */
+async function effectiveRecord(
+  paths: WebPaths,
+  port: number,
+  read: IdentityReader,
+): Promise<ServerRecord | undefined> {
+  const record = readServerRecord(paths)
+  if (record !== undefined) return record
+  return await adoptLegacyRecord(paths, port, { identity: read })
+}
+
 /** True when an install finished and the venv still exists. */
 export function isInstalled(paths: WebPaths): boolean {
   return existsSync(paths.manifestFile) && existsSync(paths.python) && existsSync(paths.srcDir)
@@ -579,10 +634,12 @@ export async function webSearchStatus(
   env: NodeJS.ProcessEnv = process.env,
   // Tests point this at a closed ephemeral port so a real backend on 8888 (or
   // another process's) can never turn a unit test green or red.
-  options: { url?: string } = {},
+  options: { url?: string; identity?: IdentityReader } = {},
 ): Promise<WebStatus> {
   const paths = resolveWebPaths(env)
   const url = options.url ?? searxUrl(env)
+  const read = options.identity ?? processIdentity
+  const port = managedPort(url)
   const managed = !isExternallyManaged(env)
   const installed = managed && isInstalled(paths)
   const base = { managed, url, dataDir: paths.dataDir, installed }
@@ -597,8 +654,10 @@ export async function webSearchStatus(
   }
 
   if (await checkHealth(url)) {
-    const record = readServerRecord(paths)
-    const ours = record !== undefined && identityMatches(record, await processIdentity(record.pid))
+    // A listener z1 started before the identity file existed is adopted here:
+    // the pid file plus a verified command line is the same claim a start makes.
+    const record = await effectiveRecord(paths, port, read)
+    const ours = record !== undefined && identityMatches(record, await read(record.pid))
     return {
       ...base,
       state: 'ready',
@@ -607,8 +666,8 @@ export async function webSearchStatus(
     }
   }
 
-  const record = readServerRecord(paths)
-  if (record !== undefined && identityMatches(record, await processIdentity(record.pid))) {
+  const record = await effectiveRecord(paths, port, read)
+  if (record !== undefined && identityMatches(record, await read(record.pid))) {
     return { ...base, state: 'starting', pid: record.pid, detail: `starting (pid ${String(record.pid)})` }
   }
   if (installed) {
@@ -1061,6 +1120,8 @@ export interface EnsureOptions {
    * never decide a unit test.
    */
   url?: string
+  /** Identity source for adoption/verification; defaults to the kernel. */
+  identity?: IdentityReader
 }
 
 /** The phase a fresh run publishes before it awaits anything. */
@@ -1083,6 +1144,8 @@ export async function ensureWebSearch(options: EnsureOptions = {}): Promise<WebS
   const report = options.onLine ?? ((): void => {})
   const url = options.url ?? searxUrl(env)
   const paths = resolveWebPaths(env)
+  const read = options.identity ?? processIdentity
+  const port = managedPort(url)
 
   if (isExternallyManaged(env)) {
     // `Z1_SEARX_URL` means the user owns the backend: z1 never installs,
@@ -1139,13 +1202,15 @@ export async function ensureWebSearch(options: EnsureOptions = {}): Promise<WebS
       if (healthy) {
         // Healthy, but is it ours? A listener on the port with no matching
         // identity was started by something else (an older z1, a manual run, a
-        // deleted pid file). Using it is fine; claiming it as manageable is not.
-        const record = readServerRecord(paths)
-        const ours = record !== undefined && identityMatches(record, await processIdentity(record.pid))
+        // deleted identity file). An older z1's plain pid file is adopted when
+        // its command line verifies; anything else is merely used, not claimed.
+        const record = await effectiveRecord(paths, port, read)
+        const ours = record !== undefined && identityMatches(record, await read(record.pid))
         publishSearxState(env, 'up')
-        if (!ours) {
-          report(`web · SearXNG is answering on ${url} but was not started by this z1; not stopping it`)
-        }
+        // No line for an unmanaged listener on purpose: a legacy backend is a
+        // normal state, and printing it on every launch is noise. The returned
+        // status carries the detail (`z1 web status`), and `stop` still says so
+        // when asked to stop what it cannot verify.
         return {
           state: 'ready',
           managed: true,
@@ -1161,9 +1226,10 @@ export async function ensureWebSearch(options: EnsureOptions = {}): Promise<WebS
       // wedged one), so wait for it instead of racing a second bind. A live pid
       // whose command line is not this SearXNG is a recycled pid: drop the
       // record and start, rather than burning the whole readiness budget on a
-      // process that will never answer for us.
-      const record = readServerRecord(paths)
-      if (record !== undefined && isProcessAlive(record.pid) && identityMatches(record, await processIdentity(record.pid))) {
+      // process that will never answer for us. A legacy pid file is adopted
+      // first, so an older z1's slow start is waited for, not duplicated.
+      const record = await effectiveRecord(paths, port, read)
+      if (record !== undefined && isProcessAlive(record.pid) && identityMatches(record, await read(record.pid))) {
         if (await waitReady('starting')) {
           publishSearxState(env, 'up')
           return { state: 'ready', managed: true, url, dataDir: paths.dataDir, pid: record.pid, detail: `ready at ${url}`, installed: isInstalled(paths) }
@@ -1198,7 +1264,6 @@ export async function ensureWebSearch(options: EnsureOptions = {}): Promise<WebS
           started = true
         }
 
-        const port = managedPort(url)
         if (await portInUse(port)) {
           return await failed(`port ${String(port)} is in use by another program`)
         }
@@ -1241,6 +1306,8 @@ export interface StopOptions {
   url?: string
   /** How long SIGTERM gets before SIGKILL; shortened in tests. */
   graceMs?: number
+  /** Identity source for adoption/verification; defaults to the kernel. */
+  identity?: IdentityReader
 }
 
 /**
@@ -1249,13 +1316,17 @@ export interface StopOptions {
  *
  * Nothing is signalled unless the recorded identity still matches the pid: a
  * recycled pid belongs to an unrelated program, and killing it is worse than
- * leaving a listener running. When z1 cannot verify the process it says so and
- * removes only its own record — a listener it never started is not its to stop.
+ * leaving a listener running. A pid file left by a build that had no identity
+ * file is adopted first, under the same check, so the backend a legacy z1
+ * started is stoppable instead of permanently a stranger. When z1 cannot verify
+ * the process it says so and removes only its own record — a listener it never
+ * started is not its to stop.
  */
 export async function stopWebSearch(env: NodeJS.ProcessEnv = process.env, options: StopOptions = {}): Promise<WebStatus> {
   const paths = resolveWebPaths(env)
   const url = options.url ?? searxUrl(env)
   const graceMs = options.graceMs ?? 5000
+  const read = options.identity ?? processIdentity
   // z1 is no longer provisioning anything: drop the hint rather than claim a
   // phase the module would believe for 20 minutes.
   delete env[SEARX_STATE_ENV]
@@ -1263,10 +1334,11 @@ export async function stopWebSearch(env: NodeJS.ProcessEnv = process.env, option
     return { state: 'external', managed: false, url, dataDir: paths.dataDir, detail: 'not managed by z1', installed: false }
   }
 
-  const record = readServerRecord(paths)
+  const record = readServerRecord(paths) ?? (await adoptLegacyRecord(paths, managedPort(url), { identity: read }))
   if (record === undefined) {
     // Either nothing ran, or the record was deleted while the listener kept
-    // going. The second case is not ours to kill: only the record says what we
+    // going. When adoption above could not verify the plain pid file, the
+    // second case is not ours to kill: only a verified record says what we
     // started, and a bare pid is not an identity.
     const legacy = readPid(paths.pidFile)
     clearServerRecord(paths)
@@ -1290,7 +1362,7 @@ export async function stopWebSearch(env: NodeJS.ProcessEnv = process.env, option
     }
   }
 
-  const current = await processIdentity(record.pid)
+  const current = await read(record.pid)
   if (!identityMatches(record, current)) {
     clearServerRecord(paths)
     if (await checkHealth(url)) {
@@ -1323,7 +1395,7 @@ export async function stopWebSearch(env: NodeJS.ProcessEnv = process.env, option
   // during the grace period, and an unrelated program must not be killed for
   // something we merely used to own.
   if (!(await waitForExit(pid, graceMs))) {
-    if (identityMatches(record, await processIdentity(pid))) {
+    if (identityMatches(record, await read(pid))) {
       try {
         process.kill(pid, 'SIGKILL')
       } catch {
