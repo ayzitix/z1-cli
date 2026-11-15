@@ -25,6 +25,7 @@ import { graphDigest } from '/home/oleksii/Projects/z1-sdk/z1/packages/graph/src
 import {
   SessionTooNewError,
   createSessionStore,
+  findRepoRoot,
 } from '/home/oleksii/Projects/z1-sdk/z1/packages/session/src/index.ts'
 import type {
   Session,
@@ -3671,10 +3672,18 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       say(red(`sessions · ${summary.id} disappeared while it was being opened`))
       return
     }
-    if (resolve(loaded.meta.cwd) !== resolve(config.cwd)) {
-      say(red(`session · belongs to ${loaded.meta.cwd}`))
-      say(dim('  this process is bound to the directory it started in'))
+    // A transcript may be reopened from any directory in the same repository;
+    // tools still run in this process's cwd, so crossing a repository boundary
+    // is refused but a repo root/subdirectory move is allowed and announced.
+    const currentRepo = findRepoRoot(config.cwd) ?? resolve(config.cwd)
+    if (resolve(loaded.meta.repoRoot) !== resolve(currentRepo)) {
+      say(red(`session · belongs to ${loaded.meta.repoRoot}`))
+      say(dim('  this process is bound to the repository it started in'))
       return
+    }
+    if (resolve(loaded.meta.cwd) !== resolve(config.cwd)) {
+      say(yellow(`session · started in ${loaded.meta.cwd}`))
+      say(dim(`  tools run in ${config.cwd}`))
     }
     if (currentSession?.meta.id === loaded.meta.id) {
       // Selecting the row you are already in must not append a second copy of
