@@ -11,8 +11,9 @@ is executed directly by `tsx` and imports the SDK from a local checkout.
 
 ```
 z1-cli/
-├── chat.ts      the CLI: composer, transcript, markdown renderer, commands
-├── tools.ts     `z1 tools` — list tools exposed by installed modules
+├── chat.ts          the CLI: composer, transcript, markdown renderer, commands
+├── tools.ts         `z1 tools` — list tools exposed by installed modules
+├── tool-policy.ts   enabled / disabled / deleted overlay shared by both
 ├── README.md
 └── .gitignore
 ```
@@ -75,7 +76,7 @@ z1                  # interactive console
 z1 chat             # same
 z1 "prompt"         # one turn, same UI, then exit
 z1 ask "prompt"     # same, explicit
-z1 tools            # list tools from installed modules
+z1 tools            # names, or name<TAB>disabled|deleted, from installed modules
 z1 run ...          # full SDK CLI (run, tree, fork, memory, module, serve, ...)
 ```
 
@@ -97,6 +98,7 @@ repo.
 | `Z1_MODULES_DIR` | Installed modules directory. Default `~/.local/share/z1/modules`. |
 | `Z1_CONTEXT_WINDOW` | Context window in tokens (default `128000`). |
 | `Z1_MAX_STEPS` | Max graph steps per turn; `0`/`off` means the SDK ceiling (10000). |
+| `Z1_TOOLS_FILE` | Tool enablement overlay. Default `$XDG_CONFIG_HOME/z1/tools.json` (usually `~/.config/z1/tools.json`). |
 | `NO_COLOR` | Disable all colour when set (any value). |
 | `Z1_TRAY=off` | Plain readline UI instead of the pinned tray; also used for pipes. |
 | `Z1_PINNED=off` | Keep the tray but use normal scrollback instead of the alternate screen. |
@@ -120,6 +122,11 @@ repo.
   declined rather than blocking.
 - **Background processes**: tools installed from modules (including background
   process control) are surfaced like any other tool call.
+- **Tool control**: `/tools` numbers the live inventory and shows `on` / `off` /
+  `del`. `off` and `delete` hide a tool from the model and make the guard reject
+  a hallucinated call; `on` and `restore` bring it back. The choice is written
+  atomically to `~/.config/z1/tools.json` and shared by every session. The
+  footer shows `tools <enabled>/<installed>`.
 - **Pipes and `Z1_TRAY=off`**: readline path with `\` line continuation, no
   alternate screen and no escape sequences emitted; `Ctrl-C` cancels a run.
 
@@ -138,6 +145,25 @@ repo.
   oriented.
 - The SDK is imported by absolute local path, so this is a workspace tool rather
   than a relocatable package.
+- `delete` in `/tools` is a tombstone, not an uninstall: the module still ships
+  the tool and one module can own many tools, so removing code would break the
+  others. `/tools restore` clears it.
+- Tool policy is enforced by this CLI's tool service. `z1 run`, the HTTP server,
+  Studio and other hosts do not read `~/.config/z1/tools.json`, so the same
+  disabled tool can still be reached there.
+- Tool names are global. Two modules exposing the same name share one
+  `on`/`off`/`delete` decision.
+- Tool preferences are a whole-file atomic replace: two sessions writing at the
+  same instant keep the last write. The next command re-reads the file, so
+  ordinary sequential edits in two windows do merge.
+- A corrupt preferences file is reported and repaired by `/tools reset`; until
+  then this process keeps the last policy it read successfully (or enables
+  everything on a fresh start).
+- Disabling every tool leaves the model request without a `tools` array. Some
+  OpenAI-compatible providers dislike tool history without tool declarations;
+  re-enable one tool if a provider rejects it.
+- Slash commands are interactive. `--once "/tools ..."` is rejected with exit
+  code 2 instead of being sent to the model.
 
 ## Keys
 
@@ -162,7 +188,14 @@ repo.
 /help              show help
 /new               start a fresh conversation
 /model <p/m>       switch model
-/tools             list installed tools
+/tools             numbered tool list with on/off/del state
+/tools off <n|name>      hide a tool from the agent
+/tools delete <n|name>   hide it and keep a restorable tombstone
+/tools on <n|name|all>   enable a tool (also restores a tombstone)
+/tools restore <n|name|all>  clear a tombstone
+/tools reset             clear every tool preference
+/tools refresh           re-read the installed module inventory
+/tools --all             include stale entries for tools no longer installed
 /context           show context usage
 /compact           compact the next turn
 /window <tokens>   set the context window

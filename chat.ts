@@ -21,6 +21,16 @@ import { runGraph } from '/home/oleksii/Projects/z1-sdk/z1/packages/runtime/src/
 import type { ApprovalService, RunEvent, RunResult } from '/home/oleksii/Projects/z1-sdk/z1/packages/runtime/src/index.ts'
 import { graphDigest } from '/home/oleksii/Projects/z1-sdk/z1/packages/graph/src/index.ts'
 
+import {
+  createGuardedTools,
+  loadToolPreferences,
+  saveToolPreferences,
+  toolState,
+  withToolStates,
+  type ToolPreferences,
+  type ToolState,
+} from './tool-policy.ts'
+
 // Keep the console clean: service-selection info goes to stderr from the SDK.
 const stderrWrite = process.stderr.write.bind(process.stderr)
 process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
@@ -31,6 +41,7 @@ process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
 
 type ChatMessage = { role: 'system' | 'user' | 'assistant' | 'tool'; content: string; toolCallId?: string; toolCalls?: unknown[] }
 type ModelHandle = { provider: string; model: string; credentialRef?: string; params?: Record<string, unknown> }
+type ToolSchema = Awaited<ReturnType<RunHandle['services']['tools']['list']>>[number]
 type MutableGraph = {
   id: string
   nodes: Array<Record<string, unknown>>
@@ -171,7 +182,7 @@ const fit = (text: string, width: number): string =>
   visibleLength(text) <= width ? text : `${text.slice(0, Math.max(1, width - 1))}…`
 
 const padTo = (text: string, width: number): string =>
-  `${text}${' '.repeat(Math.max(0, width - visibleLength(text)))}`
+  `${text}${' '.repeat(Math.max(0, width - displayCells(text)))}`
 
 /** Rounded box, the way a terminal agent introduces itself. */
 const box = (lines: readonly string[], width: number): string => {
@@ -2318,7 +2329,9 @@ const COMMANDS: readonly CommandSpec[] = [
   { name: '/help', description: 'show this help' },
   { name: '/new', description: 'start a fresh conversation' },
   { name: '/model', description: 'switch the model', args: '<provider/model>' },
-  { name: '/tools', description: 'list installed tools' },
+  // No `args` here: Enter on a bare `/tools` must list, not complete. The
+  // toggle grammar is shown in the description and in `/help`.
+  { name: '/tools', description: 'list tools; on/off/delete/restore <n|name>' },
   { name: '/context', description: 'show context usage' },
   { name: '/compact', description: 'compact the next turn' },
   { name: '/window', description: 'set the context window', args: '<tokens>' },
@@ -2475,6 +2488,10 @@ const runTurn = async (
     registry: handle.registry,
     services: {
       ...handle.services,
+      // One policy for both the advertised list and execution. The model sees
+      // only enabled tools, and a hallucinated name is rejected as a tool error
+      // (z1.tool.call turns a throw into data), so it cannot run hidden tools.
+      tools: createGuardedTools(handle.services.tools),
       onEvent: (event) => {
         if (event.type === 'node.stream' && event.port === 'text' && event.path.endsWith('/chat')) {
           streamed = true
@@ -2598,6 +2615,14 @@ const modelFrom = (raw: string): ModelHandle => {
  * completed run and 1 otherwise.
  */
 const oneShot = async (prompt: string, explicitModel: string | undefined): Promise<number> => {
+  // Slash commands belong to the interactive loop; sending one to the model
+  // would look like a prompt and silently do nothing.
+  const trimmed = prompt.trimStart()
+  if (trimmed.startsWith('/')) {
+    const command = trimmed.split(/\s+/, 1)[0] ?? trimmed
+    console.error(`chat --once: ${command} is an interactive command; run z1 without --once`)
+    return 2
+  }
   const config = loadRuntimeConfig({ cwd: process.cwd(), env: process.env, overrides: { live: true } })
   const runtime = await createRuntime(config)
   const tail = createTail()
@@ -2656,7 +2681,7 @@ const statusBar = (input: {
   model: string
   context: TurnContext | undefined
   maxSteps: number
-  tools: number
+  tools: string
 }): string => {
   const columns = Math.max(20, terminalColumns())
   const parts = [
@@ -2667,7 +2692,7 @@ const statusBar = (input: {
       ? 'ctx –'
       : `ctx ${String(Math.round(input.context.ratio * 100))}%`,
     `steps ${stepLabel(input.maxSteps)}`,
-    `tools ${String(input.tools)}`,
+    `tools ${input.tools}`,
   ]
   // The status is a single physical row; anything wider would wrap into the
   // terminal's last row and scroll the tray away.
@@ -2692,17 +2717,30 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   // module worker behind `services.tools` exists, then dispose it. Nothing in
   // that probe asks for approval, so a rejecting stub is enough.
   const probeApproval: ApprovalService = { request: async () => 'rejected' }
-  let tools: ReadonlyArray<{ name: string; description?: string }> = []
-  try {
+  let tools: readonly ToolSchema[] = []
+  const refreshTools = async (): Promise<void> => {
     const probe = await runtime.beginRun({ approval: probeApproval })
     try {
       tools = await probe.services.tools.list()
     } finally {
       await probe.dispose()
     }
+  }
+  try {
+    await refreshTools()
   } catch (error) {
     console.log(`tools · unavailable (${error instanceof Error ? error.message : String(error)})`)
   }
+
+  // Enablement is an overlay on the live list, shared by every z1 session. The
+  // startup read is only for the first drawing; every turn re-reads it inside
+  // the guarded tool service, so another session's change applies immediately.
+  const loadedPrefs = loadToolPreferences()
+  let toolPrefs: ToolPreferences = loadedPrefs.prefs
+  let toolPrefsError = loadedPrefs.error
+  const prefsPath = loadedPrefs.path
+  /** Names in the order of the last printed `/tools` list, for `off 3`. */
+  let toolListing: string[] | undefined
 
   // The model, directory and limits live in the composer footer, so the welcome
   // box only has to greet and point at the commands.
@@ -2787,15 +2825,236 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   }
   const approval = consoleApproval(askLine)
 
+  const reloadToolPrefs = (): void => {
+    const loaded = loadToolPreferences()
+    toolPrefs = loaded.prefs
+    toolPrefsError = loaded.error
+  }
+  const enabledToolCount = (): number =>
+    tools.filter((tool) => toolState(toolPrefs, tool.name) === 'enabled').length
+  /** `20/22` in the footer: what the agent can use, not just what is installed. */
+  const toolCountLabel = (): string =>
+    tools.length === 0 ? '0' : `${String(enabledToolCount())}/${String(tools.length)}`
+
   const refreshStatus = (): void => {
     tail.status(
       statusBar({
         model: modelLabel(model),
         context: lastContext,
         maxSteps,
-        tools: tools.length,
+        tools: toolCountLabel(),
       }),
     )
+  }
+
+  /**
+   * `/tools` keeps a numbered list so `off 3` is easy. Numbers resolve against
+   * the last printed list, so a stale index cannot silently hit another tool
+   * after the module set changes; names always resolve against the live list.
+   */
+  const printTools = (includeOrphans: boolean): void => {
+    reloadToolPrefs()
+    const installed = new Set(tools.map((tool) => tool.name))
+    const rows = tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description ?? '',
+      state: toolState(toolPrefs, tool.name),
+      installed: true,
+    }))
+    if (includeOrphans) {
+      for (const [name, entry] of Object.entries(toolPrefs.tools)) {
+        if (installed.has(name)) continue
+        rows.push({ name, description: '', state: entry.state, installed: false })
+      }
+    }
+    toolListing = rows.map((row) => row.name)
+
+    const live = rows.filter((row) => row.installed)
+    const off = live.filter((row) => row.state === 'disabled').length
+    const deleted = live.filter((row) => row.state === 'deleted').length
+    const stale = rows.length - live.length
+    const parts = [`${green(String(live.length - off - deleted))} enabled`]
+    if (off > 0) parts.push(`${yellow(String(off))} off`)
+    if (deleted > 0) parts.push(`${red(String(deleted))} deleted`)
+    if (stale > 0) parts.push(`${String(stale)} stale`)
+    say(`${bold('tools')} · ${String(tools.length)} installed · ${parts.join(' · ')}`)
+    if (toolPrefsError !== undefined) {
+      say(red(`tools · preferences unreadable (${prefsPath}): ${toolPrefsError}`))
+      say(dim('  every tool is treated as enabled until the file is fixed or replaced'))
+    }
+    if (rows.length === 0) {
+      say(dim('  none installed'))
+      return
+    }
+
+    const indexWidth = String(rows.length).length
+    const nameWidth = Math.min(24, Math.max(4, ...rows.map((row) => displayCells(row.name))))
+    for (const [index, row] of rows.entries()) {
+      const state =
+        row.state === 'enabled' ? green('on ') : row.state === 'disabled' ? yellow('off') : red('del')
+      const prefix = `  ${String(index + 1).padStart(indexWidth)}  ${state}  `
+      const description = (row.description.split('\n')[0] ?? '').trim()
+      const room = Math.max(8, terminalColumns() - displayCells(prefix) - nameWidth - 2)
+      const suffix = description.length > 0 ? `  ${dim(fit(description, room))}` : ''
+      const missing = row.installed ? '' : dim(' (not installed)')
+      say(`${prefix}${padTo(fit(row.name, nameWidth), nameWidth)}${suffix}${missing}`)
+    }
+    if (deleted > 0) {
+      say(dim('  deleted tools stay installed in the module but are hidden from the agent.'))
+      say(dim('  /tools restore <n|name> brings one back; /tools --all shows stale entries.'))
+    }
+  }
+
+  const findToolName = (selector: string): string | undefined => {
+    if (/^\d+$/.test(selector)) {
+      const listing = toolListing ?? tools.map((tool) => tool.name)
+      return listing[Number(selector) - 1]
+    }
+    if (tools.some((tool) => tool.name === selector)) return selector
+    // A deleted tool that is no longer installed still has a preference entry,
+    // and must remain selectable for `restore`.
+    if (Object.hasOwn(toolPrefs.tools, selector)) return selector
+    return undefined
+  }
+
+  const applyToolState = (names: readonly string[], state: ToolState): boolean => {
+    const previous = toolPrefs
+    // Re-read just before writing: another z1 session may have toggled a
+    // different tool since this command started. Whole-file rename is still
+    // last-writer-wins for two truly simultaneous writes.
+    const fresh = loadToolPreferences()
+    const next = withToolStates(fresh.prefs, names, state)
+    const saved = saveToolPreferences(next)
+    if (!saved.ok) {
+      // The guarded tool service re-reads the file, so an unsaved change would
+      // make the list disagree with what the agent can actually call.
+      toolPrefs = previous
+      say(red(`tools · could not save preferences (${saved.path}): ${saved.error}`))
+      refreshStatus()
+      return false
+    }
+    toolPrefs = next
+    toolPrefsError = undefined
+    refreshStatus()
+    return true
+  }
+
+  const handleTools = async (line: string): Promise<void> => {
+    const rest = line.slice('/tools'.length).trim()
+    if (rest === '') {
+      printTools(false)
+      return
+    }
+    if (rest === '--all' || rest === 'all') {
+      printTools(true)
+      return
+    }
+    if (rest === 'refresh') {
+      try {
+        await refreshTools()
+        toolListing = undefined
+        reloadToolPrefs()
+        say(`tools · refreshed · ${String(tools.length)} installed`)
+      } catch (error) {
+        say(red(`tools · unavailable (${error instanceof Error ? error.message : String(error)})`))
+      }
+      return
+    }
+
+    const words = rest.split(/\s+/)
+    const verb = (words[0] ?? '').toLowerCase()
+    const selector = words.slice(1).join(' ').trim()
+    if (!['on', 'off', 'delete', 'restore', 'reset'].includes(verb)) {
+      say('usage: /tools [on|off|delete|restore|reset] <n|name> | /tools refresh | /tools --all')
+      return
+    }
+
+    reloadToolPrefs()
+    if (verb === 'reset') {
+      const names = Object.keys(toolPrefs.tools)
+      const wasBroken = toolPrefsError !== undefined
+      if (names.length === 0 && !wasBroken) {
+        say('tools · preferences already empty')
+        return
+      }
+      if (!applyToolState(names, 'enabled')) return
+      say(
+        wasBroken
+          ? 'tools · preferences reset · the unreadable file was replaced'
+          : `tools · preferences cleared · ${String(names.length)} restored to defaults`,
+      )
+      return
+    }
+    if (selector === '') {
+      say(`usage: /tools ${verb} <n|name>${verb === 'on' || verb === 'restore' ? '|all' : ''}`)
+      return
+    }
+    if ((verb === 'on' || verb === 'restore') && selector === 'all') {
+      const names =
+        verb === 'on'
+          ? Array.from(new Set([...tools.map((tool) => tool.name), ...Object.keys(toolPrefs.tools)])).filter(
+              (name) => toolState(toolPrefs, name) !== 'enabled',
+            )
+          : Object.entries(toolPrefs.tools)
+              .filter(([, entry]) => entry.state === 'deleted')
+              .map(([name]) => name)
+      if (names.length === 0) {
+        say(verb === 'on' ? 'tools · every tool is already on' : 'tools · nothing is deleted')
+        return
+      }
+      if (!applyToolState(names, 'enabled')) return
+      say(
+        verb === 'on'
+          ? `tools · ${String(names.length)} tools on`
+          : `tools · ${String(names.length)} tools restored`,
+      )
+      return
+    }
+
+    const name = findToolName(selector)
+    if (name === undefined) {
+      say(`tools · no tool "${selector}" · /tools for the list`)
+      return
+    }
+    const current = toolState(toolPrefs, name)
+    if (verb === 'off') {
+      if (current === 'disabled') {
+        say(`tools · ${name} is already off`)
+        return
+      }
+      if (!applyToolState([name], 'disabled')) return
+      say(
+        current === 'deleted'
+          ? `tools · ${name} deleted → off · still hidden from the agent`
+          : `tools · ${name} off · hidden from the agent`,
+      )
+      return
+    }
+    if (verb === 'delete') {
+      if (current === 'deleted') {
+        say(`tools · ${name} is already deleted`)
+        return
+      }
+      if (!applyToolState([name], 'deleted')) return
+      say(`tools · ${name} deleted · hidden from the agent · /tools restore ${name}`)
+      return
+    }
+    if (verb === 'restore') {
+      if (current === 'enabled') {
+        say(`tools · ${name} is already on`)
+        return
+      }
+      if (!applyToolState([name], 'enabled')) return
+      say(`tools · ${name} ${current === 'deleted' ? 'restored' : 'enabled'} · on`)
+      return
+    }
+    // on: restores a tombstone too, so a deleted tool needs one command.
+    if (current === 'enabled') {
+      say(`tools · ${name} is already on`)
+      return
+    }
+    if (!applyToolState([name], 'enabled')) return
+    say(`tools · ${name} on`)
   }
 
   // A terminal drag emits many SIGWINCH events; clear and repaint once.
@@ -2816,6 +3075,8 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     for (;;) {
       if (closed && pendingLines.length === 0) break
       composer?.setBusy(false)
+      // Another session may have changed the policy while this one waited.
+      reloadToolPrefs()
       refreshStatus()
       if (pendingLines.length === 0) tail.idle()
 
@@ -2896,12 +3157,8 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         say('context · compaction forced for the next turn')
         continue
       }
-      if (line === '/tools') {
-        if (tools.length === 0) say('tools · none installed')
-        for (const tool of tools) {
-          const description = tool.description ?? ''
-          say(description.length > 0 ? `${tool.name} — ${description}` : tool.name)
-        }
+      if (line === '/tools' || line.startsWith('/tools ')) {
+        await handleTools(line)
         continue
       }
       if (line === '/window') {
