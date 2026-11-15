@@ -24,7 +24,9 @@ err="$tmp/stderr.txt"
 
 # Run from the temp dir so a repository config or workspace files can leak in.
 cd "$tmp" || exit 1
-printf '/tools\n/exit\n' | env \
+# The second line is a prompt, not an argument: a command on the first line runs,
+# and the rest of the submission is what the model is asked.
+printf '/tools\nhi\n/exit\n' | env \
   Z1_DB="$tmp/runs.db" \
   Z1_TOOLS_FILE="$tmp/tools.json" \
   Z1_MODEL=mock/mock-1 \
@@ -53,4 +55,12 @@ if ! grep -q 'tools ·' "$out"; then
   exit 1
 fi
 
-echo "PASS: pipe smoke (exit 0, no ESC bytes, 'tools ·' present)"
+# The line under the command is the prompt: without the split it was read as an
+# argument to `/tools` and never reached a turn.
+if ! grep -q 'mock: hi' "$out"; then
+  echo "FAIL: the prompt under /tools was not sent as a turn" >&2
+  sed -n '1,40p' "$out" >&2
+  exit 1
+fi
+
+echo "PASS: pipe smoke (exit 0, no ESC bytes, 'tools ·' and the prompt under it)"

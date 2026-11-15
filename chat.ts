@@ -36,6 +36,7 @@ import type {
 
 import { ownStateText } from './workspace-state.ts'
 import { ensureWebSearch } from './web-service.ts'
+import { splitCommandAndPrompt } from './input.ts'
 import { toolInventoryText } from './tool-inventory.ts'
 import { type ToolState } from './tool-policy.ts'
 import { ToolState as ToolStore } from './tool-state.ts'
@@ -2946,6 +2947,14 @@ const COMMANDS: readonly CommandSpec[] = [
 const commandSpec = (name: string): CommandSpec | undefined =>
   COMMANDS.find((command) => command.name === name)
 
+/**
+ * Whether the spec's shape allows these arguments: a command with no `args` and
+ * no `rest` takes none (`/exit now` is a shape error), and a bare call is always
+ * a shape that reaches its handler so the usage text lives once, in the table.
+ */
+const shapeAllows = (spec: CommandSpec | undefined, rest: string): boolean =>
+  rest === '' || spec?.args !== undefined || spec?.rest === true
+
 /** The body of `usage: …` for a known command, written only in the table. */
 const usageText = (name: string): string => {
   const spec = commandSpec(name)
@@ -3269,9 +3278,22 @@ const probableSessionRoot = (cwd: string): string | undefined => {
  */
 const oneShot = async (prompt: string, explicitModel: string | undefined): Promise<number> => {
   // Slash commands belong to the interactive loop; sending one to the model
-  // would look like a prompt and silently do nothing.
+  // would look like a prompt and silently do nothing. A multi-line submission is
+  // the exception: `/tools ↵ what is the weather` carries a command and a real
+  // question, so the command is honoured and only the lines under it are asked.
+  // `/tools` is the one command a one-shot can genuinely run, because its whole
+  // effect is the list; the rest act on session state a one-shot does not have
+  // and stay the old error rather than being dropped on the floor.
+  const headless = (name: string, rest: string): boolean =>
+    name === '/tools' && shapeAllows(commandSpec(name), rest)
   const trimmed = prompt.trimStart()
-  if (trimmed.startsWith('/')) {
+  const split = splitCommandAndPrompt(trimmed, headless)
+  const question = split === undefined ? prompt : split.prompt
+  if (split !== undefined && question.length === 0) {
+    console.error('chat --once: /tools alone has no question under it; add a prompt on the next line')
+    return 2
+  }
+  if (split === undefined && trimmed.startsWith('/')) {
     const command = trimmed.split(/\s+/, 1)[0] ?? trimmed
     console.error(`chat --once: ${command} is an interactive command; run z1 without --once`)
     return 2
@@ -3281,7 +3303,7 @@ const oneShot = async (prompt: string, explicitModel: string | undefined): Promi
   const runtime = await createRuntime(config)
   const tail = createTail()
   const progress = createProgress(tail)
-  progress.print(`› ${prompt}`)
+  progress.print(`› ${question}`)
   // Same background provisioning as the interactive loop. Diagnostics go to
   // stderr here: a one-shot run's stdout is the answer and may be piped.
   void ensureWebSearch({ onLine: line => console.error(dim(line)) })
@@ -3290,7 +3312,17 @@ const oneShot = async (prompt: string, explicitModel: string | undefined): Promi
   const handle = await runtime.beginRun({ approval: quietApproval(progress) })
   try {
     const toolState = new ToolStore(() => handle.services.tools.list())
-    const outcome = await runTurn(runtime, handle, model, [], prompt, progress, {
+    if (split !== undefined) {
+      // What `/tools` prints, on stderr: stdout is the answer and may be piped.
+      const snapshot = await toolState.reload()
+      const names = snapshot.enabled.map((record) => record.name)
+      console.error(
+        dim(
+          `· tools · ${snapshot.inventoryKnown ? `${String(names.length)}/${String(snapshot.installedCount)} enabled` : 'inventory unavailable'}${names.length > 0 ? ` · ${names.join(', ')}` : ''}`,
+        ),
+      )
+    }
+    const outcome = await runTurn(runtime, handle, model, [], question, progress, {
       toolState,
       cwd: config.cwd,
       sessionRoot: probableSessionRoot(config.cwd),
@@ -4720,6 +4752,33 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     },
   }
 
+  /**
+   * Run one slash-command line.
+   *
+   * `undefined` means the text was not a command at all (it does not start with
+   * `/`), so the caller may send it as a prompt; `'continue'` means it was one
+   * and was handled — or reported as a usage/unknown-command error — so it must
+   * never be sent to the model.
+   */
+  const runCommand = async (text: string): Promise<CommandResult | undefined> => {
+    if (!text.startsWith('/')) return undefined
+    // One lookup for every slash command (see `COMMANDS` and `handlers` above).
+    // A handler runs when the spec's shape allows the arguments: `/exit now` is
+    // a shape error, and bare `/window` reaches its own handler so the usage
+    // text exists once, in the table.
+    const name = text.split(/\s+/, 1)[0] ?? text
+    const rest = text.slice(name.length).trim()
+    const spec = commandSpec(name)
+    const handler = handlers[name]
+    if (handler !== undefined && shapeAllows(spec, rest)) return await handler(text, rest)
+    if (spec !== undefined) {
+      say(spec.args === undefined ? `${name} takes no arguments` : `usage: ${usageText(name)}`)
+    } else {
+      say(`unknown command ${name} · type / for the menu`)
+    }
+    return 'continue'
+  }
+
   // A terminal drag emits many SIGWINCH events; clear and repaint once.
   let resizeTimer: NodeJS.Timeout | undefined
   process.on('SIGWINCH', () => {
@@ -4776,28 +4835,27 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         })
       }
 
-      // One lookup for every slash command (see `COMMANDS` and `handlers`
-      // above). A handler runs when the spec's shape allows the arguments:
-      // `/exit now` is a shape error, and bare `/window` reaches its own
-      // handler so the usage text exists once, in the table.
-      if (line.startsWith('/')) {
-        const name = line.split(/\s+/, 1)[0] ?? line
-        const rest = line.slice(name.length).trim()
-        const spec = commandSpec(name)
-        const handler = handlers[name]
-        const shapeOk = rest === '' || spec?.args !== undefined || spec?.rest === true
-        if (handler !== undefined && shapeOk) {
-          if ((await handler(line, rest)) === 'exit') break
-          continue
-        }
-        if (spec !== undefined) {
-          say(spec.args === undefined ? `${name} takes no arguments` : `usage: ${usageText(name)}`)
-        } else {
-          say(`unknown command ${name} · type / for the menu`)
-        }
-        continue
+      // A command on the first line of a multi-line submission runs first, and
+      // the rest of the box is the prompt it was typed with: `/tools` on its own
+      // line followed by a question used to reach the `/tools` handler as a
+      // weird argument (or the model as one prompt), so the tools list was never
+      // shown and the question was never answered. Only a line the table knows
+      // and whose shape allows its own arguments splits; anything else is one
+      // prompt, exactly as before.
+      const split = splitCommandAndPrompt(line, (name, rest) => {
+        return handlers[name] !== undefined && shapeAllows(commandSpec(name), rest)
+      })
+      if (split !== undefined) {
+        if ((await runCommand(split.command)) === 'exit') break
+        // Nothing under the command: it was the whole submission.
+        if (split.prompt.length === 0) continue
+        line = split.prompt
+      } else {
+        const outcome = await runCommand(line)
+        if (outcome === 'exit') break
+        // A consumed command (or a usage/unknown-command report) is not a prompt.
+        if (outcome === 'continue') continue
       }
-
 
       composer?.setBusy(true)
       // A queued prompt may start while the picker is open; a running turn

@@ -105,6 +105,53 @@ assert.ok(!all.includes('Turned off'), 'nothing off, no line')
 assert.ok(!all.includes('turned off'), 'no stale count either')
 assert.ok(hasRule(all), 'the rule is present in the all-enabled case')
 
+// ------------------------------------------------------- current facts (web pair)
+// The refusal case this rule exists for: both halves on, no dedicated weather
+// API, model said "no weather service, only web search and page reading".
+const WEB_RULE_CLAUSES = [
+  '- For current facts',
+  'use `web.search` and then `web.fetch`',
+  'before saying you cannot look it up',
+  'search, then read a page that carries the numbers',
+  'No dedicated API is required',
+  'a snippet alone is not a reason to refuse',
+]
+const bothWeb = toolInventoryText(snapshot({ enabled: ['read', 'web.search', 'web.fetch'], off: ['write'] }))
+for (const clause of WEB_RULE_CLAUSES) {
+  assert.ok(bothWeb.includes(clause), `the current-facts rule keeps: ${clause}`)
+}
+const webLine = bodyLines(bothWeb).filter((line) => line.startsWith('- For current facts'))
+assert.equal(webLine.length, 1, 'one bullet, not a paragraph per case')
+assert.ok(webLine[0]!.includes('`web.search`') && webLine[0]!.includes('`web.fetch`'), 'both names are callable ones')
+assert.ok(bodyLines(bothWeb).length <= 6, 'the rule fits the one-line-per-fact budget')
+
+// Only search: a weaker line, and `web.fetch` is not named at all — naming a
+// tool the request does not carry is what made the model try to call it.
+const searchOnly = toolInventoryText(snapshot({ enabled: ['read', 'web.search'] }))
+assert.ok(searchOnly.includes('`web.search` works this turn'), 'search alone is still worth a lookup')
+assert.ok(searchOnly.includes('Page bodies cannot be read this turn'), 'the missing half is stated, not implied')
+assert.ok(!searchOnly.includes('web.fetch'), 'the turned-off fetch is never named as usable')
+assert.ok(!searchOnly.includes('No dedicated API is required'), 'the full pair rule is not reused as-is')
+
+// Fetch without search has no first step, so there is no rule to give.
+const fetchOnly = toolInventoryText(snapshot({ enabled: ['read', 'web.fetch'] }))
+assert.ok(!fetchOnly.includes('For current facts'), 'no rule when the pair is broken the other way')
+
+// Neither: the pre-existing snapshot, and the old wording must be untouched.
+assert.ok(!some.includes('For current facts'), 'no current-facts rule when the web tools are off')
+assert.ok(!some.includes('web.search'), 'and no search name either')
+
+// ------------------------------------------------------------------ 27 of 27
+// A real full inventory: every tool on should not push the section past the
+// budget the custom prompt slot is measured against.
+const FULL = [...Array.from({ length: 25 }, (_, index) => `tool${String(index + 1)}`), 'web.search', 'web.fetch']
+const full = toolInventoryText(snapshot({ enabled: FULL }))
+assert.ok(full.includes('(all 27 installed).'), 'the full inventory count is exact')
+assert.ok(full.includes('For current facts'), 'the rule survives a wide enabled list')
+const fullWords = full.split(/\s+/).filter(Boolean).length
+assert.ok(fullWords < 260, `the section stays short for 27 of 27 (got ${String(fullWords)} words)`)
+assert.ok(bodyLines(full).length <= 6, 'one line per fact even when everything is on')
+
 // ------------------------------------------------------------------ many enabled
 // The enabled list is promised to be complete, so it must never be capped.
 const MANY = Array.from({ length: 30 }, (_, index) => `enabled${String(index + 1)}`)

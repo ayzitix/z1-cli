@@ -71,6 +71,41 @@ const RULE =
 const NO_TOOLS_RULE =
   'Before your first action, check the request against what you have. If it needs any tool — creating or editing a file, running a command, reading a page — say so in your first sentence, name the tool you would need, and ask the user to enable it with /tools. Do not explore first, do not promise the result, and do not paste the content as a substitute unless the user asks for it.'
 
+/** The two tool names this rule is about; nothing else in this module names a tool. */
+const WEB_SEARCH = 'web.search'
+const WEB_FETCH = 'web.fetch'
+
+/**
+ * The current-facts rule, only when the web pair is fully on.
+ *
+ * The fail-fast rule above taught the model to refuse whenever the request
+ * "needs a tool you do not have", and a weather question felt like one: there is
+ * no weather tool, so the answer was "no weather service among the available
+ * tools — only web search and page reading". That is exactly backwards when
+ * both halves of the web pair are enabled: search finds a page, fetch reads the
+ * one that carries the numbers, and no dedicated API was ever required. Naming
+ * the pair and the two steps is the whole fix; the words "current facts" keep it
+ * from leaking into ordinary answers that need no lookup.
+ */
+const WEB_RULE =
+  '- For current facts — weather, prices, versions, releases, news, scores — use `web.search` and then `web.fetch` before saying you cannot look it up: search, then read a page that carries the numbers. No dedicated API is required, and a snippet alone is not a reason to refuse.'
+
+/**
+ * The same rule with the pair only half on: search still works, but the page
+ * bodies are not readable this turn, so the honest fallback is a citation of the
+ * result rather than a refusal. Never names `web.fetch`: it is not callable.
+ */
+const SEARCH_ONLY_RULE =
+  '- For current facts — weather, prices, versions, releases, news, scores — `web.search` works this turn: search for a result that carries the numbers and cite which one. Page bodies cannot be read this turn, so a snippet is what you have; do not refuse because no dedicated API is offered.'
+
+/** Which of the two rules applies — `undefined` when search itself is off. */
+const webRule = (snapshot: ToolSnapshot): string | undefined => {
+  const enabled = (name: string): boolean => snapshot.enabled.some((record) => record.name === name)
+  if (enabled(WEB_SEARCH) && enabled(WEB_FETCH)) return WEB_RULE
+  if (enabled(WEB_SEARCH)) return SEARCH_ONLY_RULE
+  return undefined
+}
+
 /**
  * The section body for the custom prompt slot.
  *
@@ -117,5 +152,7 @@ export function toolInventoryText(snapshot: ToolSnapshot): string {
   const offNames = offLine(snapshot)
   if (offNames !== undefined) body.push(offNames)
   body.push(RULE)
+  const web = webRule(snapshot)
+  if (web !== undefined) body.push(web)
   return body.join('\n')
 }
