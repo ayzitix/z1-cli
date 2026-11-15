@@ -213,10 +213,22 @@ repo.
 /exit, /quit       quit
 ```
 
-## Development and verification
+## Tests
 
-There is no test suite in this repository; the verification harness used during
-development lives outside it. Manual checks:
+Two dependency-free checks live in `tests/` (no framework, no network):
+
+```bash
+tests/pipe-smoke.sh
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/tool-state.test.mts
+```
+
+`pipe-smoke.sh` pipes `/tools` and `/exit` through the console with a temp
+database and tool overlay and fails on a non-zero exit, any ESC byte, or a
+missing `tools ·`. `tool-state.test.mts` covers snapshot revisions, orphan
+entries, guard `list()`/`call()` parity, failed writes and corrupt-file reset.
+See `tests/README.md` for what is not covered.
+
+Manual checks:
 
 ```bash
 # Pipe: must exit 0 and emit no ESC bytes. An empty XDG_CONFIG_HOME keeps

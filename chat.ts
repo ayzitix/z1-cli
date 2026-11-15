@@ -422,7 +422,15 @@ class Composer {
   private busy = false
   private asking: { label: string; resolve: (answer: string) => void } | undefined
   private askStash: { value: string; cursor: number } | undefined
-  private override: { text: string; until: number } | undefined
+  /**
+   * A transient message ("3 commands") from Tab or a dismissed menu. It is
+   * *not* a confirmation token: a note must never cancel a two-press Escape or
+   * Ctrl-C, which is why the two slots below are separate.
+   */
+  private notice: { text: string; until: number } | undefined
+  /** The armed second press: Escape clears the draft, Ctrl-C exits. */
+  private confirm: { kind: 'clear' | 'exit'; until: number } | undefined
+  private confirmTimer: NodeJS.Timeout | undefined
   private history: string[] = []
   private historyIndex = -1
   private stash = ''
@@ -469,6 +477,11 @@ class Composer {
 
   /** Show `label` in the footer and resolve with the next submitted line. */
   ask(label: string): Promise<string> {
+    // Only one question can be shown at a time. Today the caller is
+    // sequential, but an overlapping approval would otherwise overwrite
+    // `asking` and leave the first promise pending forever (a deadlocked
+    // console), so resolve the abandoned one as a denial first.
+    this.endAsk('')
     return new Promise(resolve => {
       this.askStash = { value: this.value, cursor: this.cursor }
       this.asking = { label, resolve }
@@ -486,6 +499,11 @@ class Composer {
     items: readonly ToolMenuItem[],
     onAction: (action: ToolMenuAction, name: string) => readonly ToolMenuItem[],
   ): void {
+    if (this.asking !== undefined) {
+      // The caller only opens this while idle; a question owns the keyboard, so
+      // replacing it would hide the only prompt the user can answer.
+      throw new Error('openToolMenu: an approval question is pending; answer or cancel it first')
+    }
     this.toolsMenu = { items, index: 0, onAction }
     this.changed()
   }
@@ -519,6 +537,8 @@ class Composer {
     if (this.closed) return
     this.closed = true
     if (this.escTimer !== undefined) clearTimeout(this.escTimer)
+    if (this.confirmTimer !== undefined) clearTimeout(this.confirmTimer)
+    this.confirmTimer = undefined
     if (stdin.isTTY) {
       stdin.setRawMode(false)
       stdin.pause()
@@ -532,15 +552,45 @@ class Composer {
   }
 
   private note(text: string, ms = 1800): void {
-    this.override = { text, until: Date.now() + ms }
+    this.notice = { text, until: Date.now() + ms }
     this.changed()
+    // Only this note's own timer may clear it: a newer note has a later
+    // `until`, so an old timer fizzles instead of eating the fresh message.
     const timer = setTimeout(() => {
-      if (this.override !== undefined && Date.now() >= this.override.until) {
-        this.override = undefined
+      if (this.notice !== undefined && Date.now() >= this.notice.until) {
+        this.notice = undefined
         this.changed()
       }
     }, ms + 20)
     timer.unref?.()
+  }
+
+  /**
+   * Arm a two-press action. Arming a confirm never touches the notice and vice
+   * versa, so a Tab note cannot cancel Ctrl-C-to-exit (or the reverse).
+   */
+  private requestConfirm(kind: 'clear' | 'exit', ms = 1800): void {
+    if (this.confirmTimer !== undefined) clearTimeout(this.confirmTimer)
+    this.confirm = { kind, until: Date.now() + ms }
+    // Repaint when the window closes, so the footer stops advertising a press
+    // that would no longer count.
+    const timer = setTimeout(() => {
+      this.confirmTimer = undefined
+      if (this.confirm !== undefined && Date.now() >= this.confirm.until) {
+        this.confirm = undefined
+        this.changed()
+      }
+    }, ms + 20)
+    timer.unref?.()
+    this.confirmTimer = timer
+    this.changed()
+  }
+
+  /** The armed confirm while its window is still open. */
+  private activeConfirm(): 'clear' | 'exit' | undefined {
+    const confirm = this.confirm
+    if (confirm === undefined) return undefined
+    return Date.now() < confirm.until ? confirm.kind : undefined
   }
 
   private onData = (chunk: string | Buffer): void => {
@@ -777,17 +827,18 @@ class Composer {
     if (this.menu().open) {
       this.menuDismissed = this.value
       this.note('esc again to clear')
+      // The dismissed menu counted as the first press before this split, so the
+      // next Escape still clears. An armed Ctrl-C-to-exit keeps its priority.
+      if (this.activeConfirm() !== 'exit') this.requestConfirm('clear')
       return
     }
     if (this.value.length === 0) return
-    const now = Date.now()
-    if (this.override?.text === 'esc again to clear' && now < this.override.until) {
-      this.override = undefined
+    if (this.activeConfirm() === 'clear') {
       this.clearDraft()
       this.changed()
       return
     }
-    this.note('esc again to clear')
+    this.requestConfirm('clear')
   }
 
   private ctrlC(): void {
@@ -808,12 +859,11 @@ class Composer {
       this.changed()
       return
     }
-    const now = Date.now()
-    if (this.override?.text === 'press ctrl+c again to exit' && now < this.override.until) {
+    if (this.activeConfirm() === 'exit') {
       this.onExit()
       return
     }
-    this.note('press ctrl+c again to exit')
+    this.requestConfirm('exit')
   }
 
   private ctrlD(): void {
@@ -830,7 +880,12 @@ class Composer {
     this.value = ''
     this.cursor = 0
     this.historyIndex = -1
-    this.override = undefined
+    this.notice = undefined
+    this.confirm = undefined
+    if (this.confirmTimer !== undefined) {
+      clearTimeout(this.confirmTimer)
+      this.confirmTimer = undefined
+    }
     this.menuIndex = 0
     this.menuDismissed = undefined
   }
@@ -1221,8 +1276,12 @@ class Composer {
         ? '⏎ yes · esc cancel'
         : '↑↓ · ⏎ toggle · del delete · esc'
     }
+    // An armed confirmation outranks a notice: it describes what the *next*
+    // press does, and it is the state the user has to be able to see.
+    const confirm = this.activeConfirm()
+    if (confirm !== undefined) return confirm === 'exit' ? 'press ctrl+c again to exit' : 'esc again to clear'
+    if (this.notice !== undefined && Date.now() < this.notice.until) return this.notice.text
     if (menuOpen) return '↑↓ select · ⏎ run · esc close'
-    if (this.override !== undefined && Date.now() < this.override.until) return this.override.text
     if (this.busy) return pendingLines.length > 0 ? `${String(pendingLines.length)} queued · esc to interrupt` : 'esc to interrupt'
     if (this.value.length > 0) return this.argumentHint() ?? 'esc to clear'
     return '? for shortcuts'
