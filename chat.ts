@@ -9,9 +9,9 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { appendFileSync } from 'node:fs'
+import { appendFileSync, existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import { argv, stdin, stdout } from 'node:process'
 
@@ -33,6 +33,7 @@ import type {
   SessionSummary,
 } from '/home/oleksii/Projects/z1-sdk/z1/packages/session/src/index.ts'
 
+import { ownStateText } from './workspace-state.ts'
 import { type ToolState } from './tool-policy.ts'
 import { ToolState as ToolStore } from './tool-state.ts'
 
@@ -3032,6 +3033,10 @@ const runTurn = async (
     contextWindow?: number
     /** The session's snapshot; created from the run handle when absent. */
     toolState?: ToolStore
+    /** The workspace the tools run in; the prompt names paths relative to it. */
+    cwd?: string
+    /** The store's absolute root, when one is known for this process. */
+    sessionRoot?: string
   } = {},
 ): Promise<TurnResult> => {
   const maxSteps = options.maxSteps ?? stepLimit(process.env['Z1_MAX_STEPS'])
@@ -3052,7 +3057,16 @@ const runTurn = async (
   let built: unknown = buildAgentGraph({
     model,
     maxSteps,
-    system: toolInventoryText(enabledSchemas, snapshot.installedCount, snapshot.inventoryKnown),
+    system: [
+      toolInventoryText(enabledSchemas, snapshot.installedCount, snapshot.inventoryKnown),
+      // Where z1 keeps its own state, in the same slot: without it the model
+      // reads the transcript folder and `.z1/` as project files.
+      options.cwd === undefined
+        ? ''
+        : ownStateText({ cwd: options.cwd, sessionRoot: options.sessionRoot }),
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
     // The SDK owns history placement: it drops the transcript's own `system`
     // entries and fills the loop seed, so the system prompt above is rebuilt
     // from this turn's snapshot and the full previous transcript is safe here.
@@ -3219,6 +3233,22 @@ const parseArgs = (): Options => {
 }
 
 /**
+ * The session root for the prompt, without opening a store.
+ *
+ * `--once` deliberately creates no session store, and a turn must not open one
+ * just to name a directory. The owner marker is the whole proof the SDK itself
+ * uses, so a root is claimed only when it is already there; the fallback data
+ * directory and a `Z1_SESSIONS_DIR` override are not derived here (one needs a
+ * hash, the other an expansion of the same rules), and an unknown root is a
+ * section without a transcript path rather than a guessed one.
+ */
+const probableSessionRoot = (cwd: string): string | undefined => {
+  if ((process.env['Z1_SESSIONS_DIR'] ?? '').trim() !== '') return undefined
+  const root = join(findRepoRoot(cwd) ?? resolve(cwd), 'z1')
+  return existsSync(join(root, '.z1-sessions')) ? root : undefined
+}
+
+/**
  * One shot: no banner, no prompt loop. Same progress, final answer, exit 0 on a
  * completed run and 1 otherwise.
  */
@@ -3242,7 +3272,11 @@ const oneShot = async (prompt: string, explicitModel: string | undefined): Promi
   const handle = await runtime.beginRun({ approval: quietApproval(progress) })
   try {
     const toolState = new ToolStore(() => handle.services.tools.list())
-    const outcome = await runTurn(runtime, handle, model, [], prompt, progress, { toolState })
+    const outcome = await runTurn(runtime, handle, model, [], prompt, progress, {
+      toolState,
+      cwd: config.cwd,
+      sessionRoot: probableSessionRoot(config.cwd),
+    })
     if (outcome.context !== undefined) {
       progress.print(
         dim(
@@ -4616,6 +4650,10 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
           maxSteps,
           contextWindow,
           toolState: tools,
+          cwd: config.cwd,
+          // The store may have failed to open: the section then names `.z1/`
+          // only, instead of a transcript directory this process never saw.
+          sessionRoot: sessions?.root,
         })
         forceCompact = false
         history = outcome.history
