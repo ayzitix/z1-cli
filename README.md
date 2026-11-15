@@ -128,7 +128,8 @@ repo.
   picker shows live counts and descriptions. `off` and `delete` hide a tool from
   the model and make the guard reject a hallucinated call; `on` and `restore`
   bring it back. The choice is written atomically to `~/.config/z1/tools.json`
-  and shared by every session. The footer shows `tools <enabled>/<installed>`.
+  and shared by every session. The footer shows `tools <enabled>/<installed>`,
+  or `?` when the inventory could not be read.
   Pipes and `Z1_TRAY=off` keep a numbered text list instead of the picker.
 - **Tool awareness**: every turn's system prompt lists the enabled tool names
   with a count, or says `None` when everything is off. The wire `tools` array

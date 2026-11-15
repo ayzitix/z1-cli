@@ -18,8 +18,6 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
-import type { ToolService } from '/home/oleksii/Projects/z1-sdk/z1/packages/runtime/src/index.ts'
-
 /** What the agent is allowed to do with one tool. */
 export type ToolState = 'enabled' | 'disabled' | 'deleted'
 
@@ -234,33 +232,3 @@ export const withToolStates = (
   names: readonly string[],
   state: ToolState,
 ): ToolPreferences => names.reduce((current, name) => withToolState(current, name, state), prefs)
-
-/**
- * Wrap the run's tool service so the model and the executor share one policy.
- *
- * `list()` is what the agent loop advertises to the model, and `call()` is the
- * only path a tool can take. Re-reading the overlay on every call lets a
- * `/tools off` in another session take effect without a restart. A rejected
- * call throws; `z1.tool.call` turns that into a normal tool result the model
- * can read and recover from.
- */
-export const createGuardedTools = (
-  inner: ToolService,
-  env: Record<string, string | undefined> = process.env,
-): ToolService => ({
-  async list() {
-    const { prefs } = loadToolPreferences(env)
-    return (await inner.list()).filter((tool) => toolState(prefs, tool.name) === 'enabled')
-  },
-  async call(name, args) {
-    const { prefs } = loadToolPreferences(env)
-    const state = toolState(prefs, name)
-    if (state !== 'enabled') {
-      const action = state === 'deleted' ? 'restore' : 'on'
-      throw new Error(
-        `tool "${name}" is ${state}. Run /tools ${action} ${name} in z1 to allow it again.`,
-      )
-    }
-    return inner.call(name, args)
-  },
-})

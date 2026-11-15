@@ -21,15 +21,8 @@ import { runGraph } from '/home/oleksii/Projects/z1-sdk/z1/packages/runtime/src/
 import type { ApprovalService, RunEvent, RunResult } from '/home/oleksii/Projects/z1-sdk/z1/packages/runtime/src/index.ts'
 import { graphDigest } from '/home/oleksii/Projects/z1-sdk/z1/packages/graph/src/index.ts'
 
-import {
-  createGuardedTools,
-  loadToolPreferences,
-  saveToolPreferences,
-  toolState,
-  withToolStates,
-  type ToolPreferences,
-  type ToolState,
-} from './tool-policy.ts'
+import { type ToolState } from './tool-policy.ts'
+import { ToolState as ToolStore } from './tool-state.ts'
 
 // Keep the console clean: service-selection info goes to stderr from the SDK.
 const stderrWrite = process.stderr.write.bind(process.stderr)
@@ -386,6 +379,8 @@ interface ToolMenuItem {
   name: string
   description: string
   state: ToolState
+  /** False for a tombstone whose module is no longer installed. */
+  installed: boolean
 }
 
 type ToolMenuAction = 'toggle' | 'delete'
@@ -1030,10 +1025,13 @@ class Composer {
         item.state === 'enabled' ? green('on ') : item.state === 'disabled' ? yellow('off') : red('del')
       const name = padTo(fit(item.name, nameWidth), nameWidth)
       const label = selected ? bold(cyan(name)) : name
+      const missing = item.installed ? '' : dim(' (not installed)')
       const description = (item.description.split('\n')[0] ?? '').trim()
-      const room = Math.max(0, columns - 2 - 4 - 3 - nameWidth - 2)
+      const room = Math.max(0, columns - 2 - 4 - 3 - nameWidth - displayCells(missing) - 2)
       const suffix = description.length > 0 ? `  ${dim(clip(description, room))}` : ''
-      lines.push(clip(`${pointer}${state}  ${label}${suffix}`, Math.max(1, columns - 1)))
+      lines.push(
+        clip(`${pointer}${state}  ${label}${missing}${suffix}`, Math.max(1, columns - 1)),
+      )
     }
     return lines
   }
@@ -2763,37 +2761,32 @@ const runTurn = async (
     lastTokens?: number
     maxSteps?: number
     contextWindow?: number
+    /** The session's snapshot; created from the run handle when absent. */
+    toolState?: ToolStore
   } = {},
 ): Promise<TurnResult> => {
   const maxSteps = options.maxSteps ?? stepLimit(process.env['Z1_MAX_STEPS'])
   const contextWindow =
     options.contextWindow ?? (Number(process.env['Z1_CONTEXT_WINDOW'] ?? '128000') || 128_000)
 
-  // The prompt must agree with the tool service. Read the same inventory the
-  // guard will advertise, so "all tools off" becomes an explicit "None" in the
-  // system message instead of a request that merely lacks a tools array.
-  const guardedTools = createGuardedTools(handle.services.tools)
-  let enabledTools: readonly ToolSchema[] = []
-  let totalTools = 0
-  let inventoryKnown = true
-  try {
-    const installed = await handle.services.tools.list()
-    totalTools = installed.length
-    const { prefs } = loadToolPreferences()
-    enabledTools = installed.filter((tool) => toolState(prefs, tool.name) === 'enabled')
-  } catch (error) {
-    // Reported in the prompt as "inventory unknown" rather than "no tools": the
-    // guarded service may still attach tools to this very request.
-    inventoryKnown = false
-    debugLog(
-      `tool inventory unavailable: ${error instanceof Error ? error.message : String(error)}`,
-    )
+  // One inventory read for the whole turn. The prompt, the wire `tools` array
+  // and the guarded service all come from this snapshot, so they cannot
+  // disagree — not even when another session edits the overlay mid-turn.
+  const tools = options.toolState ?? new ToolStore(() => handle.services.tools.list())
+  const snapshot = await tools.reload(() => handle.services.tools.list())
+  const enabledSchemas = snapshot.enabledSchemas
+  if (!snapshot.inventoryKnown) {
+    // Reported in the prompt as "inventory unknown" rather than "no tools".
+    debugLog(`tool inventory unavailable: ${snapshot.listError ?? 'unknown error'}`)
   }
 
   let built: unknown = buildAgentGraph({
     model,
     maxSteps,
-    system: toolInventoryText(enabledTools, totalTools, inventoryKnown),
+    system: toolInventoryText(enabledSchemas, snapshot.installedCount, snapshot.inventoryKnown),
+    // An empty explicit list is "no override" in the SDK, which would ask the
+    // guard per iteration; the guard's empty answer is the same, so omit it.
+    ...(enabledSchemas.length > 0 ? { tools: enabledSchemas } : {}),
     ...(Number.isFinite(contextWindow) && contextWindow > 0 ? { contextWindow } : {}),
   })
   if (options.forceCompact === true) built = forceCompaction(built, options.lastTokens ?? 2_000)
@@ -2822,10 +2815,10 @@ const runTurn = async (
       registry: handle.registry,
       services: {
         ...handle.services,
-        // One policy for both the advertised list and execution. The model sees
-        // only enabled tools, and a hallucinated name is rejected as a tool error
-        // (z1.tool.call turns a throw into data), so it cannot run hidden tools.
-        tools: guardedTools,
+        // The same snapshot the prompt was built from: `list()` does no RPC and
+        // `call()` re-reads the overlay, so a cross-session revocation still
+        // applies mid-turn while the advertised set stays frozen.
+        tools: tools.guard(handle.services.tools),
         onEvent: (event) => {
           if (event.type === 'node.stream' && event.port === 'text' && event.path.endsWith('/chat')) {
             streamed = true
@@ -2975,7 +2968,8 @@ const oneShot = async (prompt: string, explicitModel: string | undefined): Promi
   // reported instead of silently hanging the run.
   const handle = await runtime.beginRun({ approval: quietApproval(progress) })
   try {
-    const outcome = await runTurn(runtime, handle, model, [], prompt, progress)
+    const toolState = new ToolStore(() => handle.services.tools.list())
+    const outcome = await runTurn(runtime, handle, model, [], prompt, progress, { toolState })
     if (outcome.context !== undefined) {
       progress.print(
         dim(
@@ -3055,48 +3049,25 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
 
   const branch = gitBranch(config.cwd)
 
-  // Tool inventory for the banner and `/tools`: one short-lived run so the
-  // module worker behind `services.tools` exists, then dispose it. Nothing in
-  // that probe asks for approval, so a rejecting stub is enough.
+  // The installed inventory lives in one snapshot (`tool-state.ts`). The
+  // `tools` service only exists behind a run handle, so a short-lived probe run
+  // is its list source: it never asks for approval and its handle is disposed
+  // before the first turn. Every view — `/tools`, the footer, the prompt and the
+  // wire `tools` array — derives from this object and nothing else.
   const probeApproval: ApprovalService = { request: async () => 'rejected' }
-  let tools: readonly ToolSchema[] = []
-  /**
-   * Bumped on every successful reload of the installed inventory. Numeric
-   * selectors are bound to it: a listing printed before a refresh must not
-   * resolve a number against a different module order.
-   */
-  let toolRev = 0
-  const refreshTools = async (): Promise<void> => {
+  const probeTools = async (): Promise<readonly ToolSchema[]> => {
     const probe = await runtime.beginRun({ approval: probeApproval })
     try {
-      tools = await probe.services.tools.list()
+      return await probe.services.tools.list()
     } finally {
       await probe.dispose()
     }
-    toolRev += 1
   }
-  try {
-    await refreshTools()
-  } catch (error) {
-    console.log(`tools · unavailable (${error instanceof Error ? error.message : String(error)})`)
+  const tools = new ToolStore(probeTools)
+  const started = await tools.reload()
+  if (!started.inventoryKnown) {
+    console.log(`tools · unavailable (${started.listError ?? 'unknown error'})`)
   }
-
-  // Enablement is an overlay on the live list, shared by every z1 session. The
-  // startup read is only for the first drawing; every turn re-reads it inside
-  // the guarded tool service, so another session's change applies immediately.
-  const loadedPrefs = loadToolPreferences()
-  let toolPrefs: ToolPreferences = loadedPrefs.prefs
-  let toolPrefsError = loadedPrefs.error
-  let toolPrefsDegraded = loadedPrefs.degraded
-  const prefsPath = loadedPrefs.path
-  /**
-   * Names in the order of the last `/tools` list or picker, for `off 3`.
-   * The startup inventory is the first implicit listing; a refresh bumps
-   * `toolRev`, so old numbers become stale instead of rebinding silently.
-   */
-  let toolListing: string[] | undefined = tools.map((tool) => tool.name)
-  /** `toolRev` when that listing was shown; numbers from another rev are stale. */
-  let toolListingRev = toolRev
 
   // The model, directory and limits live in the composer footer, so the welcome
   // box only has to greet and point at the commands.
@@ -3132,17 +3103,18 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
    */
   let reportedPrefsError: string | undefined
   const reportPrefsError = (): void => {
-    if (toolPrefsError === undefined) {
+    const { error, degraded } = tools.current
+    if (error === undefined) {
       reportedPrefsError = undefined
       return
     }
-    if (reportedPrefsError === toolPrefsError) return
-    reportedPrefsError = toolPrefsError
-    say(red(`tools · preferences problem (${prefsPath}): ${toolPrefsError}`))
+    if (reportedPrefsError === error) return
+    reportedPrefsError = error
+    say(red(`tools · preferences problem (${tools.path}): ${error}`))
     const note =
-      toolPrefsDegraded === 'last-good'
+      degraded === 'last-good'
         ? 'keeping the last policy this process read'
-        : toolPrefsDegraded === 'partial'
+        : degraded === 'partial'
           ? 'unreadable entries are treated as disabled'
           : 'no readable policy in this process, so every tool is enabled until the file is fixed'
     say(dim(`  ${note} · /tools reset rewrites the file`))
@@ -3207,17 +3179,18 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   }
   const approval = consoleApproval(askLine)
 
-  const reloadToolPrefs = (): void => {
-    const loaded = loadToolPreferences()
-    toolPrefs = loaded.prefs
-    toolPrefsError = loaded.error
-    toolPrefsDegraded = loaded.degraded
+  /**
+   * `20/22` in the footer: what the agent can use, not just what is installed.
+   * `?` when the inventory could not be read, so a failed probe never renders a
+   * confident zero next to messages that do carry tools.
+   */
+  const toolCountLabel = (): string => {
+    const snapshot = tools.current
+    if (!snapshot.inventoryKnown) return '?'
+    return snapshot.installedCount === 0
+      ? '0'
+      : `${String(snapshot.enabled.length)}/${String(snapshot.installedCount)}`
   }
-  const enabledToolCount = (): number =>
-    tools.filter((tool) => toolState(toolPrefs, tool.name) === 'enabled').length
-  /** `20/22` in the footer: what the agent can use, not just what is installed. */
-  const toolCountLabel = (): string =>
-    tools.length === 0 ? '0' : `${String(enabledToolCount())}/${String(tools.length)}`
 
   const refreshStatus = (): void => {
     tail.status(
@@ -3231,28 +3204,17 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   }
 
   /**
-   * `/tools` keeps a numbered list so `off 3` is easy. Numbers resolve only
-   * against the last printed list *at the current inventory revision*: after a
-   * refresh a stale number is rejected instead of silently hitting whatever the
-   * module happens to return third. Names always resolve against the live list.
+   * `/tools` keeps a numbered list so `off 3` is easy. The numbers are bound to
+   * the revision the list was printed at (`tools.markListed`): after a refresh a
+   * stale number is rejected instead of silently hitting whatever the module now
+   * returns third. Everything printed here comes from the snapshot.
    */
   const printTools = (includeOrphans: boolean): void => {
-    reloadToolPrefs()
-    const installed = new Set(tools.map((tool) => tool.name))
-    const rows = tools.map((tool) => ({
-      name: tool.name,
-      description: tool.description ?? '',
-      state: toolState(toolPrefs, tool.name),
-      installed: true,
-    }))
-    if (includeOrphans) {
-      for (const [name, entry] of Object.entries(toolPrefs.tools)) {
-        if (installed.has(name)) continue
-        rows.push({ name, description: '', state: entry.state, installed: false })
-      }
-    }
-    toolListing = rows.map((row) => row.name)
-    toolListingRev = toolRev
+    tools.reloadPrefs()
+    const snapshot = tools.current
+    const rows = tools.markListed(
+      includeOrphans ? snapshot.records : snapshot.records.filter((row) => row.installed),
+    )
 
     const live = rows.filter((row) => row.installed)
     const off = live.filter((row) => row.state === 'disabled').length
@@ -3262,7 +3224,8 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     if (off > 0) parts.push(`${yellow(String(off))} off`)
     if (deleted > 0) parts.push(`${red(String(deleted))} deleted`)
     if (stale > 0) parts.push(`${String(stale)} stale`)
-    say(`${bold('tools')} · ${String(tools.length)} installed · ${parts.join(' · ')}`)
+    const installedLabel = snapshot.inventoryKnown ? String(snapshot.installedCount) : '?'
+    say(`${bold('tools')} · ${installedLabel} installed · ${parts.join(' · ')}`)
     reportPrefsError()
     if (rows.length === 0) {
       say(dim('  none installed'))
@@ -3288,79 +3251,29 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   }
 
   /**
-   * Resolve a `/tools` selector to a tool name.
-   *
-   * Numbers are bound to the last printed listing *and* to the inventory
-   * revision it was printed at; a number with no listing, or one printed before
-   * a refresh, is an error rather than a guess. Names are looked up live, and an
-   * unknown name triggers one inventory refresh so a tool installed since
-   * startup can be toggled without a manual `/tools refresh`.
+   * Apply one decision through the snapshot. `/tools` never writes the overlay
+   * itself: the store re-reads it, merges, saves atomically and rebuilds, and a
+   * failed write leaves the previous snapshot in place.
    */
-  const resolveToolName = async (
-    selector: string,
-  ): Promise<{ ok: true; name: string } | { ok: false; message: string }> => {
-    if (/^\d+$/.test(selector)) {
-      if (toolListing === undefined || toolListingRev !== toolRev) {
-        return { ok: false, message: 'tools · the tool list changed; run /tools again' }
-      }
-      const index = Number(selector)
-      if (index < 1 || index > toolListing.length) {
-        return {
-          ok: false,
-          message: `tools · no tool at position ${selector} · /tools for the list`,
-        }
-      }
-      return { ok: true, name: toolListing[index - 1]! }
-    }
-    if (tools.some((tool) => tool.name === selector)) return { ok: true, name: selector }
-    // A deleted tool that is no longer installed still has a preference entry,
-    // and must remain selectable for `restore`.
-    if (Object.hasOwn(toolPrefs.tools, selector)) return { ok: true, name: selector }
-    // The startup probe can predate the module directory, so retry once.
-    try {
-      await refreshTools()
-    } catch (error) {
-      debugLog(
-        `tool refresh for "${selector}" failed: ${error instanceof Error ? error.message : String(error)}`,
-      )
-      return {
-        ok: false,
-        message: `tools · no tool "${selector}" · refresh failed · /tools refresh to retry`,
-      }
-    }
-    reloadToolPrefs()
-    if (tools.some((tool) => tool.name === selector)) return { ok: true, name: selector }
-    return { ok: false, message: `tools · no tool "${selector}" · /tools for the list` }
-  }
-
-  const applyToolState = (names: readonly string[], state: ToolState): boolean => {
-    const previous = toolPrefs
-    // Re-read just before writing: another z1 session may have toggled a
-    // different tool since this command started. Whole-file rename is still
-    // last-writer-wins for two truly simultaneous writes.
-    const fresh = loadToolPreferences()
-    const next = withToolStates(fresh.prefs, names, state)
-    const saved = saveToolPreferences(next)
-    if (!saved.ok) {
-      // The guarded tool service re-reads the file, so an unsaved change would
-      // make the list disagree with what the agent can actually call.
-      toolPrefs = previous
-      say(red(`tools · could not save preferences (${saved.path}): ${saved.error}`))
+  const saveToolState = (names: readonly string[], state: ToolState): boolean => {
+    const result = tools.apply(names, state)
+    if (!result.ok) {
+      // The snapshot only changes after a successful write, so the list never
+      // promises a state the guard would not enforce.
+      say(red(result.message))
       refreshStatus()
       return false
     }
-    toolPrefs = next
-    toolPrefsError = undefined
-    toolPrefsDegraded = undefined
     refreshStatus()
     return true
   }
 
   const toolMenuItems = (): readonly ToolMenuItem[] =>
-    tools.map((tool) => ({
-      name: tool.name,
-      description: tool.description ?? '',
-      state: toolState(toolPrefs, tool.name),
+    tools.current.records.map((record) => ({
+      name: record.name,
+      description: record.description,
+      state: record.state,
+      installed: record.installed,
     }))
 
   /**
@@ -3372,17 +3285,15 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       printTools(false)
       return
     }
-    reloadToolPrefs()
+    tools.reloadPrefs()
     // The picker is the interactive form of the numbered list; bind its order
     // once so `off 12` after closing it resolves to the row the user saw.
-    toolListing = tools.map((tool) => tool.name)
-    toolListingRev = toolRev
+    tools.markListed()
     composer.openToolMenu(toolMenuItems(), (action, name) => {
-      reloadToolPrefs()
-      const current = toolState(toolPrefs, name)
+      const current = tools.current.records.find((record) => record.name === name)
       const next: ToolState =
-        action === 'delete' ? 'deleted' : current === 'enabled' ? 'disabled' : 'enabled'
-      if (current !== next) applyToolState([name], next)
+        action === 'delete' ? 'deleted' : current?.state === 'enabled' ? 'disabled' : 'enabled'
+      if (current !== undefined && current.state !== next) saveToolState([name], next)
       return toolMenuItems()
     })
   }
@@ -3398,13 +3309,12 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       return
     }
     if (rest === 'refresh') {
-      try {
-        await refreshTools()
-        reloadToolPrefs()
-        say(`tools · refreshed · ${String(tools.length)} installed`)
-      } catch (error) {
-        say(red(`tools · unavailable (${error instanceof Error ? error.message : String(error)})`))
+      const snapshot = await tools.reload()
+      if (!snapshot.inventoryKnown) {
+        say(red(`tools · unavailable (${snapshot.listError ?? 'unknown error'})`))
+        return
       }
+      say(`tools · refreshed · ${String(snapshot.installedCount)} installed`)
       return
     }
 
@@ -3416,15 +3326,22 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       return
     }
 
-    reloadToolPrefs()
+    tools.reloadPrefs()
+    const snapshot = tools.current
     if (verb === 'reset') {
-      const names = Object.keys(toolPrefs.tools)
-      const wasBroken = toolPrefsError !== undefined
+      const names = Object.keys(snapshot.prefs.tools)
+      const wasBroken = snapshot.error !== undefined
       if (names.length === 0 && !wasBroken) {
         say('tools · preferences already empty')
         return
       }
-      if (!applyToolState(names, 'enabled')) return
+      const result = tools.reset()
+      if (!result.ok) {
+        say(red(result.message))
+        refreshStatus()
+        return
+      }
+      refreshStatus()
       say(
         wasBroken
           ? 'tools · preferences reset · the unreadable file was replaced'
@@ -3441,31 +3358,25 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       // Only `enabled` becomes `disabled`: a tombstone must stay a tombstone, or
       // `restore all` has nothing left to find. Keep the result explicit today
       // instead of relying on `disabled` and `deleted` being equally hidden.
-      const names = tools
-        .map((tool) => tool.name)
-        .filter((name) => toolState(toolPrefs, name) === 'enabled')
+      const names = snapshot.enabled.map((record) => record.name)
       if (names.length === 0) {
         say('tools · every tool is already off')
         return
       }
-      if (!applyToolState(names, 'disabled')) return
+      if (!saveToolState(names, 'disabled')) return
       say(`tools · ${String(names.length)} tools off`)
       return
     }
     if ((verb === 'on' || verb === 'restore') && selector === 'all') {
       const names =
         verb === 'on'
-          ? Array.from(new Set([...tools.map((tool) => tool.name), ...Object.keys(toolPrefs.tools)])).filter(
-              (name) => toolState(toolPrefs, name) !== 'enabled',
-            )
-          : Object.entries(toolPrefs.tools)
-              .filter(([, entry]) => entry.state === 'deleted')
-              .map(([name]) => name)
+          ? snapshot.records.filter((record) => record.state !== 'enabled').map((record) => record.name)
+          : snapshot.records.filter((record) => record.state === 'deleted').map((record) => record.name)
       if (names.length === 0) {
         say(verb === 'on' ? 'tools · every tool is already on' : 'tools · nothing is deleted')
         return
       }
-      if (!applyToolState(names, 'enabled')) return
+      if (!saveToolState(names, 'enabled')) return
       say(
         verb === 'on'
           ? `tools · ${String(names.length)} tools on`
@@ -3474,13 +3385,13 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       return
     }
 
-    const resolved = await resolveToolName(selector)
+    const resolved = await tools.resolve(selector)
     if (!resolved.ok) {
       say(resolved.message)
       return
     }
-    const name = resolved.name
-    const current = toolState(toolPrefs, name)
+    const name = resolved.record.name
+    const current = resolved.record.state
     if (verb === 'off') {
       if (current === 'deleted') {
         say(`tools · ${name} is already deleted · /tools restore ${name} brings it back`)
@@ -3490,7 +3401,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         say(`tools · ${name} is already off`)
         return
       }
-      if (!applyToolState([name], 'disabled')) return
+      if (!saveToolState([name], 'disabled')) return
       say(`tools · ${name} off · hidden from the agent`)
       return
     }
@@ -3499,7 +3410,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         say(`tools · ${name} is already deleted`)
         return
       }
-      if (!applyToolState([name], 'deleted')) return
+      if (!saveToolState([name], 'deleted')) return
       say(`tools · ${name} deleted · hidden from the agent · /tools restore ${name}`)
       return
     }
@@ -3508,7 +3419,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         say(`tools · ${name} is already on`)
         return
       }
-      if (!applyToolState([name], 'enabled')) return
+      if (!saveToolState([name], 'enabled')) return
       say(`tools · ${name} ${current === 'deleted' ? 'restored' : 'enabled'} · on`)
       return
     }
@@ -3517,7 +3428,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       say(`tools · ${name} is already on`)
       return
     }
-    if (!applyToolState([name], 'enabled')) return
+    if (!saveToolState([name], 'enabled')) return
     say(`tools · ${name} on`)
   }
 
@@ -3540,7 +3451,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       if (closed && pendingLines.length === 0) break
       composer?.setBusy(false)
       // Another session may have changed the policy while this one waited.
-      reloadToolPrefs()
+      tools.reloadPrefs()
       refreshStatus()
       if (pendingLines.length === 0) tail.idle()
 
@@ -3674,6 +3585,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
           lastTokens,
           maxSteps,
           contextWindow,
+          toolState: tools,
         })
         forceCompact = false
         history = outcome.history
