@@ -122,11 +122,14 @@ repo.
   declined rather than blocking.
 - **Background processes**: tools installed from modules (including background
   process control) are surfaced like any other tool call.
-- **Tool control**: `/tools` numbers the live inventory and shows `on` / `off` /
-  `del`. `off` and `delete` hide a tool from the model and make the guard reject
-  a hallucinated call; `on` and `restore` bring it back. The choice is written
-  atomically to `~/.config/z1/tools.json` and shared by every session. The
-  footer shows `tools <enabled>/<installed>`.
+- **Tool control**: `/tools` opens a picker over the composer, styled like the
+  slash menu: `↑`/`↓` select, `Enter` toggles `on`/`off` (and restores a deleted
+  tool), `Delete` (or `Backspace`) asks before tombstoning, `Esc` closes. The
+  picker shows live counts and descriptions. `off` and `delete` hide a tool from
+  the model and make the guard reject a hallucinated call; `on` and `restore`
+  bring it back. The choice is written atomically to `~/.config/z1/tools.json`
+  and shared by every session. The footer shows `tools <enabled>/<installed>`.
+  Pipes and `Z1_TRAY=off` keep a numbered text list instead of the picker.
 - **Pipes and `Z1_TRAY=off`**: readline path with `\` line continuation, no
   alternate screen and no escape sequences emitted; `Ctrl-C` cancels a run.
 
@@ -188,7 +191,7 @@ repo.
 /help              show help
 /new               start a fresh conversation
 /model <p/m>       switch model
-/tools             numbered tool list with on/off/del state
+/tools             interactive picker: ↑↓, Enter toggle, Delete remove, Esc close
 /tools off <n|name>      hide a tool from the agent
 /tools delete <n|name>   hide it and keep a restorable tombstone
 /tools on <n|name|all>   enable a tool (also restores a tombstone)

@@ -381,6 +381,23 @@ const cursorPosition = (rows: readonly DisplayRow[], cursor: number): { row: num
   return result
 }
 
+/** One row of the interactive `/tools` menu. */
+interface ToolMenuItem {
+  name: string
+  description: string
+  state: ToolState
+}
+
+type ToolMenuAction = 'toggle' | 'delete'
+
+interface ToolMenu {
+  items: readonly ToolMenuItem[]
+  index: number
+  /** Set while the Delete key waits for a yes/no confirmation. */
+  confirmDelete?: string
+  onAction: (action: ToolMenuAction, name: string) => readonly ToolMenuItem[]
+}
+
 /**
  * The prompt, drawn the way Claude Code draws it (verified against the
  * recovered `PromptInput` code): a rounded rule above and below the draft, no
@@ -404,6 +421,8 @@ class Composer {
   /** Selected row in the slash menu, and the draft that dismissed it. */
   private menuIndex = 0
   private menuDismissed: string | undefined
+  /** Interactive `/tools` picker, independent of the slash menu. */
+  private toolsMenu: ToolMenu | undefined
   private buffer = ''
   private escTimer: NodeJS.Timeout | undefined
   private closed = false
@@ -449,6 +468,25 @@ class Composer {
       this.cursor = 0
       this.changed()
     })
+  }
+
+  /**
+   * Open the interactive `/tools` picker. Enter toggles the highlighted tool,
+   * Delete asks for confirmation before tombstoning it, Escape closes.
+   */
+  openToolMenu(
+    items: readonly ToolMenuItem[],
+    onAction: (action: ToolMenuAction, name: string) => readonly ToolMenuItem[],
+  ): void {
+    this.toolsMenu = { items, index: 0, onAction }
+    this.changed()
+  }
+
+  /** Hide the picker without touching the draft. */
+  closeToolMenu(): void {
+    if (this.toolsMenu === undefined) return
+    this.toolsMenu = undefined
+    this.changed()
   }
 
   /** Resolve or cancel an approval without losing the draft it interrupted. */
@@ -634,6 +672,18 @@ class Composer {
 
   private keyChar(char: string): void {
     const code = char.charCodeAt(0)
+    if (this.toolsMenu !== undefined) {
+      // The picker owns the keyboard: typing cannot edit the draft underneath.
+      if (code === 13) return this.submit()
+      if (code === 3) return this.ctrlC()
+      if (code === 4) return this.ctrlD()
+      // Mac keyboards send 0x7f for the key labelled Delete/Backspace; the
+      // picker has no text to edit, so both it and CSI 3~ mean "remove".
+      if (code === 127 || code === 8) return this.requestToolDelete()
+      if (code === 14 && this.toolStep(1)) return
+      if (code === 16 && this.toolStep(-1)) return
+      return
+    }
     if (code === 13) return this.submit()
     if (code === 10) return this.insert('\n')
     if (code === 127 || code === 8) return this.key('backspace')
@@ -661,6 +711,19 @@ class Composer {
   }
 
   private key(name: string): void {
+    if (this.toolsMenu !== undefined) {
+      // The picker owns the keyboard; the draft below never moves or edits.
+      switch (name) {
+        case 'up': return void this.toolStep(-1)
+        case 'down': return void this.toolStep(1)
+        case 'delete': return this.requestToolDelete()
+        case 'backspace': return this.requestToolDelete()
+        case 'escape': return this.escape()
+        case 'pageup': return void this.scroll?.('pageUp')
+        case 'pagedown': return void this.scroll?.('pageDown')
+        default: return
+      }
+    }
     switch (name) {
       case 'left': return this.move(-1)
       case 'right': return this.move(1)
@@ -681,6 +744,17 @@ class Composer {
   }
 
   private escape(): void {
+    if (this.toolsMenu !== undefined) {
+      if (this.toolsMenu.confirmDelete !== undefined) {
+        const rest = { ...this.toolsMenu }
+        delete rest.confirmDelete
+        this.toolsMenu = rest
+        this.changed()
+        return
+      }
+      this.closeToolMenu()
+      return
+    }
     if (this.asking !== undefined) {
       this.endAsk('')
       return
@@ -709,6 +783,10 @@ class Composer {
   }
 
   private ctrlC(): void {
+    if (this.toolsMenu !== undefined) {
+      this.closeToolMenu()
+      return
+    }
     if (this.asking !== undefined) {
       this.endAsk('')
       return
@@ -731,6 +809,10 @@ class Composer {
   }
 
   private ctrlD(): void {
+    if (this.toolsMenu !== undefined) {
+      this.closeToolMenu()
+      return
+    }
     if (this.busy) return
     if (this.value.length > 0) return this.delete()
     this.onExit()
@@ -750,12 +832,72 @@ class Composer {
       this.endAsk(this.value)
       return
     }
+    if (this.toolsMenu !== undefined) {
+      if (this.toolsMenu.confirmDelete !== undefined) this.deleteToolNow()
+      else this.toggleToolNow()
+      return
+    }
     const menu = this.menu()
     if (menu.open && menu.items.length > 0) {
       this.accept(menu.items[menu.index]!, 'run')
       return
     }
     this.submitText()
+  }
+
+  private selectedTool(): ToolMenuItem | undefined {
+    const menu = this.toolsMenu
+    if (menu === undefined || menu.items.length === 0) return undefined
+    return menu.items[Math.max(0, Math.min(menu.index, menu.items.length - 1))]
+  }
+
+  private toolStep(delta: number): boolean {
+    const menu = this.toolsMenu
+    if (menu === undefined || menu.items.length === 0) return false
+    if (menu.confirmDelete !== undefined) return false
+    this.toolsMenu = {
+      ...menu,
+      index: (menu.index + delta + menu.items.length) % menu.items.length,
+    }
+    this.changed()
+    return true
+  }
+
+  private toggleToolNow(): void {
+    const menu = this.toolsMenu
+    const item = this.selectedTool()
+    if (menu === undefined || item === undefined) return
+    this.toolsMenu = { ...menu, items: menu.onAction('toggle', item.name) }
+    this.clampToolIndex()
+    this.changed()
+  }
+
+  private requestToolDelete(): void {
+    const menu = this.toolsMenu
+    const item = this.selectedTool()
+    if (menu === undefined || item === undefined) return
+    this.toolsMenu = { ...menu, confirmDelete: item.name }
+    this.changed()
+  }
+
+  private deleteToolNow(): void {
+    const menu = this.toolsMenu
+    if (menu === undefined) return
+    const name = menu.confirmDelete
+    if (name === undefined) return
+    const rest = { ...menu }
+    delete rest.confirmDelete
+    this.toolsMenu = { ...rest, items: menu.onAction('delete', name) }
+    this.clampToolIndex()
+    this.changed()
+  }
+
+  private clampToolIndex(): void {
+    const menu = this.toolsMenu
+    if (menu === undefined) return
+    const last = Math.max(0, menu.items.length - 1)
+    if (menu.index <= last) return
+    this.toolsMenu = { ...menu, index: last }
   }
 
   /** Send the draft as one turn, leaving the composer ready for the next one. */
@@ -840,7 +982,64 @@ class Composer {
     })
   }
 
+  /**
+   * The `/tools` picker: a title with counts, an optional delete confirmation,
+   * then a scrolling window of `on/off/del` rows. It reuses the slash menu's
+   * pointer and selection colours so the two read as one control.
+   */
+  private renderToolMenu(columns: number): string[] {
+    const menu = this.toolsMenu
+    if (menu === undefined) return []
+    const items = menu.items
+    const on = items.filter((item) => item.state === 'enabled').length
+    const off = items.filter((item) => item.state === 'disabled').length
+    const deleted = items.filter((item) => item.state === 'deleted').length
+    const parts = [`${green(String(on))} on`]
+    if (off > 0) parts.push(`${yellow(String(off))} off`)
+    if (deleted > 0) parts.push(`${red(String(deleted))} deleted`)
+    const title = `${bold('tools')} · ${String(items.length)} total · ${parts.join(' · ')}`
+    const lines: string[] = [clip(`  ${title}`, Math.max(1, columns - 1))]
+    if (menu.confirmDelete !== undefined) {
+      lines.push(
+        clip(
+          `  ${yellow('delete')} ${bold(`"${menu.confirmDelete}"`)}? ${dim(
+            'hidden from the agent; the module keeps the code',
+          )}`,
+          Math.max(1, columns - 1),
+        ),
+      )
+      lines.push(clip(`  ${dim('⏎ yes · esc cancel')}`, Math.max(1, columns - 1)))
+    }
+    if (items.length === 0) {
+      lines.push(dim('  no tools installed'))
+      return lines
+    }
+
+    // Leave room for the title, the confirmation, the composer and the
+    // submitted `/tools` row; a 24-row terminal must still show the title.
+    const maxRows = Math.max(1, Math.min(items.length, terminalRows() - 12))
+    let start = Math.max(0, menu.index - Math.floor(maxRows / 2))
+    start = Math.min(start, Math.max(0, items.length - maxRows))
+    const slice = items.slice(start, start + maxRows)
+    // Width across the whole list, so descriptions do not jump while scrolling.
+    const nameWidth = Math.min(24, Math.max(4, ...items.map((item) => displayCells(item.name))))
+    for (const [offset, item] of slice.entries()) {
+      const selected = start + offset === menu.index
+      const pointer = selected ? `${cyan('❯')} ` : '  '
+      const state =
+        item.state === 'enabled' ? green('on ') : item.state === 'disabled' ? yellow('off') : red('del')
+      const name = padTo(fit(item.name, nameWidth), nameWidth)
+      const label = selected ? bold(cyan(name)) : name
+      const description = (item.description.split('\n')[0] ?? '').trim()
+      const room = Math.max(0, columns - 2 - 4 - 3 - nameWidth - 2)
+      const suffix = description.length > 0 ? `  ${dim(clip(description, room))}` : ''
+      lines.push(clip(`${pointer}${state}  ${label}${suffix}`, Math.max(1, columns - 1)))
+    }
+    return lines
+  }
+
   private insert(text: string): void {
+    if (this.toolsMenu !== undefined) return
     const clean = text.replace(/\r\n?/g, '\n').replace(/\t/g, '  ').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
     if (clean.length === 0) return
     this.value = `${this.value.slice(0, this.cursor)}${clean}${this.value.slice(this.cursor)}`
@@ -850,6 +1049,7 @@ class Composer {
   }
 
   private backspace(): void {
+    if (this.toolsMenu !== undefined) return
     if (this.cursor === 0) return
     const before = this.value.slice(0, this.cursor)
     const char = Array.from(before).at(-1) ?? ''
@@ -1005,6 +1205,11 @@ class Composer {
 
   private hint(menuOpen: boolean): string {
     if (this.asking !== undefined) return this.asking.label
+    if (this.toolsMenu !== undefined) {
+      return this.toolsMenu.confirmDelete !== undefined
+        ? '⏎ yes · esc cancel'
+        : '↑↓ · ⏎ toggle · del delete · esc'
+    }
     if (menuOpen) return '↑↓ select · ⏎ run · esc close'
     if (this.override !== undefined && Date.now() < this.override.until) return this.override.text
     if (this.busy) return pendingLines.length > 0 ? `${String(pendingLines.length)} queued · esc to interrupt` : 'esc to interrupt'
@@ -1026,6 +1231,7 @@ class Composer {
     const width = Math.max(8, columns)
     const menu = this.menu()
     const menuLines = this.renderMenu(width, menu)
+    const toolLines = this.renderToolMenu(width)
     // The composer is a full sharp box: top/bottom rules and vertical sides.
     // It is accented only while the field is active (idle, asking, or a draft
     // is being edited); during a run with an empty draft it stays dim.
@@ -1073,7 +1279,7 @@ class Composer {
         footer += `${' '.repeat(Math.max(0, available - stripAnsi(left).length - stripAnsi(rightText).length))}${rightText}`
       }
     }
-    const lines = [...menuLines, header, ...input, footerRule, dim(footer)]
+    const lines = [...toolLines, ...menuLines, header, ...input, footerRule, dim(footer)]
     const key = [
       this.value,
       String(this.cursor),
@@ -1082,11 +1288,13 @@ class Composer {
       this.asking?.label ?? '',
       this.hint(menu.open),
       menu.open ? `${String(menu.index)}:${menuLines.join('\n')}` : '',
+      toolLines.join('\n'),
+      this.toolsMenu === undefined ? '' : String(this.toolsMenu.confirmDelete ?? ''),
       String(width),
     ].join('\u0000')
     return {
       lines,
-      cursorRow: menuLines.length + 1 + (position.row - start),
+      cursorRow: toolLines.length + menuLines.length + 1 + (position.row - start),
       cursorCol: 2 + position.col,
       key,
     }
@@ -2331,7 +2539,7 @@ const COMMANDS: readonly CommandSpec[] = [
   { name: '/model', description: 'switch the model', args: '<provider/model>' },
   // No `args` here: Enter on a bare `/tools` must list, not complete. The
   // toggle grammar is shown in the description and in `/help`.
-  { name: '/tools', description: 'list tools; on/off/delete/restore <n|name>' },
+  { name: '/tools', description: 'tool picker; on/off/delete/restore <n|name>' },
   { name: '/context', description: 'show context usage' },
   { name: '/compact', description: 'compact the next turn' },
   { name: '/window', description: 'set the context window', args: '<tokens>' },
@@ -2939,10 +3147,37 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     return true
   }
 
+  const toolMenuItems = (): readonly ToolMenuItem[] =>
+    tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description ?? '',
+      state: toolState(toolPrefs, tool.name),
+    }))
+
+  /**
+   * Interactive `/tools` in the composer. Enter flips `on`/`off` (and restores
+   * a tombstone); Delete asks first; the static numbered list stays for pipes.
+   */
+  const openToolMenu = (): void => {
+    if (composer === undefined) {
+      printTools(false)
+      return
+    }
+    reloadToolPrefs()
+    composer.openToolMenu(toolMenuItems(), (action, name) => {
+      reloadToolPrefs()
+      const current = toolState(toolPrefs, name)
+      const next: ToolState =
+        action === 'delete' ? 'deleted' : current === 'enabled' ? 'disabled' : 'enabled'
+      if (current !== next) applyToolState([name], next)
+      return toolMenuItems()
+    })
+  }
+
   const handleTools = async (line: string): Promise<void> => {
     const rest = line.slice('/tools'.length).trim()
     if (rest === '') {
-      printTools(false)
+      openToolMenu()
       return
     }
     if (rest === '--all' || rest === 'all') {
@@ -3198,6 +3433,9 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       }
 
       composer?.setBusy(true)
+      // A queued prompt may start while the picker is open; a running turn
+      // owns the transcript, so the picker must not float over it.
+      composer?.closeToolMenu()
       const progress = createProgress(tail)
       const handle = await runtime.beginRun({ approval })
       try {
