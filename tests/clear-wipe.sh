@@ -34,6 +34,8 @@ git -C "$repo" init -q
 
 env_args=(
   "Z1_MODEL=mock/mock-1"
+  # No SearXNG provisioning here: the default would download ~120 MB.
+  "Z1_WEB_AUTOSTART=off"
   "Z1_MODULES_DIR=${Z1_MODULES_DIR:-$HOME/.local/share/z1/modules}"
 )
 

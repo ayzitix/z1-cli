@@ -35,6 +35,7 @@ import type {
 } from '/home/oleksii/Projects/z1-sdk/z1/packages/session/src/index.ts'
 
 import { ownStateText } from './workspace-state.ts'
+import { ensureWebSearch } from './web-service.ts'
 import { toolInventoryText } from './tool-inventory.ts'
 import { type ToolState } from './tool-policy.ts'
 import { ToolState as ToolStore } from './tool-state.ts'
@@ -3281,6 +3282,9 @@ const oneShot = async (prompt: string, explicitModel: string | undefined): Promi
   const tail = createTail()
   const progress = createProgress(tail)
   progress.print(`› ${prompt}`)
+  // Same background provisioning as the interactive loop. Diagnostics go to
+  // stderr here: a one-shot run's stdout is the answer and may be piped.
+  void ensureWebSearch({ onLine: line => console.error(dim(line)) })
   // Without a terminal an approval would block forever, so it is declined and
   // reported instead of silently hanging the run.
   const handle = await runtime.beginRun({ approval: quietApproval(progress) })
@@ -3417,6 +3421,13 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   tail.setHeader(buildBanner)
   /** Everything the user sees from here on goes through the tail. */
   const say = (line = ''): void => tail.print(line)
+
+  // The web tools need a SearXNG backend. Provisioning it runs in the
+  // background: the banner is already printed and the prompt already accepts
+  // input, so a first install (or a failure) never delays the session. It
+  // prints at most one line — install progress, or why it could not start —
+  // and only when it actually did something.
+  void ensureWebSearch({ onLine: line => say(dim(line)) })
 
   /**
    * An unreadable overlay degrades the whole session's policy, so it is reported

@@ -1,0 +1,75 @@
+# SearXNG configuration for z1's private, local-only search backend.
+#
+# z1 copies this template to `<web dir>/searxng/settings.yml` on first install,
+# replacing `{{SECRET}}` with a random 32-byte hex key, and writes it 0600. It
+# is never served and never binds to anything but loopback.
+#
+# `use_default_settings: true` merges these keys into the settings shipped with
+# the pinned SearXNG source instead of replacing the whole file: that is what
+# keeps engine definitions, categories and the UI templates working after an
+# upgrade of the source tarball.
+use_default_settings: true
+
+general:
+  instance_name: "z1"
+
+server:
+  # Random per install; SearXNG refuses to start on its shipped placeholder.
+  secret_key: "{{SECRET}}"
+  # Loopback only. z1 never exposes this process to the network.
+  bind_address: "127.0.0.1"
+  port: 8888
+  # No bot rate limiting: one user, one machine.
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+search:
+  # `formats` defaults to [html]; without `json` every `format=json` request is
+  # answered with 403 and the web tools cannot read results.
+  formats:
+    - html
+    - json
+  # Filters 0: none, 1: moderate, 2: strict. The user's own queries are not
+  # filtered; anything else would silently narrow their search.
+  safe_search: 0
+
+outgoing:
+  # Per-engine cap. SearXNG waits for every engine, so a slow one must not
+  # hold a whole query (default is 3.0).
+  request_timeout: 4.0
+
+# The engines the install was verified against. SearXNG merges these into the
+# shipped list by name; the flags below override the shipped defaults (google,
+# bing and mojeek ship disabled). `wikipedia` also gets `list` so its articles
+# appear as results and not only as an infobox.
+#
+# Each failure mode is independent: one engine answering 429 or blocking the IP
+# leaves the others working, and `unresponsive_engines` in the JSON response
+# says which ones were silent.
+engines:
+  - name: google
+    engine: google
+    shortcut: go
+    disabled: false
+  - name: bing
+    engine: bing
+    shortcut: bi
+    disabled: false
+  - name: brave
+    engine: brave
+    shortcut: br
+    disabled: false
+  - name: mojeek
+    engine: mojeek
+    shortcut: mj
+    disabled: false
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: false
+    display_type: ["infobox", "list"]
+  - name: github
+    engine: github
+    shortcut: gh
+    disabled: false

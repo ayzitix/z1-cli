@@ -30,6 +30,7 @@ printf '/tools\n/exit\n' | env \
   Z1_MODEL=mock/mock-1 \
   Z1_PINNED=off \
   Z1_TRAY=off \
+  Z1_WEB_AUTOSTART=off \
   Z1_MODULES_DIR="${Z1_MODULES_DIR:-$HOME/.local/share/z1/modules}" \
   "$TSX" "$CHAT" >"$out" 2>"$err"
 code=$?
