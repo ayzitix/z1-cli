@@ -282,4 +282,118 @@ assert.deepEqual(
   'real prose keeps its own text',
 )
 
+// -------------------------------------------- streamed === whole, every split
+/** Feed `text` in fixed-size deltas plus the flush. */
+const streamed = (text: string, step: number): string => {
+  const sanitizer = createOutputSanitizer()
+  let out = ''
+  for (let at = 0; at < text.length; at += step) out += sanitizer.push(text.slice(at, at + step))
+  return out + sanitizer.flush()
+}
+
+// A drained `calls>` remnant is markup at any split, not the start of prose.
+const REMNANT_DOC = 'the tool\ncalls>\nfor it'
+assert.equal(sanitizeOutput(REMNANT_DOC).text, 'the tool\nfor it', 'a bare calls> remnant line is dropped')
+for (const step of [1, 3]) {
+  assert.equal(
+    streamed(REMNANT_DOC, step),
+    'the tool\nfor it',
+    `a calls> remnant holds at every ${String(step)}-byte delta`,
+  )
+}
+
+// The real 14 KB DSML dump: one block, whatever the delta size.
+const bigBlock = (): string => {
+  const lines = ['<|DSML| calls>', '<|DSML| invoke name="x">']
+  for (let i = 0; i < 200; i += 1) {
+    lines.push(`<|DSML| parameter name="p${String(i)}" string="true">value ${String(i)}</|DSML| parameter>`)
+  }
+  lines.push('</|DSML| invoke>', '</|DSML| calls>')
+  return `${lines.join('\n')}\n`
+}
+const BIG = bigBlock()
+assert.equal(BIG.length, 14_453, 'the dump is the 14 453-byte block from the report')
+assert.equal(sanitizeOutput(BIG).text, '', 'the 14 KB block leaves nothing, whole or streamed')
+assert.equal(streamed(BIG, 1), '', 'the 14 KB block leaves nothing at one byte per delta')
+assert.equal(streamed(BIG, 3), '', 'the 14 KB block leaves nothing at three bytes per delta')
+assert.equal(streamed(BIG, 7), '', 'the 14 KB block leaves nothing at seven bytes per delta')
+
+// Prose on both sides of the same 14 KB block survives it.
+{
+  const doc = `I cannot run that.\n${BIG}Done.`
+  assert.equal(sanitizeOutput(doc).text, 'I cannot run that.\nDone.', 'prose around the 14 KB block survives')
+  assert.equal(streamed(doc, 1), 'I cannot run that.\nDone.', 'and it survives one byte per delta')
+  assert.equal(streamed(doc, 3), 'I cannot run that.\nDone.', 'and three bytes per delta')
+}
+
+// A fence around the dump is code, so it is untouched even at one byte a delta.
+{
+  const fenced = `\`\`\`\n${BIG}\`\`\`\n`
+  assert.equal(sanitizeOutput(fenced).text, fenced, 'a fence holding the 14 KB block is untouched')
+  assert.equal(streamed(fenced, 1), fenced, 'and it survives one byte per delta')
+}
+
+// An unterminated block past BLOCK_HARD_LIMIT (64 KB) drops the rest of the
+// stream instead of emitting the body as prose.
+{
+  const junk = `<|DSML| calls>\n<|DSML| parameter name="x" string="true">${'z'.repeat(70_000)}`
+  assert.equal(sanitizeOutput(junk).text, '', 'a 64 KB unterminated block emits no body')
+  assert.equal(streamed(junk, 1), '', 'and one-byte deltas emit no body either')
+  const withProse = `before\n${junk}\nafter`
+  assert.equal(sanitizeOutput(withProse).text, 'before\n', 'the prose before it is kept')
+}
+
+// The equality property: push chunks + flush is sanitizeOutput, for any split.
+{
+  const doc = [
+    'Here is the plan.',
+    '',
+    '1. read the file',
+    '2. patch `output.ts`',
+    '',
+    '```ts',
+    'const x = a < b ? 1 : 2',
+    '</tool_call>',
+    '```',
+    '',
+    'Then:',
+    'calls>',
+    '<|DSML| calls>',
+    '<|DSML| invoke name="edit">',
+    '<|DSML| parameter name="path" string="true">/tmp/x</|DSML| parameter>',
+    '</|DSML| invoke>',
+    '</|DSML| calls>',
+    '',
+    'Done. Use <div> and 3<4.',
+  ].join('\n')
+  const whole = sanitizeOutput(doc).text
+  assert.equal(whole.includes('<|DSML|'), false, 'the whole-string form has no markup left')
+  let seed = 0x2f6e2b1
+  const random = (): number => {
+    // xorshift32, so the 300 splits are fixed and a failure is reproducible.
+    seed ^= seed << 13
+    seed ^= seed >>> 17
+    seed ^= seed << 5
+    return (seed >>> 0) / 0x1_0000_0000
+  }
+  for (let run = 0; run < 300; run += 1) {
+    const sanitizer = createOutputSanitizer()
+    let out = ''
+    let at = 0
+    while (at < doc.length) {
+      const width = 1 + Math.floor(random() * 40)
+      out += sanitizer.push(doc.slice(at, at + width))
+      at += width
+    }
+    out += sanitizer.flush()
+    assert.equal(out, whole, `random split ${String(run)} reproduces the whole-string result`)
+  }
+  // Every single split point too, since the doc is short enough to afford it.
+  for (let split = 0; split <= doc.length; split += 1) {
+    const sanitizer = createOutputSanitizer()
+    const out = sanitizer.push(doc.slice(0, split)) + sanitizer.push(doc.slice(split)) + sanitizer.flush()
+    assert.equal(out, whole, `a two-delta split at ${String(split)} reproduces the whole-string result`)
+  }
+}
+
 console.log('output tests passed (screenshot block at every split, fences and prose intact, 2 KB bound)')

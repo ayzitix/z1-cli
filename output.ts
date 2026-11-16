@@ -14,9 +14,15 @@
  *    `<tool_call>` needs to see the example they asked for.
  *
  * Streaming: only markup candidates buffer (`<|` across a chunk boundary, a
- * whole block until its closer). Ordinary prose is returned from `push` as soon
- * as it arrives. A partial token is held for at most `HOLD_LIMIT` bytes and then
- * emitted literally, so a stray `<` can never stall the stream.
+ * whole block until its closer, a line that could still become a drained
+ * remnant). Ordinary prose is returned from `push` as soon as it arrives. A
+ * partial token is held for at most `HOLD_LIMIT` bytes and then emitted
+ * literally, so a stray `<` can never stall the stream.
+ *
+ * Streamed and whole-string output are the same function: `sanitizeOutput` is
+ * `push` + `flush` over the whole text, and every chunking of that text returns
+ * the same characters. The one documented exception is whitespace-only output,
+ * which `sanitizeOutput` reports as empty text.
  */
 
 /** Matches the "no tools" notice `chat.ts` prints for an empty sanitized turn. */
@@ -31,8 +37,13 @@ const HOLD_LIMIT = 2048
 /** How much of a dropped block's tail to keep while looking for its closer. */
 const BLOCK_TAIL = 128
 
-/** A dropped block stops eating the answer after this many bytes. */
-const BLOCK_LIMIT = 4096
+/**
+ * A dropped block keeps swallowing until its closer, however long its body is:
+ * a 14 KB DSML dump is still one block, and emitting the body after a few KB was
+ * exactly the leak. This is the point where a closer is given up on instead of
+ * swallowed forever — a block that big is not one turn's markup.
+ */
+const BLOCK_HARD_LIMIT = 64 * 1024
 
 /**
  * The most token text a control marker may carry. Providers space their markers
@@ -57,7 +68,7 @@ type Verdict =
   | { kind: 'hold' }
   | { kind: 'literal' }
   | { kind: 'remove'; length: number }
-  | { kind: 'block'; length: number; pattern: RegExp; keep: number; limit: number }
+  | { kind: 'block'; length: number; pattern: RegExp; keep: number }
 
 /**
  * A control marker: `<|`, up to `TOKEN_TEXT_MAX` characters of token text
@@ -97,9 +108,24 @@ const BLOCK_TAGS: readonly string[] = [
  */
 const REMNANT_LINE = /^\/?(tool_calls?|function_calls?|calls|invoke|parameter)(?:[ \t]+[^<>]*)?>$/
 
-/** The same fragment before its `>`, so a split inside it is not shown as prose. */
-const REMNANT_PARTIAL =
-  /^[ \t]*\/?(?:tool_calls?|function_calls?|calls|invoke|parameter)(?:[ \t]+[A-Za-z_][A-Za-z0-9_.:-]*="[^"<>\n]*")*[ \t]*>?[ \t]*$/
+/**
+ * The same fragment before its `>`, so a split inside it is not shown as prose.
+ * Every proper prefix of a tag counts too (`c`, `cal`, `calls`): a streamed line
+ * arrives one character at a time, and `calls>` only becomes recognizable at
+ * its `>` — by which time the `calls` characters must not already be on screen.
+ */
+const REMNANT_TAGS = ['tool_calls', 'tool_call', 'function_calls', 'function_call', 'calls', 'invoke', 'parameter']
+
+/** Every proper prefix of `tag`, longest first, as a regex alternation. */
+const prefixesOf = (tag: string): string[] => {
+  const out: string[] = []
+  for (let at = tag.length; at > 0; at -= 1) out.push(tag.slice(0, at))
+  return out
+}
+
+const REMNANT_PARTIAL = new RegExp(
+  `^[ \\t]*\\/?(?:${[...REMNANT_TAGS].reverse().flatMap(prefixesOf).join('|')})?(?:[ \\t]+[^<>\\n]*)?[ \\t]*>?[ \\t]*$`,
+)
 
 /** XML/DSML tool-call tags. Longest first so `tool_calls` wins over `tool_call`. */
 const XML_TAGS: readonly string[] = [
@@ -186,7 +212,7 @@ const classifyMarker = (text: string): Verdict => {
   }
   // An unpaired opener is a block whose closer may still arrive: drop its body
   // rather than leak the first line and the parameters under it.
-  return { kind: 'block', length, pattern, keep: BLOCK_TAIL, limit: BLOCK_LIMIT }
+  return { kind: 'block', length, pattern, keep: BLOCK_TAIL }
 }
 
 /**
@@ -227,7 +253,7 @@ const classify = (text: string): Verdict => {
       if (matched !== null) {
         return { kind: 'remove', length: opener.length + matched.index + matched[0].length }
       }
-      return { kind: 'block', length: opener.length, pattern, keep: BLOCK_TAIL, limit: BLOCK_LIMIT }
+      return { kind: 'block', length: opener.length, pattern, keep: BLOCK_TAIL }
     }
     if (core.startsWith(text)) return { kind: 'hold' }
   }
@@ -251,9 +277,15 @@ export function createOutputSanitizer(): OutputSanitizer {
   let output = ''
   let inFence = false
   let lineStart = true
-  let block: { pattern: RegExp; keep: number; limit: number } | undefined
-  /** Bytes already dropped for the current block; bounds how much it may eat. */
+  let block: { pattern: RegExp; keep: number } | undefined
+  /** Bytes already dropped for the current block; compared to `BLOCK_HARD_LIMIT`. */
   let dropped = 0
+  /**
+   * The current block never produced a closer before `BLOCK_HARD_LIMIT`, so the
+   * rest of the stream is treated as the block body: dropping it leaves an empty
+   * answer, which the notice path turns into "no tools" instead of leaking it.
+   */
+  let dropRest = false
   /** True when the line just dropped was a block remnant (so a lone `>` is too). */
   let remnantLine = false
   /** A `calls>` line whose block body must be seen before anything else is dropped. */
@@ -280,13 +312,17 @@ export function createOutputSanitizer(): OutputSanitizer {
   }
 
   const startBlock = (name: string): void => {
-    block = { pattern: blockCloser(name), keep: BLOCK_TAIL, limit: BLOCK_LIMIT }
+    block = { pattern: blockCloser(name), keep: BLOCK_TAIL }
     dropped = 0
   }
 
   const push = (delta: string): string => {
     buffer += delta
     while (buffer.length > 0) {
+      if (dropRest) {
+        buffer = ''
+        break
+      }
       if (swallowLineEnd) {
         if (!lineStart) {
           swallowLineEnd = false
@@ -305,23 +341,27 @@ export function createOutputSanitizer(): OutputSanitizer {
       if (block !== undefined) {
         const matched = block.pattern.exec(buffer)
         if (matched === null) {
-          // Keep only enough tail to catch a closer split across deltas, and
-          // never drop more than the block's budget.
-          const room = block.limit - dropped
-          const cut = Math.min(Math.max(0, buffer.length - block.keep), room)
+          // Keep only enough tail to catch a closer split across deltas. There is
+          // no per-block budget: a 14 KB DSML dump is one block, and emitting its
+          // body after a few KB was exactly the leak.
+          const cut = Math.max(0, buffer.length - block.keep)
           dropped += cut
           buffer = buffer.slice(cut)
-          if (dropped >= block.limit) {
-            // Bounded: an unpaired opener must not swallow the whole answer.
+          if (dropped >= BLOCK_HARD_LIMIT) {
+            // 64 KB without a closer is not one turn's markup. Drop the rest of
+            // the stream instead of emitting the body, and leave no block state.
             block = undefined
             dropped = 0
-            continue
+            dropRest = true
+            buffer = ''
+            break
           }
           break
         }
         buffer = buffer.slice(matched.index + matched[0].length)
         block = undefined
         dropped = 0
+        dropRest = false
         consumeLineEnd()
         continue
       }
@@ -438,7 +478,7 @@ export function createOutputSanitizer(): OutputSanitizer {
         continue
       }
       buffer = buffer.slice(verdict.length)
-      block = { pattern: verdict.pattern, keep: verdict.keep, limit: verdict.limit }
+      block = { pattern: verdict.pattern, keep: verdict.keep }
       dropped = 0
       remnantLine = true
       consumeLineEnd()
@@ -449,8 +489,8 @@ export function createOutputSanitizer(): OutputSanitizer {
   }
 
   const flush = (): string => {
-    if (block !== undefined) {
-      // An unclosed block is still markup: drop what is left of it.
+    if (block !== undefined || dropRest) {
+      // An unclosed (or given-up-on) block is still markup: drop what is left.
       buffer = ''
       block = undefined
       pending = undefined
@@ -468,6 +508,9 @@ export function createOutputSanitizer(): OutputSanitizer {
       buffer = ''
     }
     pending = undefined
+    block = undefined
+    dropped = 0
+    dropRest = false
     const out = output
     output = ''
     return out

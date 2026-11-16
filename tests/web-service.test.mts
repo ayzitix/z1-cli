@@ -329,6 +329,40 @@ assert.equal(startStatus.state, 'failed')
 assert.match(String(startHint[SEARX_STATE_ENV]), /^down:searxng did not start/)
 assert.equal(readPid(fakePaths.pidFile), undefined)
 
+// `/web down` while the launch-time provisioner is still probing: the next
+// `/web start` must begin a run of its own, not join the one the stop ended —
+// that run's answer (`ready`, or a failure) predates the stop and says nothing
+// about what is running now. A server that accepts and never answers holds
+// `checkHealth` for its full timeout: the window the stop lands in.
+const slow = createServer(() => {
+  // Intentionally silent.
+})
+await new Promise<void>(resolve => slow.listen({ host: '127.0.0.1', port: 0 }, resolve))
+const slowUrl = `http://127.0.0.1:${String((slow.address() as AddressInfo).port)}`
+const firstLines: string[] = []
+const launchRun = ensureWebSearch({
+  env: { ...fakeEnv },
+  url: slowUrl,
+  timeoutMs: 300,
+  onLine: line => firstLines.push(line),
+})
+await new Promise<void>(resolve => setTimeout(resolve, 50))
+assert.equal((await stopWebSearch({ ...fakeEnv }, { url: down })).state, 'stopped')
+const secondLines: string[] = []
+const secondStart = Date.now()
+const restarted = await ensureWebSearch({
+  env: { ...fakeEnv },
+  url: down,
+  timeoutMs: 0,
+  onLine: line => secondLines.push(line),
+})
+const secondElapsed = Date.now() - secondStart
+assert.equal(restarted.state, 'failed', 'the fake install cannot start, so a fresh run fails')
+assert.ok(secondLines.length > 0, 'the post-stop start reported through its own lines, so it was a fresh run')
+assert.ok(secondElapsed < 1500, `the post-stop start waited ${String(secondElapsed)} ms on the stopped run`)
+await launchRun
+await new Promise<void>(resolve => slow.close(() => resolve()))
+
 // `starting:`/`installing:` hints are dropped by a stop: nothing is coming up.
 const stopHint: NodeJS.ProcessEnv = { Z1_WEB_DIR: dir, Z1_SEARX_URL: '', [SEARX_STATE_ENV]: 'starting:1' }
 assert.equal((await stopWebSearch(stopHint, { url: down })).state, 'stopped')

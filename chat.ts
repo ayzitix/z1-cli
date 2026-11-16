@@ -35,7 +35,8 @@ import type {
 } from '/home/oleksii/Projects/z1-sdk/z1/packages/session/src/index.ts'
 
 import { ownStateText } from './workspace-state.ts'
-import { ensureWebSearch } from './web-service.ts'
+import { ensureWebSearch, stopWebSearch, webSearchStatus } from './web-service.ts'
+import type { WebStatus } from './web-service.ts'
 import { splitCommandAndPrompt, splitUnknownCommand } from './input.ts'
 import { createOutputSanitizer, finalizeAssistantReply, sanitizeOutput } from './output.ts'
 import { toolInventoryText } from './tool-inventory.ts'
@@ -2884,6 +2885,16 @@ const modelLabel = (model: ModelHandle): string => `${model.provider}/${model.mo
  */
 const STEP_CEILING = 10_000
 
+/**
+ * Whether an append/reload failed because the session id no longer exists on
+ * disk. The store reports that as a plain `Error` (`session: unknown session
+ * <id>`) rather than a class, so the message is the only handle there is — and
+ * it is the one failure that must drop the live handle instead of being
+ * reported per turn.
+ */
+const isUnknownSessionError = (error: unknown): boolean =>
+  error instanceof Error && /unknown session/.test(error.message)
+
 /** `off`, `0` or an empty value all mean the ceiling. */
 const stepLimit = (raw: string | undefined): number => {
   const value = Number(raw ?? '')
@@ -2928,6 +2939,15 @@ const COMMANDS: readonly CommandSpec[] = [
     ],
   },
   { name: '/compact', description: 'compact the next turn' },
+  // Same shape as `/tools`: no `args`, so Enter runs the bare status instead of
+  // completing. `handleWeb` (a plain handler) parses the three verbs.
+  {
+    name: '/web',
+    description: 'web search backend (SearXNG)',
+    usage: '/web [status|start|down]',
+    rest: true,
+    help: ['bare is status · start (installs on first use) · down'],
+  },
   {
     name: '/window',
     description: 'set the context window',
@@ -3153,6 +3173,12 @@ const runTurn = async (
       },
       runId,
       journal: runtime.journal,
+      // The same names the prompt and the wire list advertise, frozen for this
+      // run: the SDK refuses `ctx.tools.call` for any other name before the
+      // service is reached, so a hallucinated tool cannot route to whatever
+      // the live inventory happens to hold. An empty list is "no tool in this
+      // run", which is exactly what an all-disabled policy means.
+      tools: enabledSchemas.map(schema => schema.name),
     })
   } catch (error) {
     // The row was created as `running` before the run; without this it would
@@ -3598,6 +3624,23 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   /** The rows of the last printed listing; numbers resolve against it. */
   let listedSessions: readonly SessionSummary[] = []
 
+  /**
+   * Drop the live transcript without touching the store. Used where the
+   * conversation itself is gone (cleared elsewhere, deleted): the handle and
+   * the in-memory copy have to go together, or the next prompt carries a dead
+   * id into `appendTurn` and every later turn fails the same way behind the
+   * once-per-problem dedup in `sessionFailure`. A session that can no longer be
+   * *read* but whose turn was saved is different: only the handle goes there,
+   * because the conversation is still here, in `history`.
+   */
+  const forgetLiveConversation = (): void => {
+    currentSession = undefined
+    history = []
+    lastContext = undefined
+    lastTokens = 0
+    forceCompact = false
+  }
+
   const relativeTime = (ms: number): string => {
     const delta = Date.now() - ms
     if (!Number.isFinite(delta) || delta < 45_000) return 'just now'
@@ -3971,6 +4014,22 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         )
         return false
       }
+      if (isUnknownSessionError(error)) {
+        // The directory behind this handle is gone: `/sessions delete` from
+        // another z1, a deleted `z1/sessions`, a hand-cleaned repository. Unlike
+        // a cleared transcript there is nothing to reload, and it is not a
+        // per-turn fluke either — every later turn would fail on the same id,
+        // with `sessionFailure`'s once-per-problem dedup hiding the repeats, so
+        // the chat would look like it was saving while nothing was written.
+        // Drop the handle and the transcript it described, exactly as the
+        // cleared-elsewhere branch does: the next prompt creates a new session.
+        forgetLiveConversation()
+        say(
+          red('session · this session no longer exists on disk; this turn was not saved'),
+        )
+        say(dim('  the next prompt starts a new session'))
+        return false
+      }
       sessionFailure('could not save this turn', error)
       return true
     }
@@ -3987,16 +4046,21 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       return true
     }
     // The append landed, but the session it landed in can no longer be read
-    // back. Keeping `session` would pin a handle whose `messages` stop at the
-    // previous turn (and whose `messageCount` is one turn short) — the same lie
-    // the `/clear` path guards against, and `titleSession` would look for the
-    // first user message in that stale array. The in-memory transcript is not
-    // touched: `history` still holds the whole conversation, so dropping the
-    // handle means the next prompt creates a session and `appendTurn` writes
-    // that full transcript into it rather than continuing beside it.
+    // back (the directory went away, or its meta/events became unreadable).
+    // Keeping `session` would pin a handle whose `messages` stop at the
+    // previous turn — the same lie the `/clear` path guards against, and
+    // `titleSession` would look for the first user message in that stale
+    // array. So the handle goes, but only the handle: the turn *was* written,
+    // and `history` already holds it, so the conversation continues in memory
+    // under a fresh session on the next prompt rather than being thrown away.
+    // The saved bytes stay on disk untouched.
     currentSession = undefined
     say(red('session · saved this turn, but the session can no longer be read'))
-    say(dim('  the next prompt starts a new session; this one is left as it is on disk'))
+    say(
+      dim(
+        '  the next prompt starts a new session with this conversation; the old one is left as it is on disk',
+      ),
+    )
     return true
   }
 
@@ -4378,6 +4442,52 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   }
 
   /**
+   * One line for every `/web` answer: what the backend is, where, and why.
+   * `pid` is only for a process z1 started — an external `Z1_SEARX_URL` has no
+   * pid of ours to show.
+   */
+  const webLine = (status: WebStatus): string => {
+    const pid = status.managed && status.pid !== undefined ? ` · pid ${String(status.pid)}` : ''
+    return `web · ${status.url} · ${status.state}${pid} · ${status.detail}`
+  }
+
+  /**
+   * `/web` — the backend behind the web tools. `status` never changes anything;
+   * `start` is the same provisioning z1 fires on launch (an install on first
+   * use), so it also works after `down`; `down` stops only a verified process
+   * of ours and leaves the install in place.
+   */
+  const handleWeb = async (line: string): Promise<void> => {
+    const rest = line.slice('/web'.length).trim().toLowerCase()
+    const verb = rest === '' ? 'status' : rest
+    if (verb === 'status') {
+      say(webLine(await webSearchStatus()))
+      return
+    }
+    if (verb === 'start') {
+      // Progress goes through `say` so a first install reports as it downloads,
+      // exactly like the launch-time provisioning does.
+      const status = await ensureWebSearch({ onLine: message => say(dim(message)) })
+      say(webLine(status))
+      if (status.state === 'disabled') {
+        say(dim('  Z1_WEB_AUTOSTART=off is set for this session; unset it to provision'))
+      }
+      return
+    }
+    if (verb === 'down') {
+      const status = await stopWebSearch()
+      say(webLine(status))
+      // A stopped backend is restarted by the next launch, so the session does
+      // not have to stay up or be restarted by hand.
+      if (status.managed && status.state === 'stopped') {
+        say(dim('  the next z1 launch starts it again · /web start now brings it back'))
+      }
+      return
+    }
+    say(`usage: ${usageText('/web')}`)
+  }
+
+  /**
    * `r`/`d` in the session picker. The picker closes first, so the question uses
    * the normal composer; the refreshed text list is printed afterwards.
    */
@@ -4559,6 +4669,10 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       if (sessions === undefined) return
       try {
         sessions.rename(resolved.summary.id, name)
+        // A manual name is final: a session created unnamed earlier in this
+        // process must not be re-titled by `titleSession` after the next
+        // completed turn (the picker's rename does the same).
+        pendingTitles.delete(resolved.summary.id)
         if (currentSession?.meta.id === resolved.summary.id) {
           currentSession = { ...currentSession, meta: { ...currentSession.meta, name } }
         }
@@ -4786,6 +4900,10 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     },
     '/tools': async (raw) => {
       await handleTools(raw)
+      return 'continue'
+    },
+    '/web': async (raw) => {
+      await handleWeb(raw)
       return 'continue'
     },
     '/context': () => {

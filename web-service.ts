@@ -1293,10 +1293,14 @@ export async function ensureWebSearch(options: EnsureOptions = {}): Promise<WebS
     }
   })()
 
+  const run = inFlight
   try {
-    return await inFlight
+    return await run
   } finally {
-    inFlight = undefined
+    // Only the run that owns the slot clears it: a `/web down` may already have
+    // dropped it so the next `/web start` could begin a fresh one, and this
+    // late-finishing run must not erase that newer entry.
+    if (inFlight === run) inFlight = undefined
   }
 }
 
@@ -1328,8 +1332,11 @@ export async function stopWebSearch(env: NodeJS.ProcessEnv = process.env, option
   const graceMs = options.graceMs ?? 5000
   const read = options.identity ?? processIdentity
   // z1 is no longer provisioning anything: drop the hint rather than claim a
-  // phase the module would believe for 20 minutes.
+  // phase the module would believe for 20 minutes. The in-flight provisioning
+  // run is dropped with it, so a `/web start` after this stop begins a run of
+  // its own instead of joining one whose answer (`ready`) predates the stop.
   delete env[SEARX_STATE_ENV]
+  inFlight = undefined
   if (isExternallyManaged(env)) {
     return { state: 'external', managed: false, url, dataDir: paths.dataDir, detail: 'not managed by z1', installed: false }
   }
