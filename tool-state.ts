@@ -222,6 +222,17 @@ export class ToolState {
     const targets = [...names]
     if (targets.length === 0) return { ok: false, message: 'tools · nothing to change' }
     const fresh = loadToolPreferences()
+    // Merging onto a fallback is not a merge: the caller would be editing the
+    // last-good (or empty) policy and then atomically replacing the file, which
+    // silently discards every decision the corrupt file still held. Refuse and
+    // point at the documented repair instead.
+    if (fresh.degraded !== undefined || fresh.error !== undefined) {
+      const why = fresh.error ?? fresh.degraded ?? 'unreadable overlay'
+      return {
+        ok: false,
+        message: `tools · preferences are not readable (${fresh.path}): ${why} · run /tools reset to repair`,
+      }
+    }
     const next = withToolStates(fresh.prefs, targets, state)
     const saved = saveToolPreferences(next)
     if (!saved.ok) {

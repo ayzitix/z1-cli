@@ -1,11 +1,11 @@
 # z1 CLI tests
 
-Nine dependency-free checks: no test framework, no network, nothing installed —
+Twelve dependency-free checks: no test framework, no network, nothing installed —
 and deliberately **not** a full CLI suite.
 
 Prerequisites: `z1-sdk` at `~/Projects/z1-sdk` (or `Z1_SDK_REPO`), Node 24.9+,
-`git` for the session smoke,
-and for the smoke an installed `com.z1.tools` in
+`git` for the session smoke, `python3` for the pty checks,
+and for the smokes an installed `com.z1.tools` in
 `${Z1_MODULES_DIR:-$HOME/.local/share/z1/modules}`.
 The smokes set `Z1_WEB_AUTOSTART=off`, so a test run never downloads SearXNG.
 
@@ -15,11 +15,14 @@ From the repo root:
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/tool-state.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/tool-inventory.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/workspace-state.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/session-root.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/input.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/output.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/width.test.mts
 tests/pipe-smoke.sh
 tests/session-smoke.sh
 tests/clear-wipe.sh
+tests/sigterm-restore.sh
 ```
 
 `web-service.test.mts`: `~`/`Z1_WEB_DIR`/`XDG_DATA_HOME` resolution against the
@@ -33,26 +36,52 @@ It also covers process identity (`searxng.json`, `/proc` start time and cmdline)
 stop refusal for a recycled pid, the live-owner lock rule (a live pid holds the
 lock however old the file looks, while a dead one is stale at once), log rotation
 at 5 MB with one generation kept, tarball SHA-256 verification, the download
-timeout, and the no-hang guarantee for `--once`. `input.test.mts` covers the
-unknown-command-plus-prompt split: `/foo` followed by text is reported as unknown
-and the text under it is still sent as a prompt, while an unknown command with
-nothing under it stays a single line.
+timeout, and the no-hang guarantee for `--once`. On the ownership side, `up` is
+published only for a verified pid while a stranger's healthy listener leaves the
+hint unset, and a verified start that times out writes a failure marker so
+`webSearchStatus` answers `failed` instead of `starting` forever.
+
+`session-root.test.mts`: the prompt's session root, resolved read-only. A repo
+whose `z1/` is a populated non-session tree (the SDK checkout) reports
+`<dataHome>/z1/projects/<name>-<sha1>/z1`, an owned or empty `z1/` is reported
+in place, `Z1_SESSIONS_DIR` wins with `~` expansion, a foreign override falls
+back, and resolving any of them creates no directory.
+
+`input.test.mts` covers the command-plus-prompt split: `/foo` followed by text is
+reported as unknown and the text under it is still sent as a prompt, while an
+unknown command with nothing under it stays a single line. A `rest: true`
+command owns the lines under it when they read as its sub-grammar —
+`/tools` ↵ `off 3` becomes `/tools off 3` — but `/tools` ↵ `hi` is still the
+prompt `hi`, which is what the pipe smoke asserts.
 
 `output.test.mts`: the assistant-text sanitizer — a leaked `<|DSML| …>` tool-call
 block at every chunk split, end-of-sentence tokens, a partial token at flush,
-fenced code and ordinary `<div>` untouched, and the zero-tools notice policy.
+fenced code and ordinary `<div>` untouched, the zero-tools notice policy, and the
+regression that matters most: prose *describing* the format (`The element
+<parameter name="id"> holds the id…`) survives whole and at every split, while a
+real `<invoke>`/`<tool_call>` block is still removed. A confirmed block with no
+closer leaves `UNCLOSED_BLOCK_NOTICE` rather than silently erasing its body.
+
+`width.test.mts`: `fit`/`clip` budget in terminal cells. A matrix of ASCII, CJK,
+emoji, skin-tone and variation-selector glyphs, combining marks, ZWJ families and
+ANSI-coloured text is truncated at widths 0–14 and every result is asserted to
+fit its budget, to contain no lone surrogate, and never to end on a ZWJ. Exact
+checks pin the ellipsis cost and the SGR reset.
 
 `tool-state.test.mts`: startup revision, same-order reload keeps it, a real change
 bumps/stales, `markListed`, orphan `installed: false`, guard frozen list vs
-re-read `call()`, failed write leaves the snapshot, corrupt-file `reset()`.
+re-read `call()`, failed write leaves the snapshot, corrupt-file `reset()`, and
+the refusal to `apply()` onto a degraded overlay (the file is untouched, the
+error points at `/tools reset`, `reset()` repairs, then `apply()` works).
 
 `tool-inventory.test.mts`: the `/tools` section — counts, the enabled/off/deleted
 lines, orphan and unknown-tool wording, the 24-name cap with "and N more", and a
 size guard (one line per fact, <260 words for 22 tools).
 
 `workspace-state.test.mts`: the own-state block — relative root inside the
-workspace, nested and outside roots, `.z1/` always present, and the session line
-staying ≤120 chars for long/Cyrillic names.
+workspace, nested and outside roots, the per-project data-home fallback shown
+absolute, `.z1/` always present, and the session line staying ≤120 chars for
+long/Cyrillic names.
 
 `pipe-smoke.sh`: pipes `/tools`, a prompt and `/exit` with temp
 `Z1_DB`/`Z1_TOOLS_FILE`, and `/foo` + text to prove an unknown command still
@@ -69,8 +98,15 @@ another process, and `--once` creates no `z1/`.
 inert, a failed store clear keeps the transcript, and a resize after a wipe
 reflows from the wiped layout.
 
-Not covered: prompt↔wire agreement, history/seed, the full `/tools` and
-`/sessions` grammar matrices, pty/composer, foreign-cwd refusal and corrupt
-session metadata. Also not covered: a real SearXNG install/start (needs ~120 MB
-and port 8888) — that is an end-to-end check, not a unit test.
+`sigterm-restore.sh`: through the same pty harness — `/exit`, `Ctrl-D`,
+`Ctrl-C` twice, `SIGTERM` and `SIGHUP` each enter the alternate screen and enable
+mouse tracking, and each exit path emits `?1049l`, `?1000l`, `?2004l` and `?25h`
+afterwards. `pty-run.py` gained `@signal NAME` for this; it sends the signal in
+the input slot instead of typing.
 
+Not covered: prompt↔wire agreement, history/seed, the full `/tools` and
+`/sessions` grammar matrices, composer editing, foreign-cwd refusal and corrupt
+session metadata, and the `uncaughtException`/`unhandledRejection` handlers (they
+share `restoreTerminal` but the suite cannot inject a crash). Also not covered: a
+real SearXNG install/start (needs ~120 MB and port 8888) — that is an end-to-end
+check, not a unit test.

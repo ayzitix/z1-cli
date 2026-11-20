@@ -38,6 +38,29 @@ assert.deepEqual(splitCommandAndPrompt('/model river/x\nhi', toolsAndModel), {
 })
 assert.deepEqual(splitCommandAndPrompt('  /tools  \nhi', tools), { command: '/tools', prompt: 'hi' })
 
+// A `rest: true` command owns the lines below it: `/tools` + `off 3` is one
+// command, not a picker followed by a prompt the model would answer. The probe
+// sees the arguments, so text that is not a subcommand is still a prompt.
+const takesOff = (name: string, args: string): boolean =>
+  name === '/tools' && (args.split(/\s+/, 1)[0] ?? '') === 'off'
+assert.deepEqual(splitCommandAndPrompt('/tools\noff 3', tools, takesOff), {
+  command: '/tools off 3',
+  prompt: '',
+})
+assert.deepEqual(splitCommandAndPrompt('/tools\n\noff\n  3', tools, takesOff), {
+  command: '/tools off 3',
+  prompt: '',
+})
+assert.deepEqual(splitCommandAndPrompt('/tools\nhi', tools, takesOff), {
+  command: '/tools',
+  prompt: 'hi',
+}, 'a line that is not the sub-grammar stays the prompt under the command')
+assert.deepEqual(splitCommandAndPrompt('/tools\noff 3', tools), { command: '/tools', prompt: 'off 3' }, 'without the probe the old split is kept')
+assert.deepEqual(splitCommandAndPrompt('/model river/x\nhi', toolsAndModel, takesOff), {
+  command: '/model river/x',
+  prompt: 'hi',
+}, 'a non-rest command still splits off a prompt')
+
 // A command with nothing under it is the command alone: the caller runs it and
 // stops, it is not a prompt.
 assert.equal(splitCommandAndPrompt('/tools', tools), undefined)
@@ -107,5 +130,5 @@ assert.equal(
 )
 assert.deepEqual(names, ['/foo/bar'])
 
-console.log('input tests passed (6 split cases, 2 no-split cases, 9 unknown-command cases)')
+console.log('input tests passed (command+prompt, rest-command lines, no-split, unknown-command cases)')
 

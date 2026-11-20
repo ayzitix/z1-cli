@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { ToolState } from '../tool-state.ts'
@@ -74,5 +74,44 @@ const reset = store.reset()
 assert.equal(reset.ok, true)
 assert.equal(store.current.error, undefined)
 assert.equal(store.current.enabled.length, 1)
+
+// A corrupt overlay must not be merged onto: `apply` refuses, does not touch
+// the file, and names the documented repair. Merging onto the last-good/empty
+// fallback would atomically replace the file and silently wipe decisions.
+writeFileSync(file, '{ broken again')
+store.reloadPrefs()
+assert.ok(store.current.error)
+const brokenBytes = readFileSync(file, 'utf8')
+const refused = store.apply(['shell'], 'disabled')
+assert.equal(refused.ok, false)
+if (!refused.ok) assert.match(refused.message, /\/tools reset/)
+assert.equal(readFileSync(file, 'utf8'), brokenBytes, 'a refused apply left the corrupt file untouched')
+assert.equal(store.current.error !== undefined, true, 'the error is still surfaced after the refusal')
+
+// `/tools reset` is the repair; the next apply merges normally.
+assert.equal(store.reset().ok, true)
+assert.equal(store.current.error, undefined)
+const repairedApply = store.apply(['shell'], 'disabled')
+assert.equal(repairedApply.ok, true)
+assert.deepEqual(store.current.enabled.map((row) => row.name), ['read'])
+
+// The fresh-start shape (`degraded: 'empty'`, no last-good read) refuses too:
+// that is the case where merging would re-enable every tool.
+{
+  const freshFile = join(dir, 'fresh-tools.json')
+  writeFileSync(freshFile, '{ definitely not json')
+  process.env['Z1_TOOLS_FILE'] = freshFile
+  const freshStore = new ToolState(() => service.list())
+  assert.equal(freshStore.current.degraded, 'empty')
+  assert.ok(freshStore.current.error)
+  const refusedEmpty = freshStore.apply(['read'], 'disabled')
+  assert.equal(refusedEmpty.ok, false)
+  if (!refusedEmpty.ok) assert.match(refusedEmpty.message, /\/tools reset/)
+  assert.equal(readFileSync(freshFile, 'utf8'), '{ definitely not json', 'the fresh corrupt file was untouched')
+  assert.equal(freshStore.reset().ok, true)
+  assert.equal(freshStore.current.error, undefined)
+  assert.equal(freshStore.apply(['read'], 'disabled').ok, true)
+}
+process.env['Z1_TOOLS_FILE'] = file
 
 console.log('tool-state tests passed')

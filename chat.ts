@@ -35,9 +35,11 @@ import type {
 } from '/home/oleksii/Projects/z1-sdk/z1/packages/session/src/index.ts'
 
 import { ownStateText } from './workspace-state.ts'
+import { probableSessionRoot } from './session-root.ts'
 import { ensureWebSearch, stopWebSearch, webSearchStatus } from './web-service.ts'
 import type { WebStatus } from './web-service.ts'
 import { splitCommandAndPrompt, splitUnknownCommand } from './input.ts'
+import { charCells, clip, displayCells, fit, stripAnsi } from './width.ts'
 import { createOutputSanitizer, finalizeAssistantReply, sanitizeOutput } from './output.ts'
 import { toolInventoryText } from './tool-inventory.ts'
 import { type ToolState } from './tool-policy.ts'
@@ -149,48 +151,17 @@ const yellow = (text: string): string => paint('33', text)
 const italic = (text: string): string => paint('3', text)
 const underline = (text: string): string => paint('4', text)
 
-/** Printable width, ignoring the SGR sequences the accents add. */
-const visibleLength = (text: string): number => text.replace(/\x1b\[[0-9;]*m/g, '').length
-
-/** Terminal cells one code point occupies: 2 for CJK/emoji, 0 for combining. */
-const charCells = (char: string): number => {
-  const code = char.codePointAt(0) ?? 0
-  if (code === 0x200d) return 0
-  if (code >= 0x0300 && code <= 0x036f) return 0
-  if (code >= 0xfe00 && code <= 0xfe0f) return 0
-  if (code >= 0x1f3fb && code <= 0x1f3ff) return 0
-  if (
-    code >= 0x1100 &&
-    (code <= 0x115f ||
-      code === 0x2329 ||
-      code === 0x232a ||
-      (code >= 0x2e80 && code <= 0xa4cf && code !== 0x303f) ||
-      (code >= 0xac00 && code <= 0xd7a3) ||
-      (code >= 0xf900 && code <= 0xfaff) ||
-      (code >= 0xfe30 && code <= 0xfe6f) ||
-      (code >= 0xff00 && code <= 0xff60) ||
-      (code >= 0xffe0 && code <= 0xffe6) ||
-      (code >= 0x1f300 && code <= 0x1f64f) ||
-      (code >= 0x1f680 && code <= 0x1f6ff) ||
-      (code >= 0x1f900 && code <= 0x1f9ff) ||
-      (code >= 0x1fa70 && code <= 0x1faff) ||
-      (code >= 0x20000 && code <= 0x3fffd))
-  ) {
-    return 2
-  }
-  return 1
-}
-
-/** Display width of a string, ignoring SGR accents. */
-const displayCells = (text: string): number => {
-  let total = 0
-  for (const char of stripAnsi(text)) total += charCells(char)
-  return total
-}
-
-/** Truncate for a fixed-width box; the tail is usually the interesting part. */
-const fit = (text: string, width: number): string =>
-  visibleLength(text) <= width ? text : `${text.slice(0, Math.max(1, width - 1))}…`
+/**
+ * Text that must reach the screen exactly as typed. A session name and a model
+ * id are user/model controlled: an embedded ESC could repaint the terminal, and
+ * markdown punctuation would style a line the user expects to read literally.
+ * Escaping is visible but unambiguous, which is the point of a confirmation.
+ */
+const literalText = (text: string): string =>
+  text
+    .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/([\\`*_[\]~])/g, '\\$1')
 
 const padTo = (text: string, width: number): string =>
   `${text}${' '.repeat(Math.max(0, width - displayCells(text)))}`
@@ -286,6 +257,26 @@ interface Tail {
 /** The tail that owns the terminal right now, for the exit handlers. */
 let activeTail: Tail | undefined
 let terminalRestored = false
+/**
+ * True while the alternate screen is ours. The pinned tail sets it when it
+ * paints and clears it when it erases; `restoreTerminal` reads the same flag.
+ * That matters on SIGTERM/SIGHUP: `process.exit(130)` skips the `finally` that
+ * would call `tail.erase()`, so without a flag here the alternate screen and
+ * mouse tracking would survive the CLI. Entry and exit are both idempotent.
+ */
+let altScreenActive = false
+
+const enterAppScreen = (): void => {
+  if (altScreenActive) return
+  stdout.write('\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?1000h\x1b[?1006h')
+  altScreenActive = true
+}
+
+const leaveAppScreen = (): void => {
+  if (!altScreenActive) return
+  altScreenActive = false
+  stdout.write('\x1b[?1000l\x1b[?1006l\x1b[?1049l')
+}
 
 /**
  * Undo everything the UI did to the terminal. A crash that leaves the cursor
@@ -297,33 +288,14 @@ const restoreTerminal = (): void => {
   if (!stdout.isTTY) return
   try {
     activeTail?.erase()
+    // `erase()` is the normal path; this covers a signal that arrives before
+    // the tail exists (or after it stopped being live) and is a no-op otherwise.
+    leaveAppScreen()
     if (stdin.isTTY) stdin.setRawMode(false)
     stdout.write('\x1b[0m\x1b[?25h\x1b[?2004l\x1b[r\r')
   } catch {
     // The terminal is already gone; there is nothing left to restore.
   }
-}
-
-/** Printable cells, ignoring the SGR sequences the accents add. */
-const stripAnsi = (text: string): string => text.replace(/\x1b\[[0-9;]*m/g, '')
-
-/** Truncate without cutting an SGR sequence in half. */
-const clip = (text: string, width: number): string => {
-  if (width <= 0) return ''
-  let out = ''
-  let used = 0
-  for (let index = 0; index < text.length && used < width; index += 1) {
-    const rest = text.slice(index)
-    const sgr = /^\x1b\[[0-9;]*m/.exec(rest)
-    if (sgr) {
-      out += sgr[0]
-      index += sgr[0].length - 1
-      continue
-    }
-    out += text[index]
-    used += 1
-  }
-  return used < stripAnsi(text).length ? `${out}\x1b[0m…` : out
 }
 
 const terminalRows = (): number => {
@@ -1607,7 +1579,6 @@ const createTail = (options: { live?: boolean; pinned?: boolean } = {}): Tail =>
    * cannot scroll a screen the app owns.
    */
   const pinned = options.pinned === true
-  let pinnedActive = false
   /** Rows scrolled up from the live edge; 0 means "following output". */
   let viewOffset = 0
   /** Transcript rows visible above the tray at the last pinned render. */
@@ -1633,10 +1604,7 @@ const createTail = (options: { live?: boolean; pinned?: boolean } = {}): Tail =>
    */
   const renderPinned = (): void => {
     if (!live) return
-    if (!pinnedActive) {
-      stdout.write('\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?1000h\x1b[?1006h')
-      pinnedActive = true
-    }
+    enterAppScreen()
     const rows = terminalRows()
     const columns = terminalColumns()
     const frameData = buildFrame()
@@ -2232,8 +2200,7 @@ const createTail = (options: { live?: boolean; pinned?: boolean } = {}): Tail =>
     if (pinned) {
       // Leaving the alternate screen restores the normal buffer (and whatever
       // was in it) byte for byte; nothing of ours was ever written there.
-      if (pinnedActive) stdout.write('\x1b[?1000l\x1b[?1006l\x1b[?1049l')
-      pinnedActive = false
+      leaveAppScreen()
       stdout.write('\x1b[r\x1b[0m\x1b[?25h\r')
       drawn = false
       regionSet = false
@@ -2272,7 +2239,7 @@ const createTail = (options: { live?: boolean; pinned?: boolean } = {}): Tail =>
    * must pass through untouched.
    */
   const scroll = (kind: ScrollKind): boolean => {
-    if (!pinned || !live || !pinnedActive) return false
+    if (!pinned || !live || !altScreenActive) return false
     const rows = terminalRows()
     const body = Math.max(1, bodyHeight > 0 ? bodyHeight : rows - trayRows)
     const total = pinnedLines(terminalColumns()).length
@@ -2983,6 +2950,29 @@ const usageText = (name: string): string => {
   return spec.usage ?? (spec.args === undefined ? spec.name : `${spec.name} ${spec.args}`)
 }
 
+/**
+ * The words that open a `rest` command's own argument block. A line under the
+ * command is consumed only when it starts with one of them; anything else is
+ * the prompt the user typed below it (`/tools` + `what is the weather`).
+ */
+const REST_VERBS: Record<string, readonly string[]> = {
+  '/tools': ['on', 'off', 'delete', 'restore', 'reset', 'refresh', '--all', 'all'],
+  '/sessions': ['new', 'rename', 'delete', 'archive', 'unarchive', '--all', 'all', 'list'],
+  '/web': ['status', 'start', 'down'],
+}
+
+/**
+ * True when `args` (the lines under the command, joined) reads as that
+ * command's sub-grammar. The pipe smoke depends on the negative half: `/tools`
+ * followed by `hi` must still ask `hi`, not run `/tools hi`.
+ */
+const restArguments = (name: string, args: string): boolean => {
+  const verbs = REST_VERBS[name]
+  if (verbs === undefined) return false
+  const first = (args.trim().split(/\s+/, 1)[0] ?? '').toLowerCase()
+  return first !== '' && verbs.includes(first)
+}
+
 const printHelp = (print: (line?: string) => void): void => {
   print('')
   for (const command of COMMANDS) {
@@ -3341,22 +3331,6 @@ const parseArgs = (): Options => {
 }
 
 /**
- * The session root for the prompt, without opening a store.
- *
- * `--once` deliberately creates no session store, and a turn must not open one
- * just to name a directory. The owner marker is the whole proof the SDK itself
- * uses, so a root is claimed only when it is already there; the fallback data
- * directory and a `Z1_SESSIONS_DIR` override are not derived here (one needs a
- * hash, the other an expansion of the same rules), and an unknown root is a
- * section without a transcript path rather than a guessed one.
- */
-const probableSessionRoot = (cwd: string): string | undefined => {
-  if ((process.env['Z1_SESSIONS_DIR'] ?? '').trim() !== '') return undefined
-  const root = join(findRepoRoot(cwd) ?? resolve(cwd), 'z1')
-  return existsSync(join(root, '.z1-sessions')) ? root : undefined
-}
-
-/**
  * One shot: no banner, no prompt loop. Same progress, final answer, exit 0 on a
  * completed run and 1 otherwise.
  */
@@ -3543,10 +3517,11 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       ],
       Math.max(4, terminalColumns() - 4),
     )
-  // The shell line that launched z1 is exactly one row above the cursor.
-  // Erase that line only; in pinned mode the banner lives on the alternate
-  // screen, so the normal buffer stays clean for the shell after exit.
-  if (stdout.isTTY) stdout.write('\x1b[1A\x1b[2K\r')
+  // The shell line that launched z1 is exactly one row above the cursor. Only
+  // pinned mode may take it: with `Z1_PINNED=off` or `Z1_TRAY=off` the banner is
+  // printed into the normal buffer and erasing the row above would blank the
+  // user's previous shell line for no reason.
+  if (pinnedMode) stdout.write('\x1b[1A\x1b[2K\r')
   if (!pinnedMode) printBox(buildBanner())
 
   const tail = createTail({ live: process.env['Z1_TRAY'] !== 'off', pinned: pinnedMode })
@@ -4519,7 +4494,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         if (currentSession?.meta.id === id) {
           currentSession = { ...currentSession, meta: { ...currentSession.meta, name } }
         }
-        say(`sessions · renamed to "${name}"`)
+        say(`sessions · renamed to "${literalText(name)}"`)
         printSessions(false)
       } catch (error) {
         sessionFailure('could not rename', error)
@@ -4676,7 +4651,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
         if (currentSession?.meta.id === resolved.summary.id) {
           currentSession = { ...currentSession, meta: { ...currentSession.meta, name } }
         }
-        say(`sessions · renamed to "${name}"`)
+        say(`sessions · renamed to "${literalText(name)}"`)
         printSessions(false)
       } catch (error) {
         sessionFailure('could not rename', error)
@@ -4891,7 +4866,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       model = parsed.model
       // An explicit choice outlives a `/sessions` switch.
       modelPinned = true
-      say(`model · ${modelLabel(model)}`)
+      say(`model · ${literalText(modelLabel(model))}`)
       return 'continue'
     },
     '/sessions': async (raw) => {
@@ -5033,10 +5008,13 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       // weird argument (or the model as one prompt), so the tools list was never
       // shown and the question was never answered. Only a line the table knows
       // and whose shape allows its own arguments splits; anything else is one
-      // prompt, exactly as before.
-      const split = splitCommandAndPrompt(line, (name, rest) => {
-        return handlers[name] !== undefined && shapeAllows(commandSpec(name), rest)
-      })
+      // prompt, exactly as before. A `rest: true` command owns the lines below
+      // it as arguments, so `/tools` + `off 3` is one command and never a prompt.
+      const split = splitCommandAndPrompt(
+        line,
+        (name, rest) => handlers[name] !== undefined && shapeAllows(commandSpec(name), rest),
+        (name, args) => commandSpec(name)?.rest === true && restArguments(name, args),
+      )
       if (split !== undefined) {
         if ((await runCommand(split.command)) === 'exit') break
         // Nothing under the command: it was the whole submission.

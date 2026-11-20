@@ -33,6 +33,19 @@ export interface CommandSplit {
  */
 export type CommandProbe = (name: string, rest: string) => boolean
 
+/**
+ * Whether `name` takes the lines below it as its own arguments. `rest: true`
+ * commands (`/tools`, `/sessions`, `/web`) have a sub-grammar, so
+ *
+ *     /tools
+ *     off 3
+ *
+ * is one command (`/tools off 3`), not a picker plus a prompt containing
+ * `off 3`. The probe sees the joined text so the caller can accept only a real
+ * subcommand: `/tools` + `what is the weather` must stay a prompt.
+ */
+export type RestProbe = (name: string, args: string) => boolean
+
 const FIRST_TOKEN = /\s+/
 
 /**
@@ -41,8 +54,17 @@ const FIRST_TOKEN = /\s+/
  * Only a newline can produce a split: a single line is exactly what the
  * dispatcher has always handled, and a text whose first line is not a runnable
  * command (any other first line) stays one prompt, untouched.
+ *
+ * A command whose `rest` probe answers true owns the lines below it as
+ * arguments, so the split has no prompt half. Without a rest probe the old
+ * behaviour is kept: the caller may want the lines below to be a question (the
+ * `--once /tools` listing does exactly that).
  */
-export function splitCommandAndPrompt(text: string, isCommand: CommandProbe): CommandSplit | undefined {
+export function splitCommandAndPrompt(
+  text: string,
+  isCommand: CommandProbe,
+  takesRest?: RestProbe,
+): CommandSplit | undefined {
   const lines = text.split('\n')
   // One line has nothing under it to promote to a prompt.
   if (lines.length < 2) return undefined
@@ -51,6 +73,12 @@ export function splitCommandAndPrompt(text: string, isCommand: CommandProbe): Co
   const name = first.split(FIRST_TOKEN, 1)[0] ?? first
   const rest = first.slice(name.length).trim()
   if (!isCommand(name, rest)) return undefined
+  // Indentation inside a multi-line argument block is spacing, not content;
+  // the handlers split their rest on whitespace anyway.
+  const args = promptUnder(lines).replace(/\s*\n\s*/g, ' ').trim()
+  if (takesRest !== undefined && takesRest(name, args)) {
+    return { command: args === '' ? first : `${first} ${args}`, prompt: '' }
+  }
   return { command: first, prompt: promptUnder(lines) }
 }
 

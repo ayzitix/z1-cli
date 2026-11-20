@@ -109,12 +109,19 @@ repo.
 
 - **Pinned composer** in the alternate screen: the transcript scrolls above a
   fixed status/composer area. Wheel, `PgUp`/`PgDn` scroll; `Esc` returns to the
-  live edge; typed lines are queued while a turn is running.
+  live edge; typed lines are queued while a turn is running. Every exit path
+  (`/exit`, `Ctrl-D`, `Ctrl-C` twice, `SIGTERM`, `SIGHUP`, an uncaught error)
+  leaves the alternate screen and turns mouse tracking off again.
 - **Slash menu**: typing `/` filters commands; `↑`/`↓` select, `Enter` runs,
-  `Tab` completes arguments, `Esc` closes.
+  `Tab` completes arguments, `Esc` closes. A `rest` command (`/tools`,
+  `/sessions`, `/web`) owns a subcommand typed on the next line — `/tools` ↵
+  `off 3` runs `/tools off 3` — while a line that is not part of its grammar is
+  still the prompt under it, so `/tools` ↵ a question still asks the question.
 - **Markdown output**: headings, inline bold/italic/code/links/strikethrough,
   lists, quotes, rules, fenced code blocks, and tables — wide tables fall back to
-  a vertical key/value layout, narrow terminals included.
+  a vertical key/value layout, narrow terminals included. Assistant text is
+  sanitized: a leaked tool-call block is removed, prose that merely mentions the
+  tags survives, and an unclosed block leaves a visible removal marker.
 - **User messages** get a full-width background bar so turns are easy to find.
 - **Context control**: `/context`, `/compact`, `/window`, `/steps`, with a live
   context percentage in the status row.
@@ -123,6 +130,11 @@ repo.
   declined rather than blocking.
 - **Background processes**: tools installed from modules (including background
   process control) are surfaced like any other tool call.
+- **Web backend**: `/web` reports the SearXNG state and `Z1_SEARX_STATE` says
+  `up` only for a process z1 started and verified (`searxng.json` identity); a
+  listener z1 cannot claim is left to the module's own `/healthz` probe. A
+  verified start that never answers leaves a failure marker, so `/web status`
+  says `failed` instead of `starting` for as long as the process lives.
 - **Tool control**: `/tools` opens a picker over the composer, styled like the
   slash menu: `↑`/`↓` select, `Enter` toggles `on`/`off` (and restores a deleted
   tool), `Delete` (or `Backspace`) asks before tombstoning, `Esc` closes. The
@@ -171,7 +183,11 @@ If a repo already has a non-session `z1/` (the SDK source tree is the real
 example), the store falls back to
 `~/.local/share/z1/projects/<name>-<hash>/z1` instead of writing into it.
 `Z1_SESSIONS_DIR` overrides both. Messages are the source of truth; `runs.db`
-is linked through `meta.runs` but is never replayed to rebuild a chat.
+is linked through `meta.runs` but is never replayed to rebuild a chat. The
+system prompt's own-state section names the same root the store uses — the
+override when set, and the per-project data directory when the repo's `z1/`
+belongs to something else — because that is the path the model needs when it is
+asked where transcripts live.
 
 In a terminal, `/sessions` opens the same kind of arrow picker as `/tools`:
 `↑`/`↓` select, `Enter` switches, `r` renames, `d`/`Delete` deletes (after a
@@ -197,7 +213,9 @@ selecting the same session is still a no-op.
 - Resizing clears the app's history/scrollback; only the live tray is reflowed.
 - Markdown has no syntax highlighting inside code fences.
 - A very long single-line stream waits for a newline before it is committed.
-- CJK and emoji widths are approximations; some lines can misalign.
+- CJK and emoji widths are approximations. `fit`/`clip` now budget in terminal
+  cells and never split a surrogate pair or a combining mark, but a joined
+  emoji sequence can be over-counted, so some lines still waste a column.
 - Nested tables and very wide tables are best-effort; the vertical fallback is
   the escape hatch.
 - Windows is untested. The launcher is bash; absolute SDK paths are macOS/Linux
@@ -215,9 +233,11 @@ selecting the same session is still a no-op.
 - Tool preferences are a whole-file atomic replace: two sessions writing at the
   same instant keep the last write. The next command re-reads the file, so
   ordinary sequential edits in two windows do merge.
-- A corrupt preferences file is reported and repaired by `/tools reset`; until
+- A corrupt preferences file is reported and repaired by `/tools reset`. Until
   then this process keeps the last policy it read successfully (or enables
-  everything on a fresh start).
+  everything on a fresh start), and an `on`/`off`/`delete` is refused instead of
+  being merged onto that fallback: merging would replace the file and silently
+  wipe the decisions it still held.
 - Disabling every tool leaves the model request without a `tools` array. Some
   OpenAI-compatible providers dislike tool history without tool declarations;
   re-enable one tool if a provider rejects it.
@@ -275,20 +295,32 @@ selecting the same session is still a no-op.
 
 ## Tests
 
-Three dependency-free checks live in `tests/` (no framework, no network):
+Twelve dependency-free checks live in `tests/` (no framework, no network):
 
 ```bash
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/output.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/width.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/input.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/tool-state.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/tool-inventory.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/workspace-state.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/session-root.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/web-service.test.mts
 tests/pipe-smoke.sh
 tests/session-smoke.sh
-~/Projects/z1-sdk/node_modules/.bin/tsx tests/tool-state.test.mts
+tests/clear-wipe.sh
+tests/sigterm-restore.sh
 ```
 
 `pipe-smoke.sh` pipes `/tools` and `/exit` through the console with a temp
 database and tool overlay and fails on a non-zero exit, any ESC byte, or a
 missing `tools ·`. `session-smoke.sh` saves, lists and resumes a session in a
 temp git repo, checks `git status` stays clean and that `--once` leaves no
-`z1/`. `tool-state.test.mts` covers snapshot revisions, orphan entries, guard
-`list()`/`call()` parity, failed writes and corrupt-file reset.
+`z1/`. `sigterm-restore.sh` drives a pty through `/exit`, `Ctrl-D`, `Ctrl-C`
+twice, `SIGTERM` and `SIGHUP` and asserts the alternate screen and mouse
+tracking are given back each time. `tool-state.test.mts` covers snapshot
+revisions, orphan entries, guard `list()`/`call()` parity, failed writes,
+corrupt-file reset, and the refusal to merge onto a corrupt overlay.
 See `tests/README.md` for what is not covered.
 
 Manual checks:

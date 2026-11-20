@@ -18,7 +18,9 @@ environment:
 
 An input line of the form `@resize ROWSxCOLS` is not typed: it resizes the pty
 (TIOCSWINSZ on the master plus an explicit SIGWINCH) and is otherwise treated
-like a sent line, so it takes its slot between keystrokes.
+like a sent line, so it takes its slot between keystrokes. An input line of the
+form `@signal TERM` likewise sends that signal to the child instead of typing;
+it is how the exit-restore checks exercise SIGTERM/SIGHUP mid-session.
 
 The raw bytes, escape sequences included, are written to <out-file>. The exit
 status is 0 when the child exited within the timeout; a stuck child is killed.
@@ -98,6 +100,15 @@ while time.time() < deadline:
         if line.startswith('@resize '):
             size = line.split(' ', 1)[1].split('x', 1)
             set_size(int(size[0]), int(size[1]))
+        elif line.startswith('@signal '):
+            name = line.split(' ', 1)[1].strip().upper()
+            signo = getattr(signal, 'SIG' + name, None)
+            if signo is None:
+                raise SystemExit(f'unknown signal in pty input: {name}')
+            try:
+                os.kill(pid, signo)
+            except OSError:
+                break
         else:
             try:
                 os.write(fd, line.encode() + b'\r')

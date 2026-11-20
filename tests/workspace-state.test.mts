@@ -31,6 +31,14 @@ const same = ownStateText({ cwd, sessionRoot: cwd })
 assert.ok(same.includes(`\`${cwd}/`), 'root === cwd falls back to the absolute form')
 assert.ok(!same.includes('``'), 'never an empty path')
 
+// The per-project fallback (a repo whose z1/ belongs to something else) is
+// outside the workspace, so the prompt names the data-home path in full.
+const fallback = '/home/me/.local/share/z1/projects/proj-1a2b3c4d/z1'
+const fallbackText = ownStateText({ cwd, sessionRoot: fallback })
+assert.ok(fallbackText.includes(`\`${fallback}/`.split(sep).join('/')), 'the data-home fallback is shown absolute')
+assert.ok(fallbackText.includes('saved chat transcripts'), 'and it is labelled as the transcript store')
+assert.ok(!fallbackText.includes('..'), 'the fallback never turns into a parent-relative path')
+
 // No root: the .z1/ half survives, and nothing pretends to know the transcripts.
 const none = ownStateText({ cwd })
 assert.ok(none.startsWith(OWN_STATE_HEADING), 'no root still gets a section')

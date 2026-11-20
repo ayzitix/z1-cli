@@ -17,7 +17,10 @@
  * whole block until its closer, a line that could still become a drained
  * remnant). Ordinary prose is returned from `push` as soon as it arrives. A
  * partial token is held for at most `HOLD_LIMIT` bytes and then emitted
- * literally, so a stray `<` can never stall the stream.
+ * literally, so a stray `<` can never stall the stream. An XML opener is held
+ * only while its body could still prove to be a call (a `parameter` row, a JSON
+ * payload, or a closer within `CONFIRM_WINDOW`); a sentence that merely mentions
+ * the tag is released, not swallowed.
  *
  * Streamed and whole-string output are the same function: `sanitizeOutput` is
  * `push` + `flush` over the whole text, and every chunking of that text returns
@@ -65,10 +68,38 @@ export interface SanitizeResult {
 }
 
 type Verdict =
-  | { kind: 'hold' }
+  | { kind: 'hold'; window?: number }
   | { kind: 'literal' }
   | { kind: 'remove'; length: number }
   | { kind: 'block'; length: number; pattern: RegExp; keep: number }
+
+/**
+ * The visible marker `flush` adds when a block was confirmed but never closed.
+ * Dropping the body silently made a truncated leak look like an empty answer;
+ * the marker says markup was removed instead of pretending nothing happened.
+ */
+export const UNCLOSED_BLOCK_NOTICE = '[tool-call markup removed: the block had no closing tag]'
+
+/**
+ * How long an XML opener may stay undecided before it is treated as prose.
+ *
+ * An opener is only a block when the body looks like a call (see
+ * `classifyOpener`), so the hold exists solely to wait for that evidence. Four
+ * kilobytes covers a short JSON payload or the first `parameter` row while
+ * bounding the delay for a sentence that merely mentions the tag.
+ */
+const CONFIRM_WINDOW = 4096
+
+/**
+ * A mid-line opener gets a shorter window. A real leaked call starts its own
+ * line; holding the rest of a paragraph for 4 KB because it says `<invoke>` in
+ * passing is exactly the prose-eating bug this rule exists to stop.
+ */
+const MIDLINE_CONFIRM_WINDOW = 512
+
+/** A `parameter`/`function_call`/`tool_call` row, optionally marker-prefixed. */
+const CALL_ROW =
+  /^[ \t]*(?:<\|[ \t]*[^<>|\n]{0,24}[ \t]*\|[ \t]*)?<\/?(?:parameter|function_call|tool_call|calls)\b/m
 
 /**
  * A control marker: `<|`, up to `TOKEN_TEXT_MAX` characters of token text
@@ -216,10 +247,90 @@ const classifyMarker = (text: string): Verdict => {
 }
 
 /**
+ * True when `body` contains a line that starts with a `parameter` /
+ * `function_call` / `tool_call` row. That is the cheapest proof the opener has
+ * a call-shaped body: a real block puts its arguments on their own lines.
+ */
+const hasCallRow = (body: string): boolean => CALL_ROW.test(body)
+
+/**
+ * True when `body` is a complete JSON object/array. A provider that wraps a
+ * call in `<tool_call>` puts the arguments there, and parsing them is the
+ * strongest signal that the block is not prose. The closing-bracket guard keeps
+ * a long paragraph starting with `{` from being parsed on every delta.
+ */
+const isJsonPayload = (body: string): boolean => {
+  const trimmed = body.trim()
+  if (trimmed.length < 2) return false
+  if (!/^[[{]/.test(trimmed) || !/[\]}]$/.test(trimmed)) return false
+  try {
+    JSON.parse(trimmed)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Decide what an XML opener is. Ordinary prose *describes* this format —
+ * "a call starts with `<invoke name="search">` and …" — so an opener alone is
+ * not enough to start dropping; it has to look like a call.
+ *
+ * An opener is a block when any of these holds:
+ *  - a `parameter`/`function_call`/`tool_call` row follows (line-anchored), or
+ *  - it starts its line and a matching closer arrives within `CONFIRM_WINDOW`
+ *    cells (the shape of a real multi-line block), or
+ *  - the text between opener and closer parses as JSON.
+ *
+ * Otherwise it is prose: only the `<` is emitted literally and the rest of the
+ * sentence is processed normally, so the words survive.
+ */
+const classifyOpener = (text: string, name: string, atLineStart: boolean): Verdict => {
+  const core = `<${name}`
+  const gt = text.indexOf('>')
+  if (gt < 0) {
+    if (text.length > HOLD_LIMIT) return { kind: 'literal' }
+    return { kind: 'hold' }
+  }
+  // `<invokeX>` is a different word, not our tag.
+  const after = text.charAt(core.length)
+  if (after !== '>' && after !== ' ' && after !== '\t' && after !== '\n') {
+    return { kind: 'literal' }
+  }
+  const opener = text.slice(0, gt + 1)
+  const pattern = closerFor(name)
+  const rest = text.slice(gt + 1)
+
+  const matched = pattern.exec(rest)
+  if (matched !== null) {
+    // A confirmed block is removed whole, closer included.
+    const body = rest.slice(0, matched.index)
+    if (hasCallRow(body) || isJsonPayload(body) || (atLineStart && matched.index <= CONFIRM_WINDOW)) {
+      return { kind: 'remove', length: opener.length + matched.index + matched[0].length }
+    }
+    // A sentence that mentions both tags is still a sentence.
+    return { kind: 'literal' }
+  }
+
+  // The closer has not arrived. The body itself can already prove the call.
+  if (hasCallRow(rest) || isJsonPayload(rest)) {
+    return { kind: 'block', length: opener.length, pattern, keep: BLOCK_TAIL }
+  }
+
+  const window = atLineStart ? CONFIRM_WINDOW : MIDLINE_CONFIRM_WINDOW
+  if (rest.length >= window) return { kind: 'literal' }
+  // Nothing conclusive yet: hold the candidate rather than emit a prefix that
+  // a later row would have turned into a block.
+  return { kind: 'hold', window }
+}
+
+/**
  * Classify the text starting at a `<`. A verdict is only returned once the
  * answer is unambiguous; a prefix of a marker is `hold`, never `literal`.
+ * `atLineStart` is true when nothing but whitespace precedes the `<` on its
+ * line, which is what separates a leaked block from a sentence about one.
  */
-const classify = (text: string): Verdict => {
+const classify = (text: string, atLineStart: boolean): Verdict => {
   // --- control markers, tight (`<|DSML|`) or spaced (`<| DSML |`) ----------
   if (text.startsWith('<|') || text.startsWith('</|')) {
     return classifyMarker(text)
@@ -234,28 +345,8 @@ const classify = (text: string): Verdict => {
   }
 
   for (const name of XML_TAGS) {
-    const core = `<${name}`
-    if (text.startsWith(core)) {
-      const gt = text.indexOf('>')
-      if (gt < 0) {
-        if (text.length > HOLD_LIMIT) return { kind: 'literal' }
-        return { kind: 'hold' }
-      }
-      const opener = text.slice(0, gt + 1)
-      // `<invokeX>` is a different word, not our tag.
-      const after = text.charAt(core.length)
-      if (after !== '>' && after !== ' ' && after !== '\t' && after !== '\n') {
-        return { kind: 'literal' }
-      }
-      const pattern = closerFor(name)
-      const rest = text.slice(gt + 1)
-      const matched = pattern.exec(rest)
-      if (matched !== null) {
-        return { kind: 'remove', length: opener.length + matched.index + matched[0].length }
-      }
-      return { kind: 'block', length: opener.length, pattern, keep: BLOCK_TAIL }
-    }
-    if (core.startsWith(text)) return { kind: 'hold' }
+    if (text.startsWith(`<${name}`)) return classifyOpener(text, name, atLineStart)
+    if (`<${name}`.startsWith(text)) return { kind: 'hold' }
   }
 
   return { kind: 'literal' }
@@ -458,10 +549,11 @@ export function createOutputSanitizer(): OutputSanitizer {
         continue
       }
 
-      const verdict = classify(buffer)
+      const verdict = classify(buffer, lineStart)
       if (verdict.kind === 'hold') {
-        if (buffer.length > HOLD_LIMIT) {
-          // No `|>` (or tag close) arrived: emit the held text literally.
+        const window = verdict.window ?? HOLD_LIMIT
+        if (buffer.length > window) {
+          // No `|>`, tag close or call evidence arrived: emit the held text.
           emit(buffer)
           buffer = ''
         }
@@ -490,10 +582,14 @@ export function createOutputSanitizer(): OutputSanitizer {
 
   const flush = (): string => {
     if (block !== undefined || dropRest) {
-      // An unclosed (or given-up-on) block is still markup: drop what is left.
+      // An unclosed block is still markup, but a long body must not vanish
+      // without a trace: say it was removed. A bare opener with no body is the
+      // only case with nothing to report.
+      const bodySeen = dropRest || dropped > 0 || buffer.length > 0
       buffer = ''
       block = undefined
       pending = undefined
+      if (bodySeen) emit(UNCLOSED_BLOCK_NOTICE)
     } else if (buffer.length > 0) {
       const trimmed = buffer.trim()
       const marker = buffer.startsWith('<|') || buffer.startsWith('</|') ? MARKER.exec(buffer) : null

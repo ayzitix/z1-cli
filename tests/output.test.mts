@@ -12,6 +12,7 @@ import assert from 'node:assert/strict'
 import {
   MARKUP_ONLY_NOTICE,
   NO_TOOLS_NOTICE,
+  UNCLOSED_BLOCK_NOTICE,
   createOutputSanitizer,
   finalizeAssistantReply,
   sanitizeOutput,
@@ -291,6 +292,64 @@ const streamed = (text: string, step: number): string => {
   return out + sanitizer.flush()
 }
 
+/** Whole-string, every two-delta split, and one byte per delta all agree. */
+const everySplit = (doc: string, expected: string, label: string): void => {
+  assert.equal(sanitizeOutput(doc).text, expected, `${label}: whole string`)
+  for (let split = 0; split <= doc.length; split += 1) {
+    const sanitizer = createOutputSanitizer()
+    const out = sanitizer.push(doc.slice(0, split)) + sanitizer.push(doc.slice(split)) + sanitizer.flush()
+    assert.equal(out, expected, `${label}: two deltas split at ${String(split)}`)
+  }
+  assert.equal(streamed(doc, 1), expected, `${label}: one byte per delta`)
+}
+
+// ------------------------------------- prose that *describes* the call format
+// The regression report: `classify` treated any opener as a block and dropped
+// the rest of the paragraph. A sentence mentioning the tag is not a call.
+const PROSE_SENTENCES = [
+  'The element <parameter name="id"> holds the id; you close it with a slash later.',
+  'A call starts with <invoke name="search"> and the body holds the arguments. That is the whole format.',
+  'You write <tool_call> and put JSON inside; <parameter> is not needed there.',
+]
+for (const sentence of PROSE_SENTENCES) {
+  assert.equal(sanitizeOutput(sentence).text, sentence, 'the prose sentence survives whole')
+  assert.equal(sanitizeOutput(sentence).removed, false, 'and nothing was reported removed')
+  everySplit(sentence, sentence, 'prose sentence')
+}
+
+// The same sentence on its own line still survives when no closer follows: an
+// opener at line start is only a block once the call-shaped body appears.
+{
+  const doc = 'A call starts here:\n<invoke name="search">\nand the body holds the arguments.'
+  const expected = 'A call starts here:\n<invoke name="search">\nand the body holds the arguments.'
+  everySplit(doc, expected, 'a line-start opener without a closer is prose')
+}
+
+// ---------------------------------------- a real XML block is still removed
+const XML_INVOKE = '<invoke name="process.kill">\n<parameter name="id">bg_1</parameter>\n</invoke>'
+everySplit(XML_INVOKE, '', 'an <invoke>/<parameter> block')
+const XML_TOOL = '<tool_call>\n{"name":"shell"}\n</tool_call>'
+everySplit(XML_TOOL, '', 'a <tool_call> JSON block')
+const XML_CALLS = '<tool_calls><invoke name="x"></invoke></tool_calls>'
+everySplit(XML_CALLS, '', 'a plural <tool_calls> block')
+
+// An unclosed opener at flush: with no body it is shown literally, never
+// deleted; once a call row proves it was markup, the flush leaves a marker
+// rather than silently erasing a long body.
+everySplit('<tool_call>', '<tool_call>', 'an unclosed opener with an empty body survives')
+everySplit(
+  '<invoke name="x">\n<parameter name="a">1</parameter>',
+  UNCLOSED_BLOCK_NOTICE,
+  'a confirmed but unclosed block leaves the removal marker',
+)
+
+// A fenced example is code, even when the fence holds the prose sentences and a
+// real-looking block; extend the existing fence checks with a full call.
+const FENCED_TOOL = '```\n<tool_call>\n{"name":"x"}\n</tool_call>\n```'
+everySplit(FENCED_TOOL, FENCED_TOOL, 'a fence holding a <tool_call> example')
+const FENCED_PROSE = `\`\`\`\n${PROSE_SENTENCES[1]}\n\`\`\``
+everySplit(FENCED_PROSE, FENCED_PROSE, 'a fence holding the prose sentence')
+
 // A drained `calls>` remnant is markup at any split, not the start of prose.
 const REMNANT_DOC = 'the tool\ncalls>\nfor it'
 assert.equal(sanitizeOutput(REMNANT_DOC).text, 'the tool\nfor it', 'a bare calls> remnant line is dropped')
@@ -334,13 +393,25 @@ assert.equal(streamed(BIG, 7), '', 'the 14 KB block leaves nothing at seven byte
 }
 
 // An unterminated block past BLOCK_HARD_LIMIT (64 KB) drops the rest of the
-// stream instead of emitting the body as prose.
+// stream instead of emitting the body as prose, but the flush now says that
+// markup was removed: a long body never disappears without a trace.
 {
   const junk = `<|DSML| calls>\n<|DSML| parameter name="x" string="true">${'z'.repeat(70_000)}`
-  assert.equal(sanitizeOutput(junk).text, '', 'a 64 KB unterminated block emits no body')
-  assert.equal(streamed(junk, 1), '', 'and one-byte deltas emit no body either')
+  assert.equal(sanitizeOutput(junk).text, UNCLOSED_BLOCK_NOTICE, 'a 64 KB unterminated block emits no body')
+  assert.equal(streamed(junk, 1), UNCLOSED_BLOCK_NOTICE, 'and one-byte deltas emit no body either')
   const withProse = `before\n${junk}\nafter`
-  assert.equal(sanitizeOutput(withProse).text, 'before\n', 'the prose before it is kept')
+  assert.equal(
+    sanitizeOutput(withProse).text,
+    `before\n${UNCLOSED_BLOCK_NOTICE}`,
+    'the prose before it is kept and the removal is visible',
+  )
+}
+// The same 64 KiB bound on the XML path: a `<tool_call>` with a parameter row
+// is confirmed as markup, then abandoned at the hard limit.
+{
+  const junk = `<tool_call>\n<parameter name="x" string="true">${'z'.repeat(70_000)}`
+  assert.equal(sanitizeOutput(junk).text, UNCLOSED_BLOCK_NOTICE, 'a 64 KB open <tool_call> emits no body')
+  assert.equal(streamed(junk, 1), UNCLOSED_BLOCK_NOTICE, 'and one-byte deltas agree')
 }
 
 // The equality property: push chunks + flush is sanitizeOutput, for any split.

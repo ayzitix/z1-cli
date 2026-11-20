@@ -454,6 +454,7 @@ const legacyStart = await ensureWebSearch({
 assert.equal(legacyStart.state, 'ready')
 assert.equal(legacyStart.pid, legacyPid)
 assert.deepEqual(adoptLines, [], 'adoption prints nothing at startup')
+assert.equal(legacyEnv[SEARX_STATE_ENV], 'up', 'a verified backend publishes up')
 
 // Wrong command line: a live pid that is not our waitress is not adopted. The
 // listener is still used, the status still says so, and no banner line appears.
@@ -480,6 +481,7 @@ assert.match(stranger.detail, /was not started by this z1/)
 assert.deepEqual(strangerLines, [], 'an unmanaged listener prints no startup line')
 assert.equal(readServerRecord(strangerPaths), undefined, 'a mismatching pid is not adopted')
 assert.equal(readPid(strangerPaths.pidFile), legacyPid, 'and its pid file is left alone at startup')
+assert.equal(strangerEnv[SEARX_STATE_ENV], undefined, 'a stranger never publishes up as z1 state')
 
 // The same command line *is* the waitress but on another port: still not ours.
 const otherPort = await webSearchStatus(strangerEnv, {
@@ -503,6 +505,55 @@ assert.equal(noPid.pid, undefined)
 assert.match(noPid.detail, /not started by this z1/)
 assert.deepEqual(noPidLines, [], 'no pid file, no startup line')
 assert.equal(existsSync(noPidPaths.identityFile), false, 'nothing is invented for a listener with no pid')
+
+// ---- a verified but hung start is failed, not "starting" forever ----------
+// The record verifies and the pid stays alive, but `/healthz` never answers.
+// Before this, `ensureWebSearch` returned `failed` while `webSearchStatus` kept
+// saying `starting` for as long as the process lived.
+{
+  const silent = createServer(() => {
+    // Accept and never answer, so only the probe deadline ends the wait.
+  })
+  await new Promise<void>(resolve => silent.listen({ host: '127.0.0.1', port: 0 }, resolve))
+  const silentPort = (silent.address() as AddressInfo).port
+  const silentUrl = `http://127.0.0.1:${String(silentPort)}`
+
+  const hungDir = join(dir, 'hung')
+  const hungPaths = resolveWebPaths({ Z1_WEB_DIR: hungDir })
+  mkdirSync(hungPaths.dataDir, { recursive: true })
+  const hungIdentity: ProcessIdentity = {
+    pid: process.pid,
+    startedAt: '555555',
+    command: `python -m waitress --listen=127.0.0.1:${String(silentPort)} searx.webapp:app`,
+  }
+  writeServerRecord(hungPaths, {
+    pid: process.pid,
+    startedAt: hungIdentity.startedAt,
+    port: silentPort,
+    command: hungIdentity.command,
+  })
+  const hungEnv = { Z1_WEB_DIR: hungDir, Z1_SEARX_URL: '', Z1_WEB_AUTOSTART: 'on' }
+  const hung = await ensureWebSearch({
+    env: hungEnv,
+    url: silentUrl,
+    timeoutMs: 300,
+    identity: readerFor(hungIdentity),
+  })
+  assert.equal(hung.state, 'failed', 'a verified process that never answers is a failure')
+  assert.match(String(hungEnv[SEARX_STATE_ENV]), /^down:/, 'and the hint is terminal, not starting')
+
+  const after = await webSearchStatus(hungEnv, { url: silentUrl, identity: readerFor(hungIdentity) })
+  assert.equal(after.state, 'failed', 'status honours the failure marker instead of saying starting')
+  assert.match(after.detail, /last start failed/)
+
+  // A different pid's marker must not describe this record.
+  const otherPidStatus = await webSearchStatus(hungEnv, {
+    url: silentUrl,
+    identity: readerFor({ ...hungIdentity, pid: process.pid + 1 }),
+  })
+  assert.notEqual(otherPidStatus.state, 'failed', 'the marker is tied to the pid it names')
+  await new Promise<void>(resolve => silent.close(() => resolve()))
+}
 
 // `stop` adopts before refusing, then stops what it adopted. The pid is
 // deliberately one that does not exist: `kill` gets ESRCH, which proves the

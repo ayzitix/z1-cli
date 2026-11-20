@@ -153,6 +153,8 @@ export interface WebPaths {
   pidFile: string
   /** `{ pid, startedAt, port, command }` of the process we started. */
   identityFile: string
+  /** The last start that was verified but never became ready. */
+  failureFile: string
   manifestFile: string
   /** Held while installing, so two z1 processes do not share one venv. */
   lockFile: string
@@ -203,6 +205,7 @@ export function resolveWebPaths(
     logFile: join(dataDir, 'searxng.log'),
     pidFile: join(dataDir, 'searxng.pid'),
     identityFile: join(dataDir, 'searxng.json'),
+    failureFile: join(dataDir, 'last-failure.json'),
     manifestFile: join(dataDir, 'installed.json'),
     lockFile: join(dataDir, 'install.lock'),
     templateFile:
@@ -487,6 +490,47 @@ export function clearServerRecord(paths: WebPaths): void {
 }
 
 /**
+ * A start that was verified but did not become ready, kept on disk so the next
+ * `webSearchStatus` can say "failed" instead of reading the still-alive pid as
+ * "starting" forever. The marker is about a pid: a start that succeeds (or a
+ * `/web down`) removes it, and a marker for a different pid is ignored.
+ */
+interface WebFailure {
+  at: number
+  reason: string
+  pid?: number
+}
+
+function readWebFailure(paths: WebPaths): WebFailure | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(paths.failureFile, 'utf8')) as Partial<WebFailure>
+    if (typeof raw.at !== 'number' || !Number.isFinite(raw.at)) return undefined
+    if (typeof raw.reason !== 'string') return undefined
+    if (raw.pid !== undefined && (typeof raw.pid !== 'number' || !Number.isInteger(raw.pid))) return undefined
+    return { at: raw.at, reason: raw.reason, ...(raw.pid === undefined ? {} : { pid: raw.pid }) }
+  } catch {
+    return undefined
+  }
+}
+
+function writeWebFailure(paths: WebPaths, reason: string, pid: number): void {
+  try {
+    mkdirSync(paths.dataDir, { recursive: true, mode: 0o700 })
+    writeFileSync(paths.failureFile, `${JSON.stringify({ at: Date.now(), reason, pid })}\n`, { mode: 0o600 })
+  } catch {
+    // A marker we cannot write must not turn a failed start into a crash.
+  }
+}
+
+function clearWebFailure(paths: WebPaths): void {
+  try {
+    rmSync(paths.failureFile, { force: true })
+  } catch {
+    // Same best-effort rule as the server record.
+  }
+}
+
+/**
  * True when `current` is the process the record describes: same pid, same start
  * marker, and a command line that is this waitress on this port.
  *
@@ -668,6 +712,18 @@ export async function webSearchStatus(
 
   const record = await effectiveRecord(paths, port, read)
   if (record !== undefined && identityMatches(record, await read(record.pid))) {
+    // A verified process that already failed to become ready is not "starting":
+    // without this marker the pid stays alive and every later status reads as
+    // "starting" until someone stops it by hand.
+    const failure = readWebFailure(paths)
+    if (failure !== undefined && failure.pid === record.pid) {
+      return {
+        ...base,
+        state: 'failed',
+        pid: record.pid,
+        detail: `last start failed: ${failure.reason}`,
+      }
+    }
     return { ...base, state: 'starting', pid: record.pid, detail: `starting (pid ${String(record.pid)})` }
   }
   if (installed) {
@@ -1168,6 +1224,10 @@ export async function ensureWebSearch(options: EnsureOptions = {}): Promise<WebS
   // One attempt per process; a second caller joins the first.
   if (inFlight !== undefined) return inFlight
 
+  // This attempt supersedes a failure marker from an earlier one: the status
+  // must be allowed to say "starting" again while this run probes.
+  clearWebFailure(paths)
+
   // Published synchronously, before the first await: z1 fires this in the
   // background and a module worker it spawns a moment later reads the
   // environment, so "coming up" must already be there instead of "down".
@@ -1206,7 +1266,13 @@ export async function ensureWebSearch(options: EnsureOptions = {}): Promise<WebS
         // its command line verifies; anything else is merely used, not claimed.
         const record = await effectiveRecord(paths, port, read)
         const ours = record !== undefined && identityMatches(record, await read(record.pid))
-        publishSearxState(env, 'up')
+        if (ours) publishSearxState(env, 'up')
+        else {
+          // A listener z1 did not start is not z1's backend. Publishing `up`
+          // here made the module report a stranger as ours; leaving the hint
+          // unset lets its own `/healthz` probe be the authority.
+          delete env[SEARX_STATE_ENV]
+        }
         // No line for an unmanaged listener on purpose: a legacy backend is a
         // normal state, and printing it on every launch is noise. The returned
         // status carries the detail (`z1 web status`), and `stop` still says so
@@ -1234,7 +1300,12 @@ export async function ensureWebSearch(options: EnsureOptions = {}): Promise<WebS
           publishSearxState(env, 'up')
           return { state: 'ready', managed: true, url, dataDir: paths.dataDir, pid: record.pid, detail: `ready at ${url}`, installed: isInstalled(paths) }
         }
-        return await failed(`pid ${String(record.pid)} is running but not answering ${HEALTH_PATH}`)
+        // The pid still verifies, so the record would keep `webSearchStatus` at
+        // `starting` until the process died. Mark this pid as failed; the status
+        // reads the marker and `stop` (or the next start) removes it.
+        const detail = `pid ${String(record.pid)} is running but not answering ${HEALTH_PATH}`
+        writeWebFailure(paths, detail, record.pid)
+        return await failed(detail)
       }
       // Dead, recycled, or a bare pid file from a build that had no identity:
       // clean up so `starting` cannot be reported forever.
@@ -1277,7 +1348,9 @@ export async function ensureWebSearch(options: EnsureOptions = {}): Promise<WebS
         // Nothing this process spawned is left behind unrecorded, even when the
         // wait below times out: `stop` can then verify and signal it.
         if (!(await waitReady('starting'))) {
-          return await failed(`backend did not answer ${HEALTH_PATH} in ${String(Math.round((options.timeoutMs ?? READY_TIMEOUT_MS) / 1000))} s (log: ${paths.logFile})`)
+          const detail = `backend did not answer ${HEALTH_PATH} in ${String(Math.round((options.timeoutMs ?? READY_TIMEOUT_MS) / 1000))} s (log: ${paths.logFile})`
+          writeWebFailure(paths, detail, record.pid)
+          return await failed(detail)
         }
         publishSearxState(env, 'up')
         if (started) report('web · ready')
@@ -1337,6 +1410,9 @@ export async function stopWebSearch(env: NodeJS.ProcessEnv = process.env, option
   // its own instead of joining one whose answer (`ready`) predates the stop.
   delete env[SEARX_STATE_ENV]
   inFlight = undefined
+  // A stop is also the acknowledgement of a failed start: the marker must not
+  // outlive the process it described.
+  clearWebFailure(paths)
   if (isExternallyManaged(env)) {
     return { state: 'external', managed: false, url, dataDir: paths.dataDir, detail: 'not managed by z1', installed: false }
   }
