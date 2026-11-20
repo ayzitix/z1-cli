@@ -12,6 +12,8 @@ is executed directly by `tsx` and imports the SDK from a local checkout.
 ```
 z1-cli/
 ├── chat.ts          the CLI: composer, transcript, markdown renderer, commands
+├── view.ts          pure `/view` formatter: families, groups, compact plate
+├── view-prefs.ts    the global `/view` preference file
 ├── tools.ts         `z1 tools` — list tools exposed by installed modules
 ├── tool-policy.ts   enabled / disabled / deleted overlay shared by both
 ├── README.md
@@ -78,6 +80,7 @@ z1 "prompt"         # one turn, same UI, then exit
 z1 ask "prompt"     # same, explicit
 z1 tools            # names, or name<TAB>disabled|deleted, from installed modules
 z1 run ...          # full SDK CLI (run, tree, fork, memory, module, serve, ...)
+z1 --view compact   # start in a density; also works with --once
 ```
 
 A pipe works too:
@@ -99,6 +102,8 @@ repo.
 | `Z1_CONTEXT_WINDOW` | Context window in tokens (default `128000`). |
 | `Z1_MAX_STEPS` | Max graph steps per turn; `0`/`off` means the SDK ceiling (10000). |
 | `Z1_TOOLS_FILE` | Tool enablement overlay. Default `$XDG_CONFIG_HOME/z1/tools.json` (usually `~/.config/z1/tools.json`). |
+| `Z1_VIEW` | `compact`, `medium` or `full`; overrides the preference file for this run. A bad value is an error. |
+| `Z1_VIEW_FILE` | Density preference file. Default `$XDG_CONFIG_HOME/z1/view.json` (usually `~/.config/z1/view.json`). |
 | `Z1_SESSIONS_DIR` | Override the session root. Default: the nearest repo’s `z1/`, else `~/.local/share/z1/projects/<name>-<hash>/z1`. |
 | `NO_COLOR` | Disable all colour when set (any value). |
 | `Z1_TRAY=off` | Plain readline UI instead of the pinned tray; also used for pipes. |
@@ -128,6 +133,14 @@ repo.
 - **User messages** get a full-width background bar so turns are easy to find.
 - **Context control**: `/context`, `/compact`, `/window`, `/steps`, with a live
   context percentage in the status row.
+- **Tool density**: bare `/view` opens a three-row arrow picker above the
+  composer (a numbered list in a pipe or `Z1_TRAY=off`); `1`/`2`/`3` and
+  `c`/`m`/`f` select directly. `compact` shows only the model's prose, one live
+  `⬡ working · N tools` plate, errors and the terminal row; `medium` folds
+  consecutive same-family calls into one line and never folds a write; `full`
+  is the per-call transcript. The choice is global in `~/.config/z1/view.json`
+  (default `medium`); a pipe gets plain `full` unless `Z1_VIEW`/`--view` says
+  otherwise.
 - **Approvals**: tool approval requests appear inline as a `y/n` question and the
   draft is restored afterwards. In `--once`/non-interactive mode approvals are
   declined rather than blocking.
@@ -210,6 +223,13 @@ selecting the same session is still a no-op.
 
 ## Still raw
 
+- A density change affects future events only; already-printed tool lines are
+  not reflowed. `/clear`, `/new` or a session switch re-renders the visible
+  transcript under the new mode.
+- A pipe has no plate, so compact there simply omits tool lines; medium still
+  buffers groups, so a line appears only when the group closes.
+- Compact hides every tool line, including `write`/`edit`/`shell`, by design.
+  Medium is the default because it never collapses a write.
 - No native scrollback or search in the default alternate-screen mode. Use
   `Z1_PINNED=off` to keep output in the terminal's own scrollback.
 - Mouse selection requires `Shift`+drag; plain drag is captured by the app.
@@ -293,12 +313,14 @@ selecting the same session is still a no-op.
 /compact           compact the next turn
 /window <tokens>   set the context window
 /steps <n|off>     set the step limit
+/view [compact|medium|full]  picker; bare opens it (numbered list in a pipe); c|m|f, 1|2|3
 /exit, /quit       quit
 ```
 
 ## Tests
 
-Twelve dependency-free checks live in `tests/` (no framework, no network):
+Sixteen dependency-free checks live in `tests/` (no framework, no external
+network; the density pty case uses a loopback OpenAI-compatible server):
 
 ```bash
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/output.test.mts
@@ -309,11 +331,28 @@ Twelve dependency-free checks live in `tests/` (no framework, no network):
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/workspace-state.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/session-root.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/web-service.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/view.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/view-prefs.test.mts
 tests/pipe-smoke.sh
 tests/session-smoke.sh
 tests/clear-wipe.sh
 tests/sigterm-restore.sh
+tests/view-density.sh
+tests/view-picker.sh
 ```
+
+`view.test.mts` is the pure formatter matrix: mode parsing, every family, the
+exact full-mode strings, medium grouping (writes, failures, cancellation,
+text/notice boundaries, widths and CJK), the compact plate and one-line
+failures, and replay grouping. `view-prefs.test.mts` covers path precedence, the
+safe `medium` fallback, atomic writes and `0600`, and `resolveViewMode`
+including the pipe rule. `view-density.sh` drives a pipe and a pty: compact
+hides the call, full keeps it, and `tests/fake-openai.py` returns three `read`
+calls so medium must fold them into `reads · 3`; it also covers a failed read
+and replay under each mode. `view-picker.sh` drives the interactive picker:
+`↓`+`Enter` persists `full`, `Esc` leaves the file untouched, `1` selects
+`compact`, `f` selects `full`, and a pipe / `Z1_TRAY=off` print the numbered
+list.
 
 `pipe-smoke.sh` pipes `/tools` and `/exit` through the console with a temp
 database and tool overlay and fails on a non-zero exit, any ESC byte, or a

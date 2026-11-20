@@ -1,7 +1,8 @@
 # z1 CLI tests
 
-Twelve dependency-free checks: no test framework, no network, nothing installed —
-and deliberately **not** a full CLI suite.
+Sixteen dependency-free checks: no test framework, no external network, nothing
+installed — and deliberately **not** a full CLI suite. The density pty case
+starts a loopback OpenAI-compatible server in `tests/fake-openai.py`.
 
 Prerequisites: `z1-sdk` at `~/Projects/z1-sdk` (or `Z1_SDK_REPO`), Node 24.9+,
 `git` for the session smoke, `python3` for the pty checks,
@@ -19,10 +20,14 @@ From the repo root:
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/input.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/output.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/width.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/view.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/view-prefs.test.mts
 tests/pipe-smoke.sh
 tests/session-smoke.sh
 tests/clear-wipe.sh
 tests/sigterm-restore.sh
+tests/view-density.sh
+tests/view-picker.sh
 ```
 
 `web-service.test.mts`: `~`/`Z1_WEB_DIR`/`XDG_DATA_HOME` resolution against the
@@ -80,6 +85,32 @@ checks pin the ellipsis cost and the SGR reset — including `clip`'s: plain tex
 truncates to a plain cut with no escape byte, coloured text still gets its
 reset.
 
+`view.test.mts`: the pure `/view` formatter, with no terminal. It pins
+`parseViewMode` (full names, `c|m|f`, case, rejects), the family for every tool
+(and the writes/process/status tools that are never grouped), the exact
+full-mode strings moved from `chat.ts`, and the medium window: three searches
+fold into one line with summed time/size, a single call uses the tool's name and
+target, `read → write → read` stays three lines, a failure closes the group and
+prints one detail row, the next call starts a new group, text and notices close
+only when no call is pending, and a cancelled pending call renders `⬡ … cancelled`
+rather than `✓`. Widths 20/80/200, a 200-character tool name, CJK arguments and
+an unknown tool are clipped in cells. Compact is covered separately: no call or
+success rows, the plate text, one red failure row, the `process.start`/`kill`
+notice, the terminal row, and no plate when `tty: false`. Every plain-theme line
+is asserted to equal `stripAnsi(line)`. The same file covers the replay grouping
+helper (three stored reads → one line; a stored write is never grouped) and the
+pure picker row model: three rows in order, the current one marked, the
+selected one pointed at, descriptions present, and widths 20/40/80 plus a CJK
+description clipped in cells. `viewListLines` pins the numbered list verbatim.
+
+`view-prefs.test.mts`: the preference path (`Z1_VIEW_FILE` → `XDG_CONFIG_HOME` →
+`~/.config`), a missing file → `medium`, and corrupt JSON, an unknown mode or a
+wrong `schemaVersion` → `medium` plus an error without throwing. Save round-trips,
+the temp file is gone, mode `0600`, a read-only directory returns `{ ok: false }`,
+and `resolveViewMode` follows flag > env > file > default; a non-TTY stdout with
+no explicit source is `full`, while an explicit (even invalid) `Z1_VIEW` is
+reported rather than ignored.
+
 `tool-state.test.mts`: startup revision, same-order reload keeps it, a real change
 bumps/stales, `markListed`, orphan `installed: false`, guard frozen list vs
 re-read `call()`, failed write leaves the snapshot, corrupt-file `reset()`, and
@@ -94,6 +125,31 @@ size guard (one line per fact, <260 words for 22 tools).
 workspace, nested and outside roots, the per-project data-home fallback shown
 absolute, `.z1/` always present, and the session line staying ≤120 chars for
 long/Cyrillic names.
+
+`view-density.sh`: the real console through a pipe and a pty. It also checks that
+bare `/view` prints the numbered list, `/view compact` applies, and the
+preference file records `compact`. With the stock mock, `Z1_VIEW=compact` must
+hide `⬢ todo.read` and every `  ⎿  ✓` row, emit no ESC byte, and still end with
+`⬢ done` and the model answer; `full` must keep the call and result; `medium`
+must print one `⬢ todo.read · ✓` line. `--once` cannot run slash commands, so the
+same compact/full assertions are repeated with `Z1_VIEW` as the only lever. A deterministic
+loopback OpenAI-compatible server (`tests/fake-openai.py`) returns three `read`
+tool calls in one assistant message, so the pty cases prove medium folds them
+into one `⬢ reads · 3` row (with no `read({"path"`), full prints three
+`⬢ read({"path"` rows, and compact prints neither. A missing second file proves
+`⬢ reads · 2 · ✗ 1` plus one detail row, then a new group for the third read.
+Reopening the saved session under each mode proves replay honours the current
+density (medium `⬢ reads · 3` with no `✓`, compact no stored calls, full three
+rows).
+
+`view-picker.sh`: bare `/view` in a composer opens three rows (`compact`,
+`medium`, `full`) with a `⬢` on the current mode and a `❯` on the selection.
+The pty cases send `↓` + `Enter` (persists `full`), `Esc` (file untouched, no
+confirmation), `1` (persists `compact`) and `f` (persists `full`). A pipe and a
+`Z1_TRAY=off` tty must
+print the numbered list, `/view 1|2|3` applies a row, and no ESC byte may reach
+the pipe. `tests/pty-run.py` gained `@key NAME` for this: a normal input line
+always submits with `\\r`, which cannot express a bare arrow/Esc.
 
 `pipe-smoke.sh`: pipes `/tools`, a prompt and `/exit` with temp
 `Z1_DB`/`Z1_TOOLS_FILE`, and `/foo` + text to prove an unknown command still
@@ -122,3 +178,10 @@ session metadata, and the `uncaughtException`/`unhandledRejection` handlers (the
 share `restoreTerminal` but the suite cannot inject a crash). Also not covered: a
 real SearXNG install/start (needs ~120 MB and port 8888) — that is an end-to-end
 check, not a unit test.
+
+For `/view` specifically, the fake provider reproduces the live event order
+(`mapInput` → `mapCall`, sequentially) but not real provider streaming quirks,
+real tool latency, a model that interleaves prose between individual calls, or
+an interactive approval prompt (z1-tools v1 makes none). A pipe has no plate, so
+compact-in-a-pipe is asserted as "no tool lines", not as "a plate appeared". A
+mid-turn mode switch is future-only by design, so no test asserts a reflow.

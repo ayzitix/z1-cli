@@ -44,6 +44,25 @@ import { createOutputSanitizer, finalizeAssistantReply, sanitizeOutput } from '.
 import { toolInventoryText } from './tool-inventory.ts'
 import { type ToolState } from './tool-policy.ts'
 import { ToolState as ToolStore } from './tool-state.ts'
+import {
+  compactArgs,
+  createViewState,
+  errorText,
+  groupStoredCalls,
+  parseViewChoice,
+  parseViewMode,
+  resultSize,
+  viewActivity,
+  viewEvent,
+  viewListLines,
+  viewMenuItems,
+  viewNotice,
+  viewSettle,
+  viewTextStart,
+  VIEW_MODES,
+} from './view.ts'
+import type { ViewAction, ViewContext, ViewMode, ViewTheme } from './view.ts'
+import { resolveViewMode, saveViewPreference } from './view-prefs.ts'
 
 // Keep the console clean: service-selection info goes to stderr from the SDK.
 const stderrWrite = process.stderr.write.bind(process.stderr)
@@ -62,8 +81,6 @@ type MutableGraph = {
   [key: string]: unknown
 }
 
-const MAX_ARGS = 120
-
 /**
  * Env-gated diagnostics for the resize path. Off unless `Z1_UI_DEBUG` names a
  * file, so a normal session writes nothing and pays nothing.
@@ -79,54 +96,6 @@ const debugLog: (line: string) => void = (() => {
     }
   }
 })()
-
-/** Compact, single-line JSON of a tool argument payload, truncated to fit a row. */
-const compactArgs = (value: unknown): string => {
-  let raw: string
-  if (value === undefined || value === null) raw = '{}'
-  else if (typeof value === 'string') raw = value
-  else {
-    try {
-      raw = JSON.stringify(value) ?? '{}'
-    } catch {
-      raw = String(value)
-    }
-  }
-  raw = raw.replace(/\s+/g, ' ').trim()
-  if (raw.length === 0) raw = '{}'
-  return raw.length <= MAX_ARGS ? raw : `${raw.slice(0, MAX_ARGS - 1)}…`
-}
-
-/** One line of a tool failure: strings as-is, objects by their `error` field. */
-const errorText = (value: unknown): string => {
-  let raw: string
-  if (typeof value === 'string') raw = value
-  else if (typeof value === 'object' && value !== null && typeof (value as Record<string, unknown>)['error'] === 'string') {
-    raw = String((value as Record<string, unknown>)['error'])
-  } else {
-    try {
-      raw = JSON.stringify(value) ?? String(value)
-    } catch {
-      raw = String(value)
-    }
-  }
-  raw = raw.replace(/\s+/g, ' ').trim()
-  return raw.length === 0 ? 'error' : raw
-}
-
-/** Payload size the way a user reads it: characters, then kilobytes. */
-const byteSize = (value: unknown): string => {
-  let count = 0
-  if (typeof value === 'string') count = value.length
-  else {
-    try {
-      count = (JSON.stringify(value) ?? '').length
-    } catch {
-      count = String(value).length
-    }
-  }
-  return count < 1024 ? `${String(count)} B` : `${(count / 1024).toFixed(1)} KB`
-}
 
 const colorEnabled = Boolean(process.stdout.isTTY) && process.env['NO_COLOR'] === undefined
 /** The Claude-style composer needs a real terminal on both ends. */
@@ -184,7 +153,8 @@ const printBox = (text: string): void => {
   stdout.write(`${text.split('\n').join('\r\n')}\r\n`)
 }
 
-const elapsedLabel = (ms: number): string => (ms < 10_000 ? `${(ms / 1000).toFixed(1)}s` : `${(ms / 1000).toFixed(0)}s`)
+/** The accents the pure formatter may use; identity when colour is off. */
+const viewTheme: ViewTheme = { dim, bold, cyan, green, red, yellow }
 
 /** Terminal width, guarded: a pty created without a size reports `0`. */
 const terminalColumns = (): number => {
@@ -417,6 +387,13 @@ interface ToolMenu {
   onAction: (action: ToolMenuAction, name: string) => readonly ToolMenuItem[]
 }
 
+/** The three-row `/view` picker: Enter applies, digits select directly. */
+interface ViewMenu {
+  current: ViewMode
+  index: number
+  onSelect: (mode: ViewMode) => void
+}
+
 /**
  * The prompt, drawn the way Claude Code draws it (verified against the
  * recovered `PromptInput` code): a rounded rule above and below the draft, no
@@ -452,6 +429,8 @@ class Composer {
   private toolsMenu: ToolMenu | undefined
   /** Interactive `/sessions` picker, independent of `/tools`. */
   private sessionsMenu: SessionMenu | undefined
+  /** Interactive `/view` picker, independent of the other two. */
+  private viewMenu: ViewMenu | undefined
   private buffer = ''
   private escTimer: NodeJS.Timeout | undefined
   private closed = false
@@ -517,6 +496,10 @@ class Composer {
       // replacing it would hide the only prompt the user can answer.
       throw new Error('openToolMenu: an approval question is pending; answer or cancel it first')
     }
+    // A queued command may open another picker after this one; only one owns
+    // the keyboard at a time.
+    this.viewMenu = undefined
+    this.sessionsMenu = undefined
     this.toolsMenu = { items, index: 0, onAction }
     this.changed()
   }
@@ -539,6 +522,8 @@ class Composer {
     if (this.asking !== undefined) {
       throw new Error('openSessionMenu: an approval question is pending; answer or cancel it first')
     }
+    this.viewMenu = undefined
+    this.toolsMenu = undefined
     this.sessionsMenu = {
       label,
       items,
@@ -553,6 +538,39 @@ class Composer {
   closeSessionMenu(): void {
     if (this.sessionsMenu === undefined) return
     this.sessionsMenu = undefined
+    this.changed()
+  }
+
+  /**
+   * Open the interactive `/view` picker. The command was submitted, so the
+   * draft is normally empty already; clearing it here as well keeps the slash
+   * menu and an armed Escape confirmation from competing with the picker.
+   */
+  openViewMenu(current: ViewMode, onSelect: (mode: ViewMode) => void): void {
+    if (this.asking !== undefined) {
+      throw new Error('openViewMenu: an approval question is pending; answer or cancel it first')
+    }
+    this.toolsMenu = undefined
+    this.sessionsMenu = undefined
+    this.clearDraft()
+    // A lone Escape still in its disambiguation window must not close the
+    // picker the command just opened.
+    if (this.escTimer !== undefined) {
+      clearTimeout(this.escTimer)
+      this.escTimer = undefined
+    }
+    this.viewMenu = {
+      current,
+      index: Math.max(0, VIEW_MODES.indexOf(current)),
+      onSelect,
+    }
+    this.changed()
+  }
+
+  /** Hide the view picker without applying anything. */
+  closeViewMenu(): void {
+    if (this.viewMenu === undefined) return
+    this.viewMenu = undefined
     this.changed()
   }
 
@@ -771,6 +789,19 @@ class Composer {
 
   private keyChar(char: string): void {
     const code = char.charCodeAt(0)
+    if (this.viewMenu !== undefined) {
+      // The picker owns the keyboard. Digits and letters apply immediately; the
+      // three-row scale is faster to pick than to arrow through.
+      if (code === 13) return this.selectViewNow()
+      if (code === 3 || code === 4) return this.closeViewMenu()
+      if (code === 14 && this.viewStep(1)) return
+      if (code === 16 && this.viewStep(-1)) return
+      const direct = char.toLowerCase()
+      if (direct === '1' || direct === 'c') return this.selectViewMode('compact')
+      if (direct === '2' || direct === 'm') return this.selectViewMode('medium')
+      if (direct === '3' || direct === 'f') return this.selectViewMode('full')
+      return
+    }
     if (this.sessionsMenu !== undefined) {
       // The session picker owns the keyboard; typing cannot edit the draft.
       if (code === 13) return this.submit()
@@ -822,6 +853,16 @@ class Composer {
   }
 
   private key(name: string): void {
+    if (this.viewMenu !== undefined) {
+      switch (name) {
+        case 'up': return void this.viewStep(-1)
+        case 'down': return void this.viewStep(1)
+        case 'escape': return this.escape()
+        case 'pageup': return void this.scroll?.('pageUp')
+        case 'pagedown': return void this.scroll?.('pageDown')
+        default: return
+      }
+    }
     if (this.sessionsMenu !== undefined) {
       switch (name) {
         case 'up': return void this.sessionStep(-1)
@@ -867,6 +908,12 @@ class Composer {
   }
 
   private escape(): void {
+    if (this.viewMenu !== undefined) {
+      // Closing is the whole action: the next Escape must not be read as the
+      // first press of "clear the draft".
+      this.closeViewMenu()
+      return
+    }
     if (this.sessionsMenu !== undefined) {
       this.closeSessionMenu()
       return
@@ -911,6 +958,10 @@ class Composer {
   }
 
   private ctrlC(): void {
+    if (this.viewMenu !== undefined) {
+      this.closeViewMenu()
+      return
+    }
     if (this.sessionsMenu !== undefined) {
       this.closeSessionMenu()
       return
@@ -940,6 +991,10 @@ class Composer {
   }
 
   private ctrlD(): void {
+    if (this.viewMenu !== undefined) {
+      this.closeViewMenu()
+      return
+    }
     if (this.sessionsMenu !== undefined) {
       this.closeSessionMenu()
       return
@@ -970,6 +1025,10 @@ class Composer {
   private submit(): void {
     if (this.asking !== undefined) {
       this.endAsk(this.value)
+      return
+    }
+    if (this.viewMenu !== undefined) {
+      this.selectViewNow()
       return
     }
     if (this.sessionsMenu !== undefined) {
@@ -1076,6 +1135,36 @@ class Composer {
     this.sessionsMenu = undefined
     this.changed()
     if (menu !== undefined && item !== undefined) menu.onAction?.(action, item.id)
+  }
+
+  private viewStep(delta: number): boolean {
+    const menu = this.viewMenu
+    if (menu === undefined) return false
+    this.viewMenu = {
+      ...menu,
+      index: (menu.index + delta + VIEW_MODES.length) % VIEW_MODES.length,
+    }
+    this.changed()
+    return true
+  }
+
+  /** Enter: close the picker first, then hand the mode to the command layer. */
+  private selectViewNow(): void {
+    const menu = this.viewMenu
+    if (menu === undefined) return
+    const mode = VIEW_MODES[Math.max(0, Math.min(menu.index, VIEW_MODES.length - 1))]!
+    this.viewMenu = undefined
+    this.changed()
+    menu.onSelect(mode)
+  }
+
+  /** `1`/`2`/`3`, `c`/`m`/`f`: apply that row directly. */
+  private selectViewMode(mode: ViewMode): void {
+    const menu = this.viewMenu
+    if (menu === undefined) return
+    this.viewMenu = undefined
+    this.changed()
+    menu.onSelect(mode)
   }
 
   /** Send the draft as one turn, leaving the composer ready for the next one. */
@@ -1258,8 +1347,23 @@ class Composer {
     return lines
   }
 
+  /**
+   * The `/view` picker: a title naming the current mode, then three rows from
+   * the pure `viewMenuItems`. It reuses the pointer/selection accent of the
+   * other pickers and adds no box of its own.
+   */
+  private renderViewMenu(columns: number): string[] {
+    const menu = this.viewMenu
+    if (menu === undefined) return []
+    const title = `  ${bold('view')} · ${cyan(menu.current)}`
+    return [
+      clip(title, Math.max(1, columns - 1)),
+      ...viewMenuItems(menu.current, menu.index, viewTheme, Math.max(1, columns)).map((row) => row.text),
+    ]
+  }
+
   private insert(text: string): void {
-    if (this.toolsMenu !== undefined || this.sessionsMenu !== undefined) return
+    if (this.toolsMenu !== undefined || this.sessionsMenu !== undefined || this.viewMenu !== undefined) return
     const clean = text.replace(/\r\n?/g, '\n').replace(/\t/g, '  ').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
     if (clean.length === 0) return
     this.value = `${this.value.slice(0, this.cursor)}${clean}${this.value.slice(this.cursor)}`
@@ -1269,7 +1373,7 @@ class Composer {
   }
 
   private backspace(): void {
-    if (this.toolsMenu !== undefined) return
+    if (this.toolsMenu !== undefined || this.viewMenu !== undefined) return
     if (this.cursor === 0) return
     const before = this.value.slice(0, this.cursor)
     const char = Array.from(before).at(-1) ?? ''
@@ -1425,6 +1529,7 @@ class Composer {
 
   private hint(menuOpen: boolean): string {
     if (this.asking !== undefined) return this.asking.label
+    if (this.viewMenu !== undefined) return '↑↓ · ⏎ apply · 1/2/3 · esc'
     if (this.sessionsMenu !== undefined) return '↑↓ · ⏎ switch · r rename · d delete · esc'
     if (this.toolsMenu !== undefined) {
       return this.toolsMenu.confirmDelete !== undefined
@@ -1456,6 +1561,7 @@ class Composer {
     const width = Math.max(8, columns)
     const menu = this.menu()
     const menuLines = this.renderMenu(width, menu)
+    const viewLines = this.renderViewMenu(width)
     const toolLines = this.renderToolMenu(width)
     const sessionLines = this.renderSessionMenu(width)
     // The composer is a full sharp box: top/bottom rules and vertical sides.
@@ -1505,7 +1611,7 @@ class Composer {
         footer += `${' '.repeat(Math.max(0, available - stripAnsi(left).length - stripAnsi(rightText).length))}${rightText}`
       }
     }
-    const lines = [...sessionLines, ...toolLines, ...menuLines, header, ...input, footerRule, dim(footer)]
+    const lines = [...sessionLines, ...toolLines, ...viewLines, ...menuLines, header, ...input, footerRule, dim(footer)]
     const key = [
       this.value,
       String(this.cursor),
@@ -1514,18 +1620,22 @@ class Composer {
       this.asking?.label ?? '',
       this.hint(menu.open),
       menu.open ? `${String(menu.index)}:${menuLines.join('\n')}` : '',
+      viewLines.join('\n'),
       toolLines.join('\n'),
       sessionLines.join('\n'),
       this.sessionsMenu === undefined
         ? ''
         : `${String(this.sessionsMenu.index)}:${this.sessionsMenu.label}`,
       this.toolsMenu === undefined ? '' : String(this.toolsMenu.confirmDelete ?? ''),
+      this.viewMenu === undefined
+        ? ''
+        : `${String(this.viewMenu.index)}:${this.viewMenu.current}`,
       String(width),
     ].join('\u0000')
     return {
       lines,
       cursorRow:
-        sessionLines.length + toolLines.length + menuLines.length + 1 + (position.row - start),
+        sessionLines.length + toolLines.length + viewLines.length + menuLines.length + 1 + (position.row - start),
       cursorCol: 2 + position.col,
       key,
     }
@@ -2304,7 +2414,10 @@ const createTail = (options: { live?: boolean; pinned?: boolean } = {}): Tail =>
  * the transient activity row above the status.
  */
 interface Progress {
-  /** Start the animated "thinking" row; the next print replaces it. */
+  /**
+   * Start the turn's plate. Full replaces it at the first assistant row or
+   * `print`; compact/medium keep it until `settle`.
+   */
   working(label: string): void
   /** Print one complete progress row, closing an open streamed line first. */
   print(line: string): void
@@ -2543,15 +2656,22 @@ const createMarkdownPrinter = (emit: (line: string) => void): MarkdownPrinter =>
   }
 }
 
-const createProgress = (tail: Tail): Progress => {
-  const startedAt = Date.now()
-  const calls = new Map<string, { name: string; args: string }>()
-  const shown = new Set<string>()
-  let runError: string | undefined
-  let assistantStarted = false
+/**
+ * The adapter: map the SDK's graph events to `ViewEvent`, apply the pure
+ * formatter's actions, and keep the tail/markdown/spinner mechanics here.
+ *
+ * Full mode keeps today's spinner lifetime (stop at the first assistant row and
+ * on every `print`); compact and medium keep one plate for the whole turn and
+ * clear it in `settle`. Event-driven rows flush markdown before they print;
+ * rows produced from inside `emit` print raw, because flushing there recurses.
+ */
+const createProgress = (tail: Tail, mode: ViewMode): Progress => {
+  const state = createViewState(mode, Date.now())
   let spinner: NodeJS.Timeout | undefined
   const frames = [paint('0', '⬡'), dim('⬡')]
   let frame = 0
+
+  const ctx = (): ViewContext => ({ columns: terminalColumns(), now: Date.now(), tty: tail.live, theme: viewTheme })
 
   const stopSpinner = (): void => {
     if (spinner === undefined) return
@@ -2560,27 +2680,76 @@ const createProgress = (tail: Tail): Progress => {
     tail.activity(undefined)
   }
 
-  const working = (label: string): void => {
-    stopSpinner()
-    if (!tail.live) {
-      // No cursor tricks without the tail: the label is just a line.
-      tail.print(`${frames[0]} ${label}`)
+  const renderPlate = (): void => {
+    const label = viewActivity(state, ctx())
+    if (label === undefined) {
+      tail.activity(undefined)
       return
     }
-    tail.activity(`${frames[0]} ${dim(label)}`)
+    tail.activity(`${frames[frame]} ${dim(label)}`)
+  }
+
+  const working = (label: string): void => {
+    stopSpinner()
+    if (mode === 'full') {
+      if (!tail.live) {
+        // No cursor tricks without the tail: the label is just a line.
+        tail.print(`${frames[0]} ${label}`)
+        return
+      }
+      tail.activity(`${frames[0]} ${dim(label)}`)
+      spinner = setInterval(() => {
+        frame = (frame + 1) % frames.length
+        tail.activity(`${frames[frame]} ${dim(label)}`)
+      }, 220)
+      spinner.unref?.()
+      return
+    }
+    // Compact/medium: the plate is the turn's only status, so it lives until
+    // settle. Without a tail there is nowhere to draw it.
+    if (!tail.live) return
+    renderPlate()
     spinner = setInterval(() => {
       frame = (frame + 1) % frames.length
-      tail.activity(`${frames[frame]} ${dim(label)}`)
+      renderPlate()
     }, 220)
     spinner.unref?.()
   }
 
   let markdown: MarkdownPrinter | undefined
 
+  /**
+   * Apply formatter actions. Raw actions come from inside `emit`, where calling
+   * `markdown.flush()` would re-enter the printer; everything else flushes the
+   * open markdown row first so a group line cannot jump ahead of its text.
+   */
+  const apply = (actions: readonly ViewAction[], raw: boolean): void => {
+    for (const action of actions) {
+      if (action.type === 'activity') {
+        tail.activity(action.text)
+        continue
+      }
+      if (!raw) markdown?.flush()
+      tail.print(action.text)
+    }
+  }
+
+  /**
+   * Event-driven rows. Full mode keeps today's rule that any committed tool row
+   * replaces the spinner; compact/medium must keep the plate alive.
+   */
+  const applyEvent = (actions: readonly ViewAction[]): void => {
+    if (mode === 'full' && actions.some((action) => action.type === 'line')) stopSpinner()
+    apply(actions, true)
+  }
+
+  let assistantStarted = false
+
   const emit = (line: string): void => {
     if (!assistantStarted && stripAnsi(line).trim() === '') return
-    if (spinner !== undefined) stopSpinner()
+    apply(viewTextStart(state, ctx()), true)
     if (!assistantStarted) {
+      if (mode === 'full' && spinner !== undefined) stopSpinner()
       assistantStarted = true
       tail.print(`${bold('⬢')} ${line}`)
     } else {
@@ -2591,7 +2760,8 @@ const createProgress = (tail: Tail): Progress => {
 
   const print = (line: string): void => {
     markdown?.flush()
-    stopSpinner()
+    if (mode === 'full') stopSpinner()
+    apply(viewNotice(state, ctx()), false)
     tail.print(line)
   }
 
@@ -2630,38 +2800,46 @@ const createProgress = (tail: Tail): Progress => {
         // `mapInput` exposes the assistant's call: name plus the raw arguments.
         const input = /^(loop\/\d+\/toolMap\/\d+)\/mapInput$/.exec(incoming.path)
         if (input !== null) {
+          markdown?.flush()
           const value = incoming.outputs['value'] as { item?: { name?: unknown; arguments?: unknown } } | undefined
           const item = value?.item ?? {}
           const name = typeof item.name === 'string' && item.name.length > 0 ? item.name : 'tool'
           const args = compactArgs(item.arguments)
-          calls.set(input[1] as string, { name, args })
-          print(`${bold('⬢')} ${cyan(name)}${args.length === 0 ? '' : dim(`(${args})`)}`)
+          applyEvent(viewEvent(state, { type: 'tool.start', path: input[1] as string, name, args }, ctx()))
           return
         }
         // `mapCall` publishes the tool result; `isError` picks the symbol.
         const call = /^(loop\/\d+\/toolMap\/\d+)\/mapCall$/.exec(incoming.path)
         if (call !== null) {
-          const name = calls.get(call[1] as string)?.name ?? 'tool'
-          const ms = `${String(incoming.durationMs)}ms`
-          if (incoming.outputs['isError'] === true) {
-            const text = errorText(incoming.outputs['result'])
-            shown.add(text)
-            print(`  ${dim('⎿')}  ${red(`✗ ${text}`)} ${dim(`· ${ms}`)}`)
-          } else {
-            print(`  ${dim('⎿')}  ${green('✓')} ${dim(`${ms} · ${byteSize(incoming.outputs['result'])}`)}`)
-          }
+          markdown?.flush()
+          const result = incoming.outputs['result']
+          const ok = incoming.outputs['isError'] !== true
+          applyEvent(
+            viewEvent(
+              state,
+              {
+                type: 'tool.end',
+                path: call[1] as string,
+                ok,
+                ...(ok ? {} : { error: errorText(result) }),
+                durationMs: incoming.durationMs,
+                size: resultSize(result),
+                result,
+              },
+              ctx(),
+            ),
+          )
           return
         }
         return
       }
       case 'node.failed': {
-        shown.add(incoming.error)
-        print(`  ${dim('⎿')}  ${red(`✗ ${incoming.path}`)} ${dim(`· ${incoming.error}`)}`)
+        markdown?.flush()
+        applyEvent(viewEvent(state, { type: 'node.failed', path: incoming.path, error: incoming.error }, ctx()))
         return
       }
       case 'run.failed': {
-        runError = incoming.error
-        shown.add(incoming.error)
+        applyEvent(viewEvent(state, { type: 'run.failed', error: incoming.error }, ctx()))
         return
       }
       default:
@@ -2670,25 +2848,11 @@ const createProgress = (tail: Tail): Progress => {
   }
 
   const settle = (status: string, error: string | undefined): void => {
-    const elapsed = elapsedLabel(Date.now() - startedAt)
-    if (status === 'completed') {
-      print(green(`⬢ done · ${elapsed}`))
-      return
-    }
-    if (status === 'cancelled') {
-      print(dim(`⬡ cancelled · ${elapsed}`))
-      return
-    }
-    print(red(`⬢ failed · ${elapsed}`))
-    const message = error ?? runError
-    if (message !== undefined && message.length > 0) {
-      if (!shown.has(message)) print(`  ${dim('⎿')}  ${red(message)}`)
-      if (message.includes('step limit')) {
-        print(`  ${dim('⎿')}  ${yellow('step limit reached — say "continue" to resume, or /new')}`)
-      } else if (message.includes('TIMEOUT')) {
-        print(`  ${dim('⎿')}  ${yellow('turn timed out — say "continue" to resume, or /new')}`)
-      }
-    }
+    // Old code preferred the settle error over a stored `run.failed` one.
+    if (error !== undefined) state.runError = error
+    stopSpinner()
+    markdown?.flush()
+    apply(viewSettle(state, status, ctx()), true)
   }
 
   return { working, print, stream, event, settle, closeLine }
@@ -2926,6 +3090,18 @@ const COMMANDS: readonly CommandSpec[] = [
     description: 'set the step limit',
     args: '<n|off>',
     usage: '/steps <n> | /steps off',
+  },
+  // No `args`: Enter on a bare `/view` opens the picker, not a completion.
+  {
+    name: '/view',
+    description: 'tool activity density: compact, medium or full',
+    usage: '/view [compact|medium|full]',
+    rest: true,
+    help: [
+      'bare opens the picker (numbered list in a pipe)',
+      'compact hides tool lines · medium groups them · full is today’s transcript',
+      'c | m | f also parse · 1 | 2 | 3 picks a row',
+    ],
   },
   { name: '/exit', description: 'quit z1' },
   { name: '/quit', description: 'quit z1 (same as /exit)' },
@@ -3273,6 +3449,7 @@ const runTurn = async (
 interface Options {
   once?: string
   model?: string
+  view?: ViewMode
 }
 
 const parseArgs = (): Options => {
@@ -3301,6 +3478,17 @@ const parseArgs = (): Options => {
       index += 1
       continue
     }
+    if (arg === '--view') {
+      const value = rest[index + 1]
+      const mode = value === undefined ? undefined : parseViewMode(value)
+      if (mode === undefined) {
+        console.error('chat: --view must be compact, medium or full')
+        process.exit(2)
+      }
+      options.view = mode
+      index += 1
+      continue
+    }
     console.error(`chat: unknown argument ${arg}`)
     process.exit(2)
   }
@@ -3308,10 +3496,24 @@ const parseArgs = (): Options => {
 }
 
 /**
+ * Resolve the startup mode and refuse a bad explicit value. `--view` is already
+ * parsed; `Z1_VIEW` is validated here so a typo is an error, not a silent
+ * fallback. A corrupt preference file is only a report: its fallback is safe.
+ */
+const startupView = (flag: ViewMode | undefined): ReturnType<typeof resolveViewMode> => {
+  const resolved = resolveViewMode({ env: process.env, flag, tty: Boolean(stdout.isTTY) })
+  if (resolved.error !== undefined && resolved.error.startsWith('Z1_VIEW')) {
+    console.error(`chat: ${resolved.error}`)
+    process.exit(2)
+  }
+  return resolved
+}
+
+/**
  * One shot: no banner, no prompt loop. Same progress, final answer, exit 0 on a
  * completed run and 1 otherwise.
  */
-const oneShot = async (prompt: string, explicitModel: string | undefined): Promise<number> => {
+const oneShot = async (prompt: string, explicitModel: string | undefined, explicitView: ViewMode | undefined): Promise<number> => {
   // Slash commands belong to the interactive loop; sending one to the model
   // would look like a prompt and silently do nothing. A multi-line submission is
   // the exception: `/tools ↵ what is the weather` carries a command and a real
@@ -3349,11 +3551,13 @@ const oneShot = async (prompt: string, explicitModel: string | undefined): Promi
     console.error(`chat --once: unknown command ${firstName} · run z1 without --once for the menu`)
     console.error(dim('the text under it was sent as a prompt'))
   }
+  const view = startupView(explicitView)
   const model = startModel(explicitModel)
   const config = loadRuntimeConfig({ cwd: process.cwd(), env: process.env, overrides: { live: true } })
   const runtime = await createRuntime(config)
   const tail = createTail()
-  const progress = createProgress(tail)
+  const progress = createProgress(tail, view.mode)
+  if (view.error !== undefined) progress.print(dim(view.error))
   progress.print(`› ${question}`)
   // Same background provisioning as the interactive loop. Diagnostics go to
   // stderr here: a one-shot run's stdout is the answer and may be piped.
@@ -3444,7 +3648,9 @@ const statusBar = (input: {
   return text.length <= columns - 1 ? text : `${text.slice(0, columns - 2)}…`
 }
 
-const interactive = async (explicitModel: string | undefined): Promise<void> => {
+const interactive = async (explicitModel: string | undefined, explicitView: ViewMode | undefined): Promise<void> => {
+  const startup = startupView(explicitView)
+  let viewMode: ViewMode = startup.mode
   let model = startModel(explicitModel)
   // `--model` and `/model` are instructions that survive a session switch; a
   // model read from a transcript must not silently replace them.
@@ -3505,6 +3711,9 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
   tail.setHeader(buildBanner)
   /** Everything the user sees from here on goes through the tail. */
   const say = (line = ''): void => tail.print(line)
+  // A corrupt display preference has no security consequence: it resets to
+  // medium and names the file once, unlike a corrupt tool policy.
+  if (startup.error !== undefined) say(dim(startup.error))
 
   // The web tools need a SearXNG backend. Provisioning it runs in the
   // background: the banner is already printed and the prompt already accepts
@@ -3759,8 +3968,13 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     }
   }
 
-  /** A stored assistant turn: markdown for the text, compact rows for calls. */
-  const printStoredAssistant = (message: ChatMessage): void => {
+  /**
+   * A stored assistant turn: markdown for the text, then the calls under the
+   * current density. The stored message carries no result, so a medium group
+   * line cannot claim `✓`; full keeps today's dim call rows and compact drops
+   * them, leaving the prose the user asked for.
+   */
+  const printStoredAssistant = (message: ChatMessage, mode: ViewMode): void => {
     let first = true
     const printer = createMarkdownPrinter((line) => {
       if (line.trim() === '' && first) return
@@ -3771,12 +3985,26 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       printer.push(message.content.endsWith('\n') ? message.content : `${message.content}\n`)
       printer.flush()
     }
-    for (const call of message.toolCalls ?? []) {
-      say(dim(`⬢ ${call.name}(${compactArgs(call.arguments)})`))
+    const calls = message.toolCalls ?? []
+    if (mode === 'full') {
+      for (const call of calls) {
+        say(dim(`⬢ ${call.name}(${compactArgs(call.arguments)})`))
+      }
+      return
+    }
+    if (mode === 'medium' && calls.length > 0) {
+      const ctx: ViewContext = {
+        columns: terminalColumns(),
+        now: Date.now(),
+        tty: Boolean(stdout.isTTY),
+        theme: viewTheme,
+      }
+      const stored = calls.map((call) => ({ name: call.name, args: compactArgs(call.arguments) }))
+      for (const line of groupStoredCalls(stored, ctx)) say(line)
     }
   }
 
-  /** A stored tool result, clipped to one readable row. */
+  /** A stored tool result, clipped to one readable row; full mode only. */
   const printStoredTool = (message: ChatMessage): void => {
     const text = message.content.replace(/\s+/g, ' ').trim()
     if (text.length === 0) return
@@ -3787,9 +4015,10 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
    * Replay a loaded transcript into the visible transcript. This is display
    * only: `history` was already assigned, and the SDK builds a fresh system
    * prompt on the next turn. Tool results are clipped to one row; the stored
-   * JSONL keeps the full result.
+   * JSONL keeps the full result. Density applies here, so a session switch is
+   * the way history re-renders under the current mode.
    */
-  const replaySession = (session: Session): void => {
+  const replaySession = (session: Session, mode: ViewMode): void => {
     say('')
     if (session.messages.length === 0) {
       say(dim('  (this session has no messages yet)'))
@@ -3799,10 +4028,10 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       if (message.role === 'user') {
         printStoredUser(message.content)
       } else if (message.role === 'assistant') {
-        printStoredAssistant(message)
+        printStoredAssistant(message, mode)
         say('')
       } else if (message.role === 'tool') {
-        printStoredTool(message)
+        if (mode === 'full') printStoredTool(message)
       }
     }
   }
@@ -3882,7 +4111,7 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     say(
       `session · ${sessionIcon(loaded.meta)} ${loaded.meta.name} · ${String(loaded.messages.length)} msgs${loaded.tornTail ? ' · the last line was incomplete and was dropped' : ''}`,
     )
-    replaySession(loaded)
+    replaySession(loaded, viewMode)
     refreshStatus()
   }
 
@@ -4726,6 +4955,28 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
     switchSession(resolved.summary)
   }
 
+  /**
+   * Apply one `/view` mode: the live display changes for future events only,
+   * then the preference is written. A failed write still applies the mode
+   * because display state is not safety state.
+   */
+  const applyViewMode = (mode: ViewMode): void => {
+    viewMode = mode
+    const saved = saveViewPreference(mode)
+    say(
+      saved.ok
+        ? `view · ${cyan(mode)}`
+        : `view · ${cyan(mode)} · not saved: ${saved.error ?? 'unknown error'}`,
+    )
+  }
+
+  /** Interactive bare `/view`: open the three-row picker above the composer. */
+  const composeViewMenu = (): void => {
+    const picker = composer
+    if (picker === undefined) return
+    picker.openViewMenu(viewMode, applyViewMode)
+  }
+
   type CommandResult = 'continue' | 'exit'
   type CommandHandler = (raw: string, rest: string) => CommandResult | Promise<CommandResult>
 
@@ -4894,6 +5145,23 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       say(`steps · ${stepLabel(maxSteps)}`)
       return 'continue'
     },
+    '/view': (_raw, rest) => {
+      if (rest === '') {
+        if (composer !== undefined) {
+          composeViewMenu()
+          return 'continue'
+        }
+        for (const line of viewListLines(viewMode, viewTheme)) say(line)
+        return 'continue'
+      }
+      const next = parseViewChoice(rest)
+      if (next === undefined) {
+        say(`usage: ${usageText('/view')}`)
+        return 'continue'
+      }
+      applyViewMode(next)
+      return 'continue'
+    },
   }
 
   /**
@@ -5023,7 +5291,8 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
       // owns the transcript, so the picker must not float over it.
       composer?.closeToolMenu()
       composer?.closeSessionMenu()
-      const progress = createProgress(tail)
+      composer?.closeViewMenu()
+      const progress = createProgress(tail, viewMode)
       const handle = await runtime.beginRun({ approval })
       // The first prompt of a conversation creates its session; later prompts
       // keep using it. A store failure returns undefined and the turn still runs.
@@ -5104,14 +5373,14 @@ const interactive = async (explicitModel: string | undefined): Promise<void> => 
 const options = parseArgs()
 
 if (options.once !== undefined) {
-  oneShot(options.once, options.model)
+  oneShot(options.once, options.model, options.view)
     .then(code => { process.exitCode = code })
     .catch(error => {
       console.error(error instanceof Error ? error.message : String(error))
       process.exitCode = 1
     })
 } else {
-  interactive(options.model).catch(error => {
+  interactive(options.model, options.view).catch(error => {
     console.error(error instanceof Error ? error.message : String(error))
     process.exitCode = 1
   })

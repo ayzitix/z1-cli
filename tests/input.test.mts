@@ -136,7 +136,7 @@ assert.deepEqual(names, ['/foo/bar'])
 // sub-grammar, not just its first word. A first-word check swallowed ordinary
 // English, because `on`, `all`, `new` and `start` open real prompts too.
 const knownRest = (name: string): boolean =>
-  name === '/tools' || name === '/sessions' || name === '/web'
+  name === '/tools' || name === '/sessions' || name === '/web' || name === '/view'
 const realSplit = (text: string): ReturnType<typeof splitCommandAndPrompt> =>
   splitCommandAndPrompt(text, knownRest, restArguments)
 
@@ -147,6 +147,7 @@ const PROMPTS_UNDER = [
   ['/tools', 'all of the above explains the design'],
   ['/sessions', 'new ideas for the parser'],
   ['/web', 'start over with a simpler approach'],
+  ['/view', 'compact this paragraph for me'],
 ] as const
 for (const [name, question] of PROMPTS_UNDER) {
   assert.equal(restArguments(name, question), false, `the grammar refuses "${question}"`)
@@ -173,6 +174,12 @@ const COMMAND_BLOCKS = [
   ['/web', 'status', '/web status'],
   ['/web', 'start', '/web start'],
   ['/web', 'down', '/web down'],
+  ['/view', 'compact', '/view compact'],
+  ['/view', 'medium', '/view medium'],
+  ['/view', 'full', '/view full'],
+  ['/view', 'c', '/view c'],
+  ['/view', 'm', '/view m'],
+  ['/view', 'f', '/view f'],
 ] as const
 for (const [name, block, joined] of COMMAND_BLOCKS) {
   assert.equal(restArguments(name, block), true, `the grammar takes "${block}"`)

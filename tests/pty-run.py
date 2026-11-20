@@ -20,7 +20,10 @@ An input line of the form `@resize ROWSxCOLS` is not typed: it resizes the pty
 (TIOCSWINSZ on the master plus an explicit SIGWINCH) and is otherwise treated
 like a sent line, so it takes its slot between keystrokes. An input line of the
 form `@signal TERM` likewise sends that signal to the child instead of typing;
-it is how the exit-restore checks exercise SIGTERM/SIGHUP mid-session.
+it is how the exit-restore checks exercise SIGTERM/SIGHUP mid-session. An input
+line of the form `@key NAME` sends one key without the trailing `\\r` (a normal
+line always submits): `up`, `down`, `left`, `right`, `enter`, `esc`, `tab`,
+`space`, `backspace`, `delete`, or any single character.
 
 The raw bytes, escape sequences included, are written to <out-file>. The exit
 status is 0 when the child exited within the timeout; a stuck child is killed.
@@ -46,6 +49,21 @@ if input_file:
         lines = [row.rstrip('\n') for row in handle if row.strip() != '']
 settle = float(os.environ.get('PTY_SETTLE', '1.5'))
 gap = float(os.environ.get('PTY_GAP', '0.7'))
+
+KEY_SEQUENCES = {
+    'up': b'\x1b[A',
+    'down': b'\x1b[B',
+    'left': b'\x1b[D',
+    'right': b'\x1b[C',
+    'enter': b'\r',
+    'return': b'\r',
+    'esc': b'\x1b',
+    'escape': b'\x1b',
+    'tab': b'\t',
+    'space': b' ',
+    'backspace': b'\x7f',
+    'delete': b'\x1b[3~',
+}
 
 pid, fd = pty.fork()
 if pid == 0:
@@ -107,6 +125,17 @@ while time.time() < deadline:
                 raise SystemExit(f'unknown signal in pty input: {name}')
             try:
                 os.kill(pid, signo)
+            except OSError:
+                break
+        elif line.startswith('@key '):
+            name = line.split(' ', 1)[1].strip()
+            seq = KEY_SEQUENCES.get(name.lower())
+            if seq is None and len(name) == 1:
+                seq = name.encode()
+            if seq is None:
+                raise SystemExit(f'unknown key in pty input: {name}')
+            try:
+                os.write(fd, seq)
             except OSError:
                 break
         else:

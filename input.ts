@@ -91,6 +91,16 @@ const REST_GRAMMAR: Record<string, readonly { verb: string; maxTail: number }[]>
     { verb: 'start', maxTail: 0 },
     { verb: 'down', maxTail: 0 },
   ],
+  // A mode word, so `/view` ↵ `compact` is one command. The one-letter forms
+  // are accepted by the same parser; the whole block must still match.
+  '/view': [
+    { verb: 'compact', maxTail: 0 },
+    { verb: 'medium', maxTail: 0 },
+    { verb: 'full', maxTail: 0 },
+    { verb: 'c', maxTail: 0 },
+    { verb: 'm', maxTail: 0 },
+    { verb: 'f', maxTail: 0 },
+  ],
 }
 
 /** A selector token: a number, a name or a flag — never a sentence fragment. */
