@@ -68,7 +68,7 @@ export interface SanitizeResult {
 }
 
 type Verdict =
-  | { kind: 'hold'; window?: number }
+  | { kind: 'hold'; window?: number; opener?: boolean }
   | { kind: 'literal' }
   | { kind: 'remove'; length: number }
   | { kind: 'block'; length: number; pattern: RegExp; keep: number }
@@ -317,11 +317,32 @@ const classifyOpener = (text: string, name: string, atLineStart: boolean): Verdi
     return { kind: 'block', length: opener.length, pattern, keep: BLOCK_TAIL }
   }
 
-  const window = atLineStart ? CONFIRM_WINDOW : MIDLINE_CONFIRM_WINDOW
-  if (rest.length >= window) return { kind: 'literal' }
+  // A line-start opener is never released as prose when the window elapses. A
+  // real call streams its JSON body gradually, so at CONFIRM_WINDOW the body is
+  // still incomplete — releasing here printed the whole arguments blob as text
+  // and only the later closer was stripped. Instead the opener is committed as
+  // a block: its body is dropped until the closer arrives or BLOCK_HARD_LIMIT
+  // gives up, and a stream that ends before that is reported by `flush` with
+  // the unclosed-block notice, never as raw body text.
+  if (atLineStart && rest.length >= CONFIRM_WINDOW) {
+    return { kind: 'block', length: opener.length, pattern, keep: BLOCK_TAIL }
+  }
+
+  // A mid-line opener keeps the short prose release: ordinary prose like
+  // "The element <parameter name="id"> holds the id" is mid-line, and holding
+  // the rest of a paragraph for it is exactly the prose-eating bug the
+  // line-start rule exists to stop.
+  if (!atLineStart && rest.length >= MIDLINE_CONFIRM_WINDOW) return { kind: 'literal' }
+
   // Nothing conclusive yet: hold the candidate rather than emit a prefix that
-  // a later row would have turned into a block.
-  return { kind: 'hold', window }
+  // a later row would have turned into a block. `opener` marks a line-start
+  // candidate so `flush` can tell a stream truncated mid-call (markup) from a
+  // mid-line mention that is genuinely prose.
+  return {
+    kind: 'hold',
+    window: atLineStart ? CONFIRM_WINDOW : MIDLINE_CONFIRM_WINDOW,
+    opener: atLineStart || undefined,
+  }
 }
 
 /**
@@ -333,6 +354,9 @@ const classifyOpener = (text: string, name: string, atLineStart: boolean): Verdi
 const classify = (text: string, atLineStart: boolean): Verdict => {
   // --- control markers, tight (`<|DSML|`) or spaced (`<| DSML |`) ----------
   if (text.startsWith('<|') || text.startsWith('</|')) {
+    // Marker holds keep their own release rules: a complete lone token is
+    // dropped at flush, and a partial form without the closing pipe stays
+    // literal (a truncated token is a stray two bytes, not a leaked block).
     return classifyMarker(text)
   }
 
@@ -381,6 +405,13 @@ export function createOutputSanitizer(): OutputSanitizer {
   let remnantLine = false
   /** A `calls>` line whose block body must be seen before anything else is dropped. */
   let pending: string | undefined
+  /**
+   * The held candidate began with a line-start opener (`<tool_call`, `<invoke`,
+   * a `<|`/`</|` marker): it is a block candidate, not prose, so a stream that
+   * ends while it is still undecided must be reported as removed markup, not
+   * printed. A mid-line mention keeps its prose release and never sets this.
+   */
+  let heldOpener = false
   /** A dropped block owned the line, and its newline has not arrived yet. */
   let swallowLineEnd = false
 
@@ -551,14 +582,21 @@ export function createOutputSanitizer(): OutputSanitizer {
 
       const verdict = classify(buffer, lineStart)
       if (verdict.kind === 'hold') {
-        const window = verdict.window ?? HOLD_LIMIT
-        if (buffer.length > window) {
-          // No `|>`, tag close or call evidence arrived: emit the held text.
-          emit(buffer)
-          buffer = ''
+        // An opener-tagged hold is a block candidate: it must never be pushed
+        // out as prose by the window, because a real call streams its body
+        // gradually — `classify` commits it to a block once the window elapses.
+        if (verdict.opener !== true) {
+          const window = verdict.window ?? HOLD_LIMIT
+          if (buffer.length > window) {
+            // No `|>`, tag close or call evidence arrived: emit the held text.
+            emit(buffer)
+            buffer = ''
+          }
         }
+        heldOpener = verdict.opener === true
         break
       }
+      heldOpener = false
       if (verdict.kind === 'literal') {
         emit('<')
         buffer = buffer.slice(1)
@@ -599,14 +637,23 @@ export function createOutputSanitizer(): OutputSanitizer {
       } else if (REMNANT_LINE.test(trimmed) || (remnantLine && trimmed === '>')) {
         // A drained fragment with no newline to end it is still markup.
         buffer = ''
+      } else if (heldOpener) {
+        // The stream ended while a line-start opener was still undecided — the
+        // shape of a turn cut off by max_tokens mid-call. The held text is
+        // markup, not prose, so it becomes the removal marker instead of
+        // printing a truncated call; only a verdict of `literal` (a mid-line
+        // mention) may ever reach the screen as text.
+        emit(UNCLOSED_BLOCK_NOTICE)
+        buffer = ''
       }
-      emit(buffer)
+      if (buffer.length > 0) emit(buffer)
       buffer = ''
     }
     pending = undefined
     block = undefined
     dropped = 0
     dropRest = false
+    heldOpener = false
     const out = output
     output = ''
     return out

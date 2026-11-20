@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 
-import { splitCommandAndPrompt, splitUnknownCommand } from '../input.ts'
+import { restArguments, splitCommandAndPrompt, splitUnknownCommand } from '../input.ts'
 
 /** The console's own predicate, reduced to existence and shape. */
 const probeFor = (table: Record<string, 'none' | 'args' | 'rest'>) => (name: string, rest: string): boolean => {
@@ -130,5 +130,60 @@ assert.equal(
 )
 assert.deepEqual(names, ['/foo/bar'])
 
-console.log('input tests passed (command+prompt, rest-command lines, no-split, unknown-command cases)')
+// ------------------------------------------------------- the real rest grammar
+// `restArguments` is what chat.ts dispatches with, so it is under test here
+// directly: the whole block under a rest command must match that command's
+// sub-grammar, not just its first word. A first-word check swallowed ordinary
+// English, because `on`, `all`, `new` and `start` open real prompts too.
+const knownRest = (name: string): boolean =>
+  name === '/tools' || name === '/sessions' || name === '/web'
+const realSplit = (text: string): ReturnType<typeof splitCommandAndPrompt> =>
+  splitCommandAndPrompt(text, knownRest, restArguments)
+
+// The four reported losses: a sentence whose first word is a verb of the
+// command must stay the prompt, whole and untouched.
+const PROMPTS_UNDER = [
+  ['/tools', 'on the record, why is this slow?'],
+  ['/tools', 'all of the above explains the design'],
+  ['/sessions', 'new ideas for the parser'],
+  ['/web', 'start over with a simpler approach'],
+] as const
+for (const [name, question] of PROMPTS_UNDER) {
+  assert.equal(restArguments(name, question), false, `the grammar refuses "${question}"`)
+  assert.deepEqual(
+    realSplit(`${name}\n${question}`),
+    { command: name, prompt: question },
+    `${name} + "${question}" keeps the question as the prompt`,
+  )
+}
+
+// The still-working selector cases: real usage is one command with no prompt.
+const COMMAND_BLOCKS = [
+  ['/tools', 'off 3', '/tools off 3'],
+  ['/tools', 'on', '/tools on'],
+  ['/tools', 'off all', '/tools off all'],
+  ['/tools', 'restore shell', '/tools restore shell'],
+  ['/tools', 'reset', '/tools reset'],
+  ['/tools', 'refresh', '/tools refresh'],
+  ['/tools', '--all', '/tools --all'],
+  ['/sessions', 'new refactor', '/sessions new refactor'],
+  ['/sessions', 'rename 2 mine', '/sessions rename 2 mine'],
+  ['/sessions', 'delete 3', '/sessions delete 3'],
+  ['/sessions', 'list', '/sessions list'],
+  ['/web', 'status', '/web status'],
+  ['/web', 'start', '/web start'],
+  ['/web', 'down', '/web down'],
+] as const
+for (const [name, block, joined] of COMMAND_BLOCKS) {
+  assert.equal(restArguments(name, block), true, `the grammar takes "${block}"`)
+  assert.deepEqual(
+    realSplit(`${name}\n${block}`),
+    { command: joined, prompt: '' },
+    `${name} + "${block}" is one command`,
+  )
+}
+
+console.log(
+  'input tests passed (command+prompt, rest-command lines, real rest grammar, no-split, unknown-command cases)',
+)
 

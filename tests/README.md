@@ -50,9 +50,14 @@ back, and resolving any of them creates no directory.
 `input.test.mts` covers the command-plus-prompt split: `/foo` followed by text is
 reported as unknown and the text under it is still sent as a prompt, while an
 unknown command with nothing under it stays a single line. A `rest: true`
-command owns the lines under it when they read as its sub-grammar —
+command owns the lines under it when the whole block reads as its sub-grammar —
 `/tools` ↵ `off 3` becomes `/tools off 3` — but `/tools` ↵ `hi` is still the
-prompt `hi`, which is what the pipe smoke asserts.
+prompt `hi`, which is what the pipe smoke asserts. The real grammar
+(`restArguments`) is under test directly: a sentence whose first word is a verb
+(`/tools` ↵ `on the record, why is this slow?`, `/sessions` ↵ `new ideas for
+the parser`, `/web` ↵ `start over with a simpler approach`) stays the prompt,
+while the selector usage (`off 3`, `rename 2 mine`, `--all`, `status`) still
+parses as one command.
 
 `output.test.mts`: the assistant-text sanitizer — a leaked `<|DSML| …>` tool-call
 block at every chunk split, end-of-sentence tokens, a partial token at flush,
@@ -60,13 +65,20 @@ fenced code and ordinary `<div>` untouched, the zero-tools notice policy, and th
 regression that matters most: prose *describing* the format (`The element
 <parameter name="id"> holds the id…`) survives whole and at every split, while a
 real `<invoke>`/`<tool_call>` block is still removed. A confirmed block with no
-closer leaves `UNCLOSED_BLOCK_NOTICE` rather than silently erasing its body.
+closer leaves `UNCLOSED_BLOCK_NOTICE` rather than silently erasing its body. The
+same holds when the body only *looks* incomplete so far: a line-start opener is
+never released as prose when the confirm window elapses, so a real call with a
+6 KB JSON body streams clean (streamed equals whole-string at 16-char chunks),
+and a stream cut off mid-call leaves the removal marker at flush instead of the
+half-written call; a mid-line mention keeps its short prose release.
 
 `width.test.mts`: `fit`/`clip` budget in terminal cells. A matrix of ASCII, CJK,
 emoji, skin-tone and variation-selector glyphs, combining marks, ZWJ families and
 ANSI-coloured text is truncated at widths 0–14 and every result is asserted to
 fit its budget, to contain no lone surrogate, and never to end on a ZWJ. Exact
-checks pin the ellipsis cost and the SGR reset.
+checks pin the ellipsis cost and the SGR reset — including `clip`'s: plain text
+truncates to a plain cut with no escape byte, coloured text still gets its
+reset.
 
 `tool-state.test.mts`: startup revision, same-order reload keeps it, a real change
 bumps/stales, `markListed`, orphan `installed: false`, guard frozen list vs

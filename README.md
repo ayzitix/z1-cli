@@ -116,12 +116,15 @@ repo.
   `Tab` completes arguments, `Esc` closes. A `rest` command (`/tools`,
   `/sessions`, `/web`) owns a subcommand typed on the next line — `/tools` ↵
   `off 3` runs `/tools off 3` — while a line that is not part of its grammar is
-  still the prompt under it, so `/tools` ↵ a question still asks the question.
+  still the prompt under it, so `/tools` ↵ a question still asks the question,
+  even when the question merely starts with a verb (`on the record, why…`).
 - **Markdown output**: headings, inline bold/italic/code/links/strikethrough,
   lists, quotes, rules, fenced code blocks, and tables — wide tables fall back to
   a vertical key/value layout, narrow terminals included. Assistant text is
-  sanitized: a leaked tool-call block is removed, prose that merely mentions the
-  tags survives, and an unclosed block leaves a visible removal marker.
+  sanitized: a leaked tool-call block is removed (streamed or whole), prose that
+  merely mentions the tags survives, and an unclosed block — including a turn
+  cut off mid-call by `max_tokens` — leaves a visible removal marker, never the
+  raw arguments.
 - **User messages** get a full-width background bar so turns are easy to find.
 - **Context control**: `/context`, `/compact`, `/window`, `/steps`, with a live
   context percentage in the status row.

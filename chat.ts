@@ -38,7 +38,7 @@ import { ownStateText } from './workspace-state.ts'
 import { probableSessionRoot } from './session-root.ts'
 import { ensureWebSearch, stopWebSearch, webSearchStatus } from './web-service.ts'
 import type { WebStatus } from './web-service.ts'
-import { splitCommandAndPrompt, splitUnknownCommand } from './input.ts'
+import { restArguments, splitCommandAndPrompt, splitUnknownCommand } from './input.ts'
 import { charCells, clip, displayCells, fit, stripAnsi } from './width.ts'
 import { createOutputSanitizer, finalizeAssistantReply, sanitizeOutput } from './output.ts'
 import { toolInventoryText } from './tool-inventory.ts'
@@ -2948,29 +2948,6 @@ const usageText = (name: string): string => {
   const spec = commandSpec(name)
   if (spec === undefined) return name
   return spec.usage ?? (spec.args === undefined ? spec.name : `${spec.name} ${spec.args}`)
-}
-
-/**
- * The words that open a `rest` command's own argument block. A line under the
- * command is consumed only when it starts with one of them; anything else is
- * the prompt the user typed below it (`/tools` + `what is the weather`).
- */
-const REST_VERBS: Record<string, readonly string[]> = {
-  '/tools': ['on', 'off', 'delete', 'restore', 'reset', 'refresh', '--all', 'all'],
-  '/sessions': ['new', 'rename', 'delete', 'archive', 'unarchive', '--all', 'all', 'list'],
-  '/web': ['status', 'start', 'down'],
-}
-
-/**
- * True when `args` (the lines under the command, joined) reads as that
- * command's sub-grammar. The pipe smoke depends on the negative half: `/tools`
- * followed by `hi` must still ask `hi`, not run `/tools hi`.
- */
-const restArguments = (name: string, args: string): boolean => {
-  const verbs = REST_VERBS[name]
-  if (verbs === undefined) return false
-  const first = (args.trim().split(/\s+/, 1)[0] ?? '').toLowerCase()
-  return first !== '' && verbs.includes(first)
 }
 
 const printHelp = (print: (line?: string) => void): void => {

@@ -317,12 +317,65 @@ for (const sentence of PROSE_SENTENCES) {
   everySplit(sentence, sentence, 'prose sentence')
 }
 
-// The same sentence on its own line still survives when no closer follows: an
-// opener at line start is only a block once the call-shaped body appears.
+// An unclosed line-start opener is a block, not prose. A real call streams its
+// JSON body gradually, so no window can prove the opener innocent: releasing it
+// once CONFIRM_WINDOW elapsed printed the whole arguments blob and only the
+// later closer was stripped. The opener is committed as a block instead — body
+// dropped, and the flush reports removed markup rather than a truncated call.
 {
   const doc = 'A call starts here:\n<invoke name="search">\nand the body holds the arguments.'
-  const expected = 'A call starts here:\n<invoke name="search">\nand the body holds the arguments.'
-  everySplit(doc, expected, 'a line-start opener without a closer is prose')
+  const expected = `A call starts here:\n${UNCLOSED_BLOCK_NOTICE}`
+  everySplit(doc, expected, 'an unclosed line-start opener becomes the removal marker')
+}
+
+// A real block with a body well over CONFIRM_WINDOW, streamed in 16-char
+// chunks: the body is still incomplete JSON when the window elapses, so this
+// was exactly the leak — streaming printed the body and only the closer was
+// stripped. Streaming and whole-string must both remove it.
+{
+  const body = JSON.stringify({ name: 'search', arguments: { query: 'x'.repeat(6000) } })
+  assert.ok(body.length > 4096, 'the body really is past the confirm window')
+  const doc = `<tool_call>\n${body}\n</tool_call>`
+  assert.equal(sanitizeOutput(doc).text, '', 'the whole 6 KB call is removed')
+  assert.equal(streamed(doc, 16), '', 'and the 6 KB call streamed in 16-char chunks is removed too')
+}
+
+// The same block truncated mid-body (the max_tokens shape): the opener was
+// confirmed or is still held, and the flush says markup was removed — the
+// arguments never reach the screen.
+{
+  const body = JSON.stringify({ name: 'search', arguments: { query: 'x'.repeat(6000) } })
+  const doc = `<tool_call>\n${body.slice(0, 5000)}`
+  assert.equal(sanitizeOutput(doc).text, UNCLOSED_BLOCK_NOTICE, 'a truncated 6 KB call emits only the marker')
+  assert.equal(streamed(doc, 16), UNCLOSED_BLOCK_NOTICE, 'and streamed truncation agrees')
+}
+
+// A mid-line opener with a >4 KB remainder that really is prose: the short
+// mid-line window still releases it, verbatim.
+{
+  const sentence = `The element <parameter name="id"> holds the id; ${'and the paragraph keeps going. '.repeat(150)}`
+  assert.ok(sentence.length > 4096 + 30, 'the remainder really is past the mid-line window')
+  assert.equal(sanitizeOutput(sentence).text, sentence, 'mid-line prose past 4 KB is released whole')
+  assert.equal(sanitizeOutput(sentence).removed, false, 'and nothing was reported removed')
+  everySplit(sentence, sentence, 'mid-line prose with a >4 KB remainder')
+}
+
+// A turn cut off mid-call leaves a truncated opener in the buffer at flush:
+// that is markup, not prose, so the flush says it was removed instead of
+// printing the half-written call.
+{
+  const truncated = '<tool_call>\n{"name": "search", "arguments": {"query": "hi"'
+  assert.equal(
+    sanitizeOutput(truncated).text,
+    UNCLOSED_BLOCK_NOTICE,
+    'a truncated call at flush emits the marker, never the raw buffer',
+  )
+  assert.equal(streamed(truncated, 16), UNCLOSED_BLOCK_NOTICE, 'and streamed truncation agrees')
+  // A mid-line partial mention keeps its prose release: only a line-start
+  // opener is markup.
+  const midline = 'see the docs at <tool_call and the notes that follow it'
+  assert.equal(sanitizeOutput(midline).text, midline, 'a mid-line partial opener is still prose at flush')
+  assert.equal(sanitizeOutput('hello <|DSML').text, 'hello <|DSML', 'a mid-line partial token is still literal')
 }
 
 // ---------------------------------------- a real XML block is still removed
@@ -333,10 +386,11 @@ everySplit(XML_TOOL, '', 'a <tool_call> JSON block')
 const XML_CALLS = '<tool_calls><invoke name="x"></invoke></tool_calls>'
 everySplit(XML_CALLS, '', 'a plural <tool_calls> block')
 
-// An unclosed opener at flush: with no body it is shown literally, never
-// deleted; once a call row proves it was markup, the flush leaves a marker
-// rather than silently erasing a long body.
-everySplit('<tool_call>', '<tool_call>', 'an unclosed opener with an empty body survives')
+// An unclosed opener at flush: a line-start opener is markup even with an
+// empty body, so it becomes the marker; once a call row proves the block was
+// real, the flush leaves the same marker rather than silently erasing a long
+// body.
+everySplit('<tool_call>', UNCLOSED_BLOCK_NOTICE, 'an unclosed line-start opener is markup at flush')
 everySplit(
   '<invoke name="x">\n<parameter name="a">1</parameter>',
   UNCLOSED_BLOCK_NOTICE,

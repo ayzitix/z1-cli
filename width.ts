@@ -143,5 +143,7 @@ export const clip = (text: string, width: number): string => {
     out += glyph.text
     used += glyph.cells
   }
-  return `${out}\x1b[0m…`
+  // Same guard as `fit`: a cut through coloured text needs the reset, but
+  // plain text under NO_COLOR or a pipe must stay free of escapes entirely.
+  return `${out}${/\x1b\[[0-9;]*m/.test(out) ? '\x1b[0m' : ''}…`
 }

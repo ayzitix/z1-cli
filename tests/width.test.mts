@@ -82,12 +82,24 @@ assert.equal(displayCells(fit('日本語', 3)), 3, 'an odd budget rounds down to
 }
 
 // Coloured truncation resets the SGR before the ellipsis; colour-free output
-// stays escape-free so a pipe keeps its no-ESC guarantee.
+// stays escape-free so a pipe keeps its no-ESC guarantee. `clip` once appended
+// `\x1b[0m` unconditionally, which put the only ESC on the line under NO_COLOR.
 {
   const coloured = fit('\x1b[31m日本語\x1b[0m', 5)
   assert.ok(coloured.startsWith('\x1b[31m'), 'the opening SGR is kept')
   assert.ok(coloured.includes('\x1b[0m…'), 'and the reset precedes the ellipsis')
   assert.equal(fit('日本語', 5).includes('\x1b['), false, 'plain text gains no escape byte')
+}
+{
+  const plain = clip('abcdefghij', 4)
+  assert.equal(plain, 'abc…', 'clip on plain text is a plain truncation')
+  assert.equal(plain.includes('\x1b'), false, 'and carries no escape byte at all')
+  assert.equal(clip('日本語です', 5), '日本…', 'CJK truncation is escape-free too')
+  const coloured = clip('\x1b[31m日本語\x1b[0m', 5)
+  assert.ok(coloured.includes('\x1b[0m…'), 'clip still resets coloured text before the ellipsis')
+  // Byte-identical to a truncation that never knew about SGR: the only
+  // difference from plain text is the kept prefix and the ellipsis.
+  assert.equal(clip('abcdefghij', 4), 'abcdefghij'.slice(0, 3) + '…', 'plain clip is byte-identical to a plain cut')
 }
 
 // charCells is the unit both helpers trust.

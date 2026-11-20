@@ -11,8 +11,8 @@
  *
  * Here it is two things instead: the first line runs as the command it spells,
  * and every line below it is the prompt that follows. Pure string work over a
- * supplied predicate — the command table and its shapes live in `chat.ts`, and
- * this module must be importable by a test without running the console.
+ * supplied predicate — the command table lives in `chat.ts`, and this module
+ * must be importable by a test without running the console.
  */
 
 /** A submission read as `command` then `prompt`. */
@@ -47,6 +47,75 @@ export type CommandProbe = (name: string, rest: string) => boolean
 export type RestProbe = (name: string, args: string) => boolean
 
 const FIRST_TOKEN = /\s+/
+
+/**
+ * The sub-grammar each `rest: true` command accepts in the lines below it, as
+ * data: the words that may open the block, and how many selector tokens may
+ * follow. The whole block has to match, not just its first word — `on`, `all`,
+ * `new` and `start` are ordinary English too, and a first-word check ran
+ * `/tools` + "on the record, why is this slow?" as `/tools on …`, losing the
+ * question entirely. A bounded tail keeps the real usage (`/tools off 3`,
+ * `/sessions rename 2 mine`) one command while a sentence under the command
+ * stays the prompt, which is what the README promises.
+ */
+const REST_GRAMMAR: Record<string, readonly { verb: string; maxTail: number }[]> = {
+  // `on/off/delete/restore <n|name>`; `reset`, `refresh` and the `--all`/`all`
+  // listing forms stand alone. A selector is a number or a tool name, so a few
+  // tokens bound it.
+  '/tools': [
+    { verb: 'on', maxTail: 3 },
+    { verb: 'off', maxTail: 3 },
+    { verb: 'delete', maxTail: 3 },
+    { verb: 'restore', maxTail: 3 },
+    { verb: 'reset', maxTail: 0 },
+    { verb: 'refresh', maxTail: 0 },
+    { verb: '--all', maxTail: 0 },
+    { verb: 'all', maxTail: 0 },
+  ],
+  // A selector is a number, an id prefix or a name; `rename` carries the new
+  // name after the ref, `new` optionally names the session, and `--all`/`all`
+  // /`list` stand alone.
+  '/sessions': [
+    { verb: 'new', maxTail: 1 },
+    { verb: 'rename', maxTail: 2 },
+    { verb: 'delete', maxTail: 1 },
+    { verb: 'archive', maxTail: 1 },
+    { verb: 'unarchive', maxTail: 1 },
+    { verb: 'list', maxTail: 0 },
+    { verb: '--all', maxTail: 0 },
+    { verb: 'all', maxTail: 0 },
+  ],
+  // Exactly one of the three verbs; anything longer is a question.
+  '/web': [
+    { verb: 'status', maxTail: 0 },
+    { verb: 'start', maxTail: 0 },
+    { verb: 'down', maxTail: 0 },
+  ],
+}
+
+/** A selector token: a number, a name or a flag — never a sentence fragment. */
+const SELECTOR_TOKEN = /^[A-Za-z0-9_.:-]+$/
+
+/**
+ * True when `args` (the lines under the command, joined) matches that command's
+ * whole sub-grammar: one of its verbs plus at most the selector tokens the
+ * grammar allows, each selector-shaped. Anything else is prose typed under the
+ * command and must stay the prompt. (A short tail of plain words — `/tools on
+ * the record` — is still ambiguous and reads as the command; only length and
+ * punctuation separate it from a sentence.)
+ */
+export const restArguments = (name: string, args: string): boolean => {
+  const forms = REST_GRAMMAR[name]
+  if (forms === undefined) return false
+  const words = args.trim().split(/\s+/)
+  const verb = (words[0] ?? '').toLowerCase()
+  if (verb === '') return false
+  const form = forms.find((entry) => entry.verb === verb)
+  if (form === undefined) return false
+  const tail = words.slice(1)
+  if (tail.length > form.maxTail) return false
+  return tail.every((word) => SELECTOR_TOKEN.test(word))
+}
 
 /**
  * `command` and the prompt under it, or `undefined` when this is one prompt.
