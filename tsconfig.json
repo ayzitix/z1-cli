@@ -14,7 +14,8 @@
       "@z1/bootstrap": ["../z1-sdk/z1/packages/bootstrap/lib/index.d.ts"],
       "@z1/graph": ["../z1-sdk/z1/packages/graph/lib/index.d.ts"],
       "@z1/node": ["../z1-sdk/z1/packages/node/lib/index.d.ts"],
-      "@z1/runtime": ["../z1-sdk/z1/packages/runtime/lib/index.d.ts"]
+      "@z1/runtime": ["../z1-sdk/z1/packages/runtime/lib/index.d.ts"],
+      "@z1/subagent": ["../z1-sdk/z1/packages/subagent/lib/index.d.ts"]
     }
   },
   "include": ["*.ts"]

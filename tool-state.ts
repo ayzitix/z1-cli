@@ -22,7 +22,7 @@
  * whatever the module now returns third.
  */
 
-import type { ToolService } from './sdk.ts'
+import type { SubagentCallGuard, ToolService } from './sdk.ts'
 
 import {
   emptyToolPreferences,
@@ -56,8 +56,14 @@ export interface ToolSnapshot {
   /**
    * The same set as wire schemas, built once: the system prompt and the
    * request's `tools` array are literally this array, so they cannot drift.
+   * Includes host-composed tools such as `subagent`.
    */
   readonly enabledSchemas: readonly ToolSchema[]
+  /**
+   * The real module inventory, without host-composed tools. The subagent grant
+   * ceiling must not treat the delegation tool as a grantable child tool.
+   */
+  readonly moduleSchemas: readonly ToolSchema[]
   readonly installedCount: number
   /** Bumped once per successful full inventory reload, never by a prefs re-read. */
   readonly revision: number
@@ -78,6 +84,12 @@ const reason = (error: unknown): string => (error instanceof Error ? error.messa
 
 export class ToolState {
   #list: () => Promise<readonly ToolSchema[]>
+  /**
+   * Tools the CLI composes itself (currently only `subagent`). They are listed
+   * and policy-controlled like installed tools, but are not part of the module
+   * inventory: a real tool with the same name wins and suppresses the host one.
+   */
+  #hostSchemas: readonly ToolSchema[]
   #schemas: readonly ToolSchema[] = []
   #loaded: LoadedToolPreferences
   #inventoryKnown = false
@@ -90,13 +102,37 @@ export class ToolState {
   #snapshot: ToolSnapshot
   #pending: Promise<ToolSnapshot> | undefined
 
-  constructor(list: () => Promise<readonly ToolSchema[]>) {
+  constructor(
+    list: () => Promise<readonly ToolSchema[]>,
+    hostSchemas: readonly ToolSchema[] = [],
+  ) {
     this.#list = list
+    this.#hostSchemas = hostSchemas
     this.#loaded = loadToolPreferences()
     this.#snapshot = this.#build()
     // The startup inventory is the first implicit listing: `off 1` works before
     // the user has ever run `/tools`. A refresh still invalidates it.
-    this.#listing = { revision: this.#revision, names: this.#schemas.map((tool) => tool.name) }
+    this.#listing = { revision: this.#revision, names: this.#installedNames() }
+  }
+
+  /** Raw modules plus host schemas whose names are free, in listing order. */
+  #installedSchemas(): readonly ToolSchema[] {
+    // Host tools are composed against the live service, so only advertise them
+    // when that inventory is trustworthy; an unknown inventory keeps the last
+    // known module set and makes no promise about `subagent`.
+    if (!this.#inventoryKnown) return [...this.#schemas]
+    const schemas = [...this.#schemas]
+    const names = new Set(schemas.map((tool) => tool.name))
+    for (const schema of this.#hostSchemas) {
+      if (names.has(schema.name)) continue
+      names.add(schema.name)
+      schemas.push(schema)
+    }
+    return schemas
+  }
+
+  #installedNames(): readonly string[] {
+    return this.#installedSchemas().map((tool) => tool.name)
   }
 
   /** What every view renders. Frozen; identity is stable until something changes. */
@@ -111,9 +147,10 @@ export class ToolState {
 
   #build(): ToolSnapshot {
     const prefs = this.#loaded.prefs
+    const schemas = this.#installedSchemas()
     const installed = new Set<string>()
     const records: ToolRecord[] = []
-    for (const schema of this.#schemas) {
+    for (const schema of schemas) {
       installed.add(schema.name)
       records.push(
         Object.freeze({
@@ -134,7 +171,8 @@ export class ToolState {
       records: Object.freeze(records),
       enabled: Object.freeze(enabled),
       enabledSchemas: Object.freeze(enabled.map((record) => record.schema!)),
-      installedCount: this.#schemas.length,
+      moduleSchemas: Object.freeze([...this.#schemas]),
+      installedCount: schemas.length,
       revision: this.#revision,
       prefs,
       ...(this.#loaded.error === undefined ? {} : { error: this.#loaded.error }),
@@ -149,7 +187,7 @@ export class ToolState {
     // shown order is pinned, so a refresh makes old numbers stale instead of
     // silently re-binding them to the new module order.
     if (!this.#listed && this.#inventoryKnown) {
-      this.#listing = { revision: this.#revision, names: this.#schemas.map((tool) => tool.name) }
+      this.#listing = { revision: this.#revision, names: this.#installedNames() }
       this.#listed = true
     }
     this.#snapshot = this.#build()
@@ -304,6 +342,32 @@ export class ToolState {
     return { ok: false, message: `tools · no tool "${raw}" · /tools for the list` }
   }
 
+  /** Re-read the overlay and throw unless `name` is enabled right now. */
+  #assertEnabled(name: string): void {
+    const { prefs } = loadToolPreferences()
+    const state = toolState(prefs, name)
+    if (state !== 'enabled') {
+      const action = state === 'deleted' ? 'restore' : 'on'
+      throw new Error(
+        `tool "${name}" is ${state}. Run /tools ${action} ${name} in z1 to allow it again.`,
+      )
+    }
+  }
+
+  /**
+   * A call-only policy hook for a child subagent's restricted tool service.
+   *
+   * The child keeps its own `list()` (exactly the granted schemas), so the
+   * package's guard cannot advertise an ungranted tool. Every forwarded child
+   * call re-reads the same overlay as the parent guard, which makes a mid-run
+   * `/tools off read` revoke a tool the child was granted when it started.
+   */
+  guardCall(): SubagentCallGuard {
+    return (name) => {
+      this.#assertEnabled(name)
+    }
+  }
+
   /**
    * Wrap the run's tool service so the model and the executor share one policy.
    *
@@ -320,14 +384,7 @@ export class ToolState {
         return store.#snapshot.enabledSchemas
       },
       async call(name, args) {
-        const { prefs } = loadToolPreferences()
-        const state = toolState(prefs, name)
-        if (state !== 'enabled') {
-          const action = state === 'deleted' ? 'restore' : 'on'
-          throw new Error(
-            `tool "${name}" is ${state}. Run /tools ${action} ${name} in z1 to allow it again.`,
-          )
-        }
+        store.#assertEnabled(name)
         return inner.call(name, args)
       },
     }

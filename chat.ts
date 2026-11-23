@@ -25,6 +25,7 @@ import {
   graphDigest,
   loadRuntimeConfig,
   runGraph,
+  subagentToolSchema,
 } from './sdk.ts'
 import type {
   ApprovalService,
@@ -48,6 +49,7 @@ import { createOutputSanitizer, finalizeAssistantReply, sanitizeOutput } from '.
 import { toolInventoryText } from './tool-inventory.ts'
 import { type ToolState } from './tool-policy.ts'
 import { ToolState as ToolStore } from './tool-state.ts'
+import { composeSubagentService } from './subagent-host.ts'
 import {
   compactArgs,
   createViewState,
@@ -3234,13 +3236,32 @@ const runTurn = async (
   // One inventory read for the whole turn. The prompt, the wire `tools` array
   // and the guarded service all come from this snapshot, so they cannot
   // disagree — not even when another session edits the overlay mid-turn.
-  const tools = options.toolState ?? new ToolStore(() => handle.services.tools.list())
+  const tools =
+    options.toolState ??
+    new ToolStore(() => handle.services.tools.list(), [subagentToolSchema])
   const snapshot = await tools.reload(() => handle.services.tools.list())
   const enabledSchemas = snapshot.enabledSchemas
   if (!snapshot.inventoryKnown) {
     // Reported in the prompt as "inventory unknown" rather than "no tools".
     debugLog(`tool inventory unavailable: ${snapshot.listError ?? 'unknown error'}`)
   }
+
+  // The delegation tool is rebuilt every turn with a trustworthy snapshot:
+  // the ceiling is the `/tools`-enabled module set, child approvals are deny,
+  // and the call-only guard re-reads the overlay per child tool call. The
+  // parent `guard` stays outermost so `/tools off subagent` also revokes the
+  // composite name before a child can start.
+  const guardCall = tools.guardCall()
+  const composedTools = snapshot.inventoryKnown
+    ? await composeSubagentService({
+        runtime,
+        model: model as import('./sdk.ts').ModelHandle,
+        parent: handle.services.tools,
+        snapshot,
+        guardCall,
+      })
+    : handle.services.tools
+  const serviceTools = tools.guard(composedTools)
 
   let built: unknown = buildAgentGraph({
     model,
@@ -3302,8 +3323,9 @@ const runTurn = async (
         ...handle.services,
         // The same snapshot the prompt was built from: `list()` does no RPC and
         // `call()` re-reads the overlay, so a cross-session revocation still
-        // applies mid-turn while the advertised set stays frozen.
-        tools: tools.guard(handle.services.tools),
+        // applies mid-turn while the advertised set stays frozen. The subagent
+        // composite sits inside this guard and adds its own call-only check.
+        tools: serviceTools,
         onEvent: (event) => {
           if (event.type === 'node.stream' && event.port === 'text' && event.path.endsWith('/chat')) {
             streamed = true
@@ -3570,7 +3592,7 @@ const oneShot = async (prompt: string, explicitModel: string | undefined, explic
   // reported instead of silently hanging the run.
   const handle = await runtime.beginRun({ approval: quietApproval(progress) })
   try {
-    const toolState = new ToolStore(() => handle.services.tools.list())
+    const toolState = new ToolStore(() => handle.services.tools.list(), [subagentToolSchema])
     if (split !== undefined) {
       // What `/tools` prints, on stderr: stdout is the answer and may be piped.
       const snapshot = await toolState.reload()
@@ -3684,7 +3706,7 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
       await probe.dispose()
     }
   }
-  const tools = new ToolStore(probeTools)
+  const tools = new ToolStore(probeTools, [subagentToolSchema])
   const started = await tools.reload()
   if (!started.inventoryKnown) {
     console.log(`tools · unavailable (${started.listError ?? 'unknown error'})`)
@@ -4439,7 +4461,7 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
       say(`${prefix}${padTo(fit(row.name, nameWidth), nameWidth)}${suffix}${missing}`)
     }
     if (deleted > 0) {
-      say(dim('  deleted tools stay installed in the module but are hidden from the agent.'))
+      say(dim('  deleted tools stay installed but are hidden from the agent.'))
       say(dim('  /tools restore <n|name> brings one back; /tools --all shows stale entries.'))
     }
   }

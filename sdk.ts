@@ -39,14 +39,17 @@ const candidates = (): string[] => {
 const resolveSdkRoot = (): string => {
   for (const candidate of candidates()) {
     const root = resolve(candidate)
-    if (existsSync(join(root, 'z1', 'packages', 'bootstrap', 'lib', 'index.js'))) {
+    if (
+      existsSync(join(root, 'z1', 'packages', 'bootstrap', 'lib', 'index.js')) &&
+      existsSync(join(root, 'z1', 'packages', 'subagent', 'lib', 'index.js'))
+    ) {
       return root
     }
   }
   const tried = candidates().map((candidate) => `  ${resolve(candidate)}`).join('\n')
   throw new Error(
     [
-      'z1-sdk checkout not found or not built.',
+      'z1-sdk checkout not found or not built (bootstrap and subagent are required).',
       'Set Z1_SDK_REPO to the z1-sdk root and run:',
       '  pnpm install',
       '  pnpm -C z1 build',
@@ -68,13 +71,37 @@ const bootstrap = await load<typeof import('@z1/bootstrap')>('bootstrap')
 const agent = await load<typeof import('@z1/agent')>('agent')
 const runtime = await load<typeof import('@z1/runtime')>('runtime')
 const graph = await load<typeof import('@z1/graph')>('graph')
+const subagent = await load<typeof import('@z1/subagent')>('subagent')
 
 export const { createRuntime, loadRuntimeConfig } = bootstrap
 export const { buildAgentGraph } = agent
 export const { runGraph } = runtime
 export const { graphDigest } = graph
 export const { SessionClearedError, SessionTooNewError, createSessionStore, findRepoRoot } = bootstrap
+export const {
+  SUBAGENT_TOOL_NAME,
+  SubagentError,
+  SubagentGrantError,
+  createSubagentTool,
+  denyApprovalService,
+  resolveToolGrant,
+  restrictToolService,
+  subagentToolSchema,
+  withSubagentTool,
+} = subagent
 
 export type { Runtime, RunHandle, Session, SessionStore, SessionSummary } from '@z1/bootstrap'
-export type { ChatMessage } from '@z1/node'
+export type { ChatMessage, ModelHandle } from '@z1/node'
 export type { ApprovalService, RunEvent, RunResult, ToolService } from '@z1/runtime'
+export type {
+  SubagentCallGuard,
+  SubagentErrorCode,
+  SubagentGrantErrorCode,
+  SubagentHost,
+  SubagentInventory,
+  SubagentRunHandle,
+  SubagentRunOverrides,
+  SubagentTool,
+  SubagentToolOptions,
+  SubagentToolResult,
+} from '@z1/subagent'

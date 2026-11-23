@@ -1,11 +1,12 @@
 /**
- * `z1 tools` — list the tools the installed service modules expose, with the
- * enablement decision stored by `/tools` in the console. Not part of the
- * repository. Opens the runtime, borrows the `tools` service for one short
- * run, prints the same snapshot the console shows, disposes and closes.
+ * `z1 tools` — list the tools available to the agent: the installed service
+ * modules plus CLI-composed tools (currently `subagent`), with the enablement
+ * decision stored by `/tools` in the console. Not part of the repository.
+ * Opens the runtime, borrows the `tools` service for one short run, prints the
+ * same snapshot the console shows, disposes and closes.
  */
 
-import { createRuntime, loadRuntimeConfig } from './sdk.ts'
+import { createRuntime, loadRuntimeConfig, subagentToolSchema } from './sdk.ts'
 
 import { ToolState as ToolStore } from './tool-state.ts'
 
@@ -20,7 +21,7 @@ const main = async (): Promise<void> => {
   try {
     const handle = await runtime.beginRun({ approval })
     try {
-      const store = new ToolStore(() => handle.services.tools.list())
+      const store = new ToolStore(() => handle.services.tools.list(), [subagentToolSchema])
       const snapshot = await store.reload()
       for (const record of snapshot.records.filter((row) => row.installed)) {
         console.log(
