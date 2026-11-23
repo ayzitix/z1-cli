@@ -15,24 +15,28 @@ import { join, resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import { argv, stdin, stdout } from 'node:process'
 
-import { createRuntime, loadRuntimeConfig } from '/home/oleksii/Projects/z1-sdk/z1/packages/bootstrap/src/index.ts'
-import type { Runtime, RunHandle } from '/home/oleksii/Projects/z1-sdk/z1/packages/bootstrap/src/index.ts'
-import { buildAgentGraph } from '/home/oleksii/Projects/z1-sdk/z1/packages/agent/src/index.ts'
-import type { ChatMessage } from '/home/oleksii/Projects/z1-sdk/z1/packages/node/src/index.ts'
-import { runGraph } from '/home/oleksii/Projects/z1-sdk/z1/packages/runtime/src/index.ts'
-import type { ApprovalService, RunEvent, RunResult } from '/home/oleksii/Projects/z1-sdk/z1/packages/runtime/src/index.ts'
-import { graphDigest } from '/home/oleksii/Projects/z1-sdk/z1/packages/graph/src/index.ts'
 import {
   SessionClearedError,
   SessionTooNewError,
+  buildAgentGraph,
+  createRuntime,
   createSessionStore,
   findRepoRoot,
-} from '/home/oleksii/Projects/z1-sdk/z1/packages/session/src/index.ts'
+  graphDigest,
+  loadRuntimeConfig,
+  runGraph,
+} from './sdk.ts'
 import type {
+  ApprovalService,
+  ChatMessage,
+  RunEvent,
+  RunHandle,
+  RunResult,
+  Runtime,
   Session,
   SessionStore,
   SessionSummary,
-} from '/home/oleksii/Projects/z1-sdk/z1/packages/session/src/index.ts'
+} from './sdk.ts'
 
 import { ownStateText } from './workspace-state.ts'
 import { probableSessionRoot } from './session-root.ts'

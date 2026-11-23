@@ -22,7 +22,7 @@
  * whatever the module now returns third.
  */
 
-import type { ToolService } from '/home/oleksii/Projects/z1-sdk/z1/packages/runtime/src/index.ts'
+import type { ToolService } from './sdk.ts'
 
 import {
   emptyToolPreferences,

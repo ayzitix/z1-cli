@@ -30,45 +30,53 @@ Working and used daily, but the UI is still under active iteration. See
 
 ## Clone
 
+Keep the two checkouts side by side; that layout is discovered at runtime, not
+compiled into the source:
+
 ```bash
-git clone https://github.com/ayzitix/z1-sdk ~/Projects/z1-sdk
-git clone https://github.com/ayzitix/z1-cli ~/Projects/z1-cli
+git clone https://github.com/ayzitix/z1-sdk z1-sdk
+git clone https://github.com/ayzitix/z1-cli z1-cli
 ```
 
-The CLI imports the SDK by absolute path; keep the SDK at
-`~/Projects/z1-sdk` (the default) or edit the imports.
+`z1-cli` finds the SDK through `Z1_SDK_REPO`, then a sibling `../z1-sdk`, then
+`./z1-sdk` under the current directory. No absolute path is compiled in; a
+checkout moved elsewhere only needs `Z1_SDK_REPO` (or the sibling layout).
 
 ## Requirements
 
 - **Node.js 24.9+** (the SDK's `engines` requirement).
-- **`tsx`**, normally taken from the SDK checkout's `node_modules/.bin/tsx`.
-- A **`z1-sdk` checkout**, by default `~/Projects/z1-sdk`, containing
-  `z1/packages/bootstrap`, `agent`, `runtime` and `graph`.
+- A **built `z1-sdk` checkout** containing `z1/packages/bootstrap`, `agent`,
+  `runtime`, `graph` and the rest, plus `node_modules` and `lib/`
+  (`pnpm install`, then `pnpm -C z1 build`).
+- **`tsx`**, taken from the SDK checkout's `node_modules/tsx/dist/cli.mjs`.
 - An API key in the environment — `RIVER_API_KEY` (default provider) or
   `OPENAI_API_KEY`. Keys are read from the environment only; never put them in
   this repository.
-- The launcher reads `~/.config/z1/env` if it exists (outside the repo).
-
-`chat.ts` currently imports the SDK through **absolute paths**
-(`/home/oleksii/Projects/z1-sdk/...`). Another checkout needs those imports
-edited, or `Z1_SDK_REPO` support added to the launcher.
+- The external `~/.local/bin/z1` launcher reads `~/.config/z1/env` if it exists
+  (outside the repo); the repository launchers do not.
 
 ## Install / launcher
 
-`~/.local/bin/z1` is a small shell launcher (kept outside this repository). It
-resolves the SDK, sources `~/.config/z1/env`, then execs `tsx` on this repo:
+The repository ships two launchers that resolve the same SDK:
 
 ```bash
-CHAT="$HOME/Projects/z1-cli/chat.ts"
-TOOLS="$HOME/Projects/z1-cli/tools.ts"
-exec "$TSX" "$CHAT"          # z1, z1 chat
-exec "$TSX" "$TOOLS"         # z1 tools
+./z1                 # POSIX
+z1.cmd               # Windows (Node 24 on PATH, or set Z1_NODE)
 ```
 
-Without the launcher, run the file directly:
+Set `Z1_SDK_REPO` when the two checkouts are not siblings:
+
+```powershell
+$env:Z1_SDK_REPO = "C:\path\to\z1-sdk"
+.\z1.cmd --once "hello"
+```
+
+Without a launcher, run the file directly (the runtime config keeps the
+`@z1/*` type-only imports out of module resolution):
 
 ```bash
-~/Projects/z1-sdk/node_modules/.bin/tsx ~/Projects/z1-cli/chat.ts
+"${Z1_SDK_REPO:-../z1-sdk}/node_modules/tsx/dist/cli.mjs" \
+  --tsconfig tsconfig.runtime.json chat.ts
 ```
 
 ## Run
@@ -241,10 +249,11 @@ selecting the same session is still a no-op.
   emoji sequence can be over-counted, so some lines still waste a column.
 - Nested tables and very wide tables are best-effort; the vertical fallback is
   the escape hatch.
-- Windows is untested. The launcher is bash; absolute SDK paths are macOS/Linux
-  oriented.
-- The SDK is imported by absolute local path, so this is a workspace tool rather
-  than a relocatable package.
+- Windows is tested for the console with Node 24 and `z1.cmd`; the SDK's
+  symlink-heavy tests still assume a POSIX host.
+- `z1-cli` is a workspace tool, not a published package: it loads the built
+  `z1-sdk` checkout and is relocatable through `Z1_SDK_REPO`, but it is not
+  installable from npm.
 - `delete` in `/tools` is a tombstone, not an uninstall: the module still ships
   the tool and one module can own many tools, so removing code would break the
   others. `/tools restore` clears it.
@@ -323,16 +332,10 @@ Sixteen dependency-free checks live in `tests/` (no framework, no external
 network; the density pty case uses a loopback OpenAI-compatible server):
 
 ```bash
-~/Projects/z1-sdk/node_modules/.bin/tsx tests/output.test.mts
-~/Projects/z1-sdk/node_modules/.bin/tsx tests/width.test.mts
-~/Projects/z1-sdk/node_modules/.bin/tsx tests/input.test.mts
-~/Projects/z1-sdk/node_modules/.bin/tsx tests/tool-state.test.mts
-~/Projects/z1-sdk/node_modules/.bin/tsx tests/tool-inventory.test.mts
-~/Projects/z1-sdk/node_modules/.bin/tsx tests/workspace-state.test.mts
-~/Projects/z1-sdk/node_modules/.bin/tsx tests/session-root.test.mts
-~/Projects/z1-sdk/node_modules/.bin/tsx tests/web-service.test.mts
-~/Projects/z1-sdk/node_modules/.bin/tsx tests/view.test.mts
-~/Projects/z1-sdk/node_modules/.bin/tsx tests/view-prefs.test.mts
+SDK="${Z1_SDK_REPO:-../z1-sdk}"
+for test in tests/*.test.mts; do
+  node "$SDK/node_modules/tsx/dist/cli.mjs" --tsconfig tsconfig.runtime.json "$test"
+done
 tests/pipe-smoke.sh
 tests/session-smoke.sh
 tests/clear-wipe.sh

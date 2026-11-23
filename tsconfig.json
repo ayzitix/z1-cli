@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "typeRoots": ["../z1-sdk/node_modules/@types"],
+    "paths": {
+      "@z1/agent": ["../z1-sdk/z1/packages/agent/lib/index.d.ts"],
+      "@z1/bootstrap": ["../z1-sdk/z1/packages/bootstrap/lib/index.d.ts"],
+      "@z1/graph": ["../z1-sdk/z1/packages/graph/lib/index.d.ts"],
+      "@z1/node": ["../z1-sdk/z1/packages/node/lib/index.d.ts"],
+      "@z1/runtime": ["../z1-sdk/z1/packages/runtime/lib/index.d.ts"]
+    }
+  },
+  "include": ["*.ts"]
+}

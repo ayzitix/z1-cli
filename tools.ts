@@ -5,7 +5,7 @@
  * run, prints the same snapshot the console shows, disposes and closes.
  */
 
-import { createRuntime, loadRuntimeConfig } from '/home/oleksii/Projects/z1-sdk/z1/packages/bootstrap/src/index.ts'
+import { createRuntime, loadRuntimeConfig } from './sdk.ts'
 
 import { ToolState as ToolStore } from './tool-state.ts'
 

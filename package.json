@@ -1,0 +1,7 @@
+{
+  "name": "z1-cli",
+  "private": true,
+  "type": "module",
+  "description": "Local terminal UI for the z1 graph agent",
+  "license": "MIT"
+}

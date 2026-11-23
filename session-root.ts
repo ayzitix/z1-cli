@@ -19,7 +19,7 @@ import { existsSync, readdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 
-import { findRepoRoot } from '/home/oleksii/Projects/z1-sdk/z1/packages/session/src/index.ts'
+import { findRepoRoot } from './sdk.ts'
 
 type Env = Record<string, string | undefined>
 
