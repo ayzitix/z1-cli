@@ -69,7 +69,7 @@
  * `--once` prints its answer and exits while this module is still polling.
  */
 
-import { spawn, execFile } from 'node:child_process'
+import { execFileSync, spawn, execFile } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import {
   appendFileSync,
@@ -1152,8 +1152,36 @@ function portInUse(port: number): Promise<boolean> {
 }
 
 /**
- * Spawn waitress detached: it outlives z1 so the next start is instant, and
- * its stdio goes straight to the log file (never a pipe someone must read).
+ * Stop a managed backend and its children. On Windows the venv python is a
+ * launcher that execs the base interpreter, so waitress is a grandchild; a
+ * plain `process.kill` would leave it listening. `taskkill /T` kills the tree.
+ * On POSIX the venv interpreter is the server itself, so a single signal is
+ * enough; the watchdog covers a force-killed z1.
+ */
+function killTree(pid: number): void {
+  if (process.platform === 'win32') {
+    try {
+      execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true,
+      })
+    } catch {
+      // Already gone.
+    }
+    return
+  }
+  try {
+    process.kill(pid, 'SIGTERM')
+  } catch {
+    // Already gone.
+  }
+}
+
+/**
+ * Spawn SearXNG as a child of z1, in one Python process with a parent
+ * watchdog. It is not detached: no extra console window, and the watchdog
+ * exits the server as soon as this z1 pid disappears (including a force kill).
+ * Its stdio goes straight to the log file, never a pipe someone must read.
  *
  * Resolving only on the child's `spawn` event matters: a missing or
  * non-executable interpreter is reported asynchronously, and an unhandled
@@ -1170,10 +1198,10 @@ async function startServer(paths: WebPaths, env: NodeJS.ProcessEnv, port: number
   rotateLog(paths.logFile)
   const logFd = openSync(paths.logFile, 'a', 0o600)
   chmodSync(paths.logFile, 0o600)
+  const listen = `127.0.0.1:${String(port)}`
   const args = [
-    '-m',
-    'waitress',
-    `--listen=127.0.0.1:${String(port)}`,
+    join(import.meta.dirname, 'web-watchdog.py'),
+    `--listen=${listen}`,
     '--threads=8',
     '--channel-timeout=300',
     'searx.webapp:app',
@@ -1184,8 +1212,16 @@ async function startServer(paths: WebPaths, env: NodeJS.ProcessEnv, port: number
       cwd: paths.srcDir,
       // The rendered settings are outside the source tree on purpose: an
       // upgrade re-extracts `src/` and must not overwrite the secret.
-      env: { ...env, SEARXNG_SETTINGS_PATH: paths.settingsFile },
-      detached: true,
+      env: {
+        ...env,
+        SEARXNG_SETTINGS_PATH: paths.settingsFile,
+        Z1_PARENT_PID: String(process.pid),
+        Z1_SEARX_LISTEN: listen,
+        Z1_SEARX_THREADS: '8',
+        Z1_SEARX_CHANNEL_TIMEOUT: '300',
+      },
+      detached: false,
+      windowsHide: true,
       stdio: ['ignore', logFd, logFd],
     })
   } finally {
@@ -1200,6 +1236,10 @@ async function startServer(paths: WebPaths, env: NodeJS.ProcessEnv, port: number
   })
   if (child.pid === undefined) throw new WebServiceError('searxng did not start')
   child.unref()
+  ownedServerPid = child.pid
+  child.once('exit', () => {
+    if (ownedServerPid === child.pid) ownedServerPid = undefined
+  })
   // Read the identity now, while this is certainly the process we spawned. A
   // brief retry covers the instant between `spawn` and a readable cmdline.
   let identity = await processIdentity(child.pid)
@@ -1253,6 +1293,14 @@ export function initialSearxPhase(installed: boolean): SearxPhase {
 }
 
 let inFlight: Promise<WebStatus> | undefined
+
+/** The backend this z1 spawned, if any; killed synchronously on process exit. */
+let ownedServerPid: number | undefined
+
+process.on('exit', () => {
+  if (ownedServerPid === undefined) return
+  killTree(ownedServerPid)
+})
 
 /**
  * Make the backend ready, in the background. Idempotent and safe to call from
@@ -1537,7 +1585,7 @@ export async function stopWebSearch(env: NodeJS.ProcessEnv = process.env, option
 
   const pid = record.pid
   try {
-    process.kill(pid, 'SIGTERM')
+    killTree(pid)
   } catch {
     // Gone between the check and the signal; the record is still stale.
   }
@@ -1547,7 +1595,7 @@ export async function stopWebSearch(env: NodeJS.ProcessEnv = process.env, option
   if (!(await waitForExit(pid, graceMs))) {
     if (identityMatches(record, await read(pid))) {
       try {
-        process.kill(pid, 'SIGKILL')
+        killTree(pid)
       } catch {
         // Same race, nothing left to do.
       }
@@ -1555,6 +1603,7 @@ export async function stopWebSearch(env: NodeJS.ProcessEnv = process.env, option
     }
   }
   clearServerRecord(paths)
+  if (ownedServerPid === pid) ownedServerPid = undefined
   return {
     state: 'stopped',
     managed: true,

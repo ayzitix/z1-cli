@@ -158,10 +158,12 @@ repo.
   `up` only for a process z1 started and verified (`searxng.json` identity); a
   listener z1 cannot claim is left to the module's own `/healthz` probe. A
   verified start that never answers leaves a failure marker, so `/web status`
-  says `failed` instead of `starting` for as long as the process lives. On
-  Windows, provisioning needs `uv` on PATH and `Z1_PYTHON` pointing at a
-  Python 3.10+ executable; z1 writes the `pwd` shim and skips the tarball's
-  Apache template symlink automatically.
+  says `failed` instead of `starting` for as long as the process lives. The
+  backend runs in z1's process tree; a parent watchdog stops it when z1 exits
+  (including a force kill), and `/web down` kills the whole tree. On Windows,
+  provisioning needs `uv` on PATH and `Z1_PYTHON` pointing at a Python 3.10+
+  executable; z1 writes the `pwd` shim and skips the tarball's Apache template
+  symlink automatically.
 - **Tool control**: `/tools` opens a picker over the composer, styled like the
   slash menu: `↑`/`↓` select, `Enter` toggles `on`/`off` (and restores a deleted
   tool), `Delete` (or `Backspace`) asks before tombstoning, `Esc` closes. The
