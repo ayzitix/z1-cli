@@ -72,6 +72,7 @@
 import { spawn, execFile } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import {
+  appendFileSync,
   chmodSync,
   closeSync,
   existsSync,
@@ -895,6 +896,64 @@ export async function downloadSource(
  * `install.lock` and a failure removes the source tree: a half-installed venv
  * must never look installed to the next start.
  */
+/**
+ * SearXNG imports the Unix-only `pwd` module (for a Valkey failure log) and
+ * calls `os.getuid` in the same path. Windows has neither, so the venv gets a
+ * tiny `pwd` shim and a `sitecustomize` patch for the uid/gid helpers. The
+ * pinned tarball's only symlink is excluded during extraction above.
+ */
+function writeWindowsCompatibility(paths: WebPaths): void {
+  const site = join(paths.venvDir, 'Lib', 'site-packages')
+  if (!existsSync(site)) return
+  writeFileSync(
+    join(site, 'pwd.py'),
+    `"""Minimal Windows stand-in for the Unix pwd module (SearXNG imports it)."""
+
+class struct_passwd(tuple):
+    pw_name = property(lambda self: self[0])
+    pw_passwd = property(lambda self: self[1])
+    pw_uid = property(lambda self: self[2])
+    pw_gid = property(lambda self: self[3])
+    pw_gecos = property(lambda self: self[4])
+    pw_dir = property(lambda self: self[5])
+    pw_shell = property(lambda self: self[6])
+
+def getpwuid(uid=0):
+    uid = int(uid)
+    return struct_passwd(("user", "x", uid, uid, "", "", ""))
+
+def getpwnam(name):
+    return struct_passwd((str(name), "x", 0, 0, "", "", ""))
+
+def getpwall():
+    return [getpwuid(0)]
+`,
+    { mode: 0o600 },
+  )
+  writeFileSync(
+    join(site, 'z1_windows_compat.py'),
+    `import os
+
+if not hasattr(os, "getuid"):
+    os.getuid = lambda: 0
+if not hasattr(os, "geteuid"):
+    os.geteuid = lambda: 0
+if not hasattr(os, "getgid"):
+    os.getgid = lambda: 0
+if not hasattr(os, "getegid"):
+    os.getegid = lambda: 0
+`,
+    { mode: 0o600 },
+  )
+  const sitecustomize = join(site, 'sitecustomize.py')
+  const importLine = 'import z1_windows_compat'
+  if (!existsSync(sitecustomize)) {
+    writeFileSync(sitecustomize, `${importLine}\n`, { mode: 0o600 })
+  } else if (!readFileSync(sitecustomize, 'utf8').includes(importLine)) {
+    appendFileSync(sitecustomize, `\n${importLine}\n`)
+  }
+}
+
 async function install(paths: WebPaths, env: NodeJS.ProcessEnv, report: (line: string) => void): Promise<void> {
   // `takeLock` already created it; repeated here so the install owns every
   // directory it writes to, whatever called it.
@@ -907,7 +966,14 @@ async function install(paths: WebPaths, env: NodeJS.ProcessEnv, report: (line: s
 
   rmSync(staging, { recursive: true, force: true })
   mkdirSync(staging, { recursive: true, mode: 0o700 })
-  const untar = await run('tar', ['-xzf', tarball, '-C', staging]).catch(error => {
+  // The pinned tarball contains one symlink, an Apache template alias
+  // (`utils/templates/etc/apache2 -> httpd`). Windows without Developer Mode
+  // cannot create symlinks, and the file is not runtime code, so skip it there.
+  const untarArgs = ['-xzf', tarball, '-C', staging]
+  if (process.platform === 'win32') {
+    untarArgs.push('--exclude', `searxng-${SEARXNG_SHA}/utils/templates/etc/apache2`)
+  }
+  const untar = await run('tar', untarArgs).catch(error => {
     throw error instanceof WebServiceError ? error : new WebServiceError(`extract failed: ${(error as Error).message}`)
   })
   if (untar.code !== 0) throw new WebServiceError(`extract failed: ${lastLine(untar.output)}`)
@@ -954,6 +1020,7 @@ async function install(paths: WebPaths, env: NodeJS.ProcessEnv, report: (line: s
     { env },
   )
   if (pip.code !== 0) throw new WebServiceError(`install failed: ${lastLine(pip.output)}`)
+  if (process.platform === 'win32') writeWindowsCompatibility(paths)
 
   const secret = generateSecret()
   writeFileSync(
