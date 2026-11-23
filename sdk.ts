@@ -91,7 +91,7 @@ export const {
 } = subagent
 
 export type { Runtime, RunHandle, Session, SessionStore, SessionSummary } from '@z1/bootstrap'
-export type { ChatMessage, ModelHandle } from '@z1/node'
+export type { ChatMessage, Json, ModelHandle } from '@z1/node'
 export type { ApprovalService, RunEvent, RunResult, ToolService } from '@z1/runtime'
 export type {
   SubagentCallGuard,

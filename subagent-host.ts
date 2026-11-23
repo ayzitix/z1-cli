@@ -26,13 +26,17 @@ import {
   withSubagentTool,
 } from './sdk.ts'
 import type {
+  ChatMessage,
+  Json,
   ModelHandle,
   Runtime,
+  RunEvent,
   SubagentCallGuard,
   SubagentHost,
   SubagentInventory,
   SubagentRunHandle,
   SubagentRunOverrides,
+  SubagentTool,
   ToolService,
 } from './sdk.ts'
 import type { ToolSnapshot } from './tool-state.ts'
@@ -102,6 +106,45 @@ export interface ComposeSubagentOptions {
    * signal and must *not* be wired to the parent turn (see SUBAGENT-DESIGN-2).
    */
   readonly signal?: AbortSignal
+  /**
+   * Read-side hooks for `/agents` (SUBAGENT-DESIGN-2, 1.5b).
+   *
+   * `onStart` fires when the package creates the child's run id, before the
+   * child runs, so a running row exists from the first moment (the model's
+   * `description` is known then; the effective grant follows in `onFinish`).
+   * `onEvent` forwards the child's own events for live step counts, and
+   * `onFinish` reports how it ended plus the grant the package resolved.
+   *
+   * None of these change the grant, the budget or the approval path: they only
+   * observe.
+   */
+  readonly onStart?: (start: SubagentRunStart) => void
+  readonly onEvent?: (runId: string, event: RunEvent) => void
+  readonly onFinish?: (finish: SubagentRunFinish) => void
+}
+
+/** A child that exists now; the effective grant is not known yet. */
+export interface SubagentRunStart {
+  readonly runId: string
+  readonly description: string
+}
+
+/**
+ * How one delegation ended, mapped to the host's vocabulary. A finished child
+ * is a *result* in 1.5c (timeouts, cancellations and step caps included), so a
+ * throw here is a pre-run failure: an invalid grant, a full budget, a
+ * `beginRun` error. Those already have their own message; this hook is for the
+ * journal row the user opens with `/agents`.
+ */
+export interface SubagentRunFinish {
+  readonly runId: string
+  readonly description: string
+  readonly status: 'completed' | 'failed' | 'cancelled' | 'timeout' | 'partial'
+  readonly tools: readonly string[]
+  readonly denied: readonly string[]
+  readonly errorCode?: string
+  readonly detail?: string
+  readonly steps?: number
 }
 
 /**
@@ -129,6 +172,21 @@ export async function composeSubagentService(
   if (hasSubagentCollision(options.snapshot)) return options.parent
 
   const inventory = subagentInventory(options.snapshot)
+  // Calls of one turn can overlap (the parent may delegate twice), and the
+  // package allocates each run id inside its own `call`. `onEvent` fires
+  // synchronously within that call, so a FIFO of the descriptions handed to
+  // `call`, plus the ids already announced, is enough to bind id → label.
+  const descriptions: string[] = []
+  const started = new Set<string>()
+  const announce = (runId: string, description: string): void => {
+    if (started.has(runId)) return
+    started.add(runId)
+    try {
+      options.onStart?.({ runId, description })
+    } catch {
+      // Observation only; a broken registry must not fail a child.
+    }
+  }
   const tool = createSubagentTool({
     model: options.model,
     host: subagentHost(options.runtime),
@@ -139,9 +197,61 @@ export async function composeSubagentService(
     guardCall: options.guardCall,
     // `exactOptionalPropertyTypes`: omit rather than pass `undefined`.
     ...(options.signal === undefined ? {} : { signal: options.signal }),
+    // `onStart` needs the run id, and the first event that carries it is this
+    // hook, so it is always installed (the registry's announce is cheap and
+    // idempotent); `options.onEvent` is an additional consumer, not the source.
+    onEvent: (event) => {
+      const runId = (event as { runId?: unknown }).runId
+      if (typeof runId !== 'string') return
+      announce(runId, descriptions.at(-1) ?? '')
+      try {
+        options.onEvent?.(runId, event as RunEvent)
+      } catch {
+        // Observation only; a broken consumer must not fail a child.
+      }
+    },
   })
-  return await withSubagentTool(options.parent, tool, {
+  const inner: SubagentTool = {
+    schema: tool.schema,
+    async call(args: Json) {
+      const description = descriptionOf(args)
+      descriptions.push(description)
+      try {
+        const result = await tool.call(args)
+        // A journal-less child, or one that fails before its first event, never
+        // reaches the hook above; finishing proves the child existed, so it is
+        // announced here too (idempotent through `started`).
+        announce(result.runId, description)
+        try {
+          options.onFinish?.({
+            runId: result.runId,
+            description,
+            status: result.status,
+            tools: result.tools,
+            denied: result.denied,
+            ...(result.errorCode === undefined ? {} : { errorCode: result.errorCode }),
+            ...(result.detail === undefined ? {} : { detail: result.detail }),
+            ...(result.steps === undefined ? {} : { steps: result.steps }),
+          })
+        } catch {
+          // Observation only.
+        }
+        return result
+      } finally {
+        const index = descriptions.lastIndexOf(description)
+        if (index >= 0) descriptions.splice(index, 1)
+      }
+    },
+  }
+  return await withSubagentTool(options.parent, inner, {
     inventory: inventory.installed,
     guardCall: options.guardCall,
   })
+}
+
+/** The model-supplied description, read exactly as the package will read it. */
+function descriptionOf(args: Json): string {
+  if (typeof args !== 'object' || args === null) return ''
+  const value = (args as { description?: unknown }).description
+  return typeof value === 'string' ? value.trim() : ''
 }

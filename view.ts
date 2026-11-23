@@ -48,6 +48,11 @@ export type ViewEvent =
       size: number
       /** The raw result, for the compact background-process notice. */
       result?: unknown
+      /**
+       * An extra, dim tail for this one row (e.g. `/agents run_1a2b` after a
+       * completed `subagent` call). Never a child tool call: the row stays one.
+       */
+      hint?: string
     }
   | { type: 'node.failed'; path: string; error: string }
   | { type: 'run.failed'; error: string }
@@ -116,14 +121,33 @@ export const errorText = (value: unknown): string => {
   else if (typeof value === 'object' && value !== null && typeof (value as Record<string, unknown>)['error'] === 'string') {
     raw = String((value as Record<string, unknown>)['error'])
   } else {
-    try {
-      raw = JSON.stringify(value) ?? String(value)
-    } catch {
-      raw = String(value)
-    }
+    raw = compactFailure(value)
   }
   raw = raw.replace(/\s+/g, ' ').trim()
   return raw.length === 0 ? 'error' : raw
+}
+
+/**
+ * A tool result that is not a plain `{ error }`: the subagent result in 1.5c
+ * is `{ status, errorCode, detail, … }`, and dumping it as JSON made a whole
+ * payload land on one transcript row. A subagent failure therefore reads as
+ * `partial · stopped by the step cap …` (or `timeout · child_timeout ·
+ * …`), and anything else still falls back to compact JSON.
+ */
+const compactFailure = (value: unknown): string => {
+  if (typeof value !== 'object' || value === null) return String(value)
+  const record = value as Record<string, unknown>
+  const status = record['status']
+  if (typeof status === 'string' && record['runId'] !== undefined) {
+    const code = typeof record['errorCode'] === 'string' ? ` · ${record['errorCode']}` : ''
+    const detail = typeof record['detail'] === 'string' ? record['detail'].replace(/\s+/g, ' ').trim() : ''
+    return detail.length === 0 ? `${status}${code}` : `${status}${code} · ${detail}`
+  }
+  try {
+    return JSON.stringify(value) ?? String(value)
+  } catch {
+    return String(value)
+  }
 }
 
 /** Payload size in characters, before it is turned into a label. */
@@ -244,15 +268,30 @@ const clipLine = (text: string, ctx: ViewContext): string =>
 const callLabel = (name: string, summary: string | undefined, theme: ViewTheme): string =>
   `${theme.bold('⬢')} ${theme.cyan(name)}${summary === undefined ? '' : ` ${theme.dim('→')} ${summary}`}`
 
-const singleOk = (name: string, summary: string | undefined, ms: number, ctx: ViewContext): string =>
+const hintTail = (hint: string | undefined, ctx: ViewContext): string =>
+  hint === undefined || hint.length === 0 ? '' : ` ${ctx.theme.dim('·')} ${ctx.theme.dim(hint)}`
+
+const singleOk = (
+  name: string,
+  summary: string | undefined,
+  ms: number,
+  ctx: ViewContext,
+  hint?: string,
+): string =>
   clipLine(
-    `${callLabel(name, summary, ctx.theme)} ${ctx.theme.dim('·')} ${ctx.theme.green('✓')} ${ctx.theme.dim(durationLabel(ms))}`,
+    `${callLabel(name, summary, ctx.theme)} ${ctx.theme.dim('·')} ${ctx.theme.green('✓')} ${ctx.theme.dim(durationLabel(ms))}${hintTail(hint, ctx)}`,
     ctx,
   )
 
-const singleFail = (name: string, summary: string | undefined, ms: number, ctx: ViewContext): string =>
+const singleFail = (
+  name: string,
+  summary: string | undefined,
+  ms: number,
+  ctx: ViewContext,
+  hint?: string,
+): string =>
   clipLine(
-    `${callLabel(name, summary, ctx.theme)} ${ctx.theme.dim('·')} ${ctx.theme.red('✗')} ${ctx.theme.dim(durationLabel(ms))}`,
+    `${callLabel(name, summary, ctx.theme)} ${ctx.theme.dim('·')} ${ctx.theme.red('✗')} ${ctx.theme.dim(durationLabel(ms))}${hintTail(hint, ctx)}`,
     ctx,
   )
 
@@ -393,14 +432,14 @@ const endEvent = (state: ViewState, event: Extract<ViewEvent, { type: 'tool.end'
       return [
         {
           type: 'line',
-          text: `  ${theme.dim('⎿')}  ${theme.red(`✗ ${error}`)} ${theme.dim(`· ${ms}`)}`,
+          text: `  ${theme.dim('⎿')}  ${theme.red(`✗ ${error}`)} ${theme.dim(`· ${ms}`)}${hintTail(event.hint, ctx)}`,
         },
       ]
     }
     return [
       {
         type: 'line',
-        text: `  ${theme.dim('⎿')}  ${theme.green('✓')} ${theme.dim(`${ms} · ${sizeLabel(event.size)}`)}`,
+        text: `  ${theme.dim('⎿')}  ${theme.green('✓')} ${theme.dim(`${ms} · ${sizeLabel(event.size)}`)}${hintTail(event.hint, ctx)}`,
       },
     ]
   }
@@ -440,10 +479,10 @@ const endEvent = (state: ViewState, event: Extract<ViewEvent, { type: 'tool.end'
     return flushGroup(state, ctx)
   }
   // A solitary or ungrouped call is one line, printed when its result arrives.
-  if (event.ok) return [{ type: 'line', text: singleOk(name, summary, event.durationMs, ctx) }]
+  if (event.ok) return [{ type: 'line', text: singleOk(name, summary, event.durationMs, ctx, event.hint) }]
   state.shown.add(error)
   return [
-    { type: 'line', text: singleFail(name, summary, event.durationMs, ctx) },
+    { type: 'line', text: singleFail(name, summary, event.durationMs, ctx, event.hint) },
     { type: 'line', text: failureDetail(name, error, ctx) },
   ]
 }

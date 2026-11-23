@@ -18,6 +18,7 @@ import { argv, stdin, stdout } from 'node:process'
 import {
   SessionClearedError,
   SessionTooNewError,
+  SUBAGENT_TOOL_NAME,
   buildAgentGraph,
   createRuntime,
   createSessionStore,
@@ -50,6 +51,9 @@ import { toolInventoryText } from './tool-inventory.ts'
 import { type ToolState } from './tool-policy.ts'
 import { ToolState as ToolStore } from './tool-state.ts'
 import { composeSubagentService } from './subagent-host.ts'
+import { AgentRegistry, runningLabel } from './agents.ts'
+import { agentListLines, agentRefusal, agentTranscriptLines, agentHint } from './agents-view.ts'
+import type { AgentEventRow } from './agents-view.ts'
 import { reapOrphanedRuns } from './reaper.ts'
 import {
   compactArgs,
@@ -2442,6 +2446,11 @@ interface Progress {
   settle(status: string, error: string | undefined): void
   /** Make sure the console is at column 0. */
   closeLine(): void
+  /**
+   * The session's child list changed (a delegation started or ended). Repaints
+   * the transient "N subagents running" row; a no-op when nothing changed.
+   */
+  agentsChanged(): void
 }
 
 
@@ -2695,11 +2704,16 @@ const createProgress = (tail: Tail, mode: ViewMode): Progress => {
 
   const renderPlate = (): void => {
     const label = viewActivity(state, ctx())
+    // The child row is not a spinner: it stays while any child runs and is a
+    // plain sentence (`◷ 2 subagents running · /agents`), appended under the
+    // plate when there is one. Reusing `tail.activity()` is the whole point.
+    const children = runningLabel(runningChildren)
+    const childRow = children === undefined ? undefined : dim(children)
     if (label === undefined) {
-      tail.activity(undefined)
+      tail.activity(childRow)
       return
     }
-    tail.activity(`${frames[frame]} ${dim(label)}`)
+    tail.activity(childRow === undefined ? `${frames[frame]} ${dim(label)}` : `${frames[frame]} ${dim(label)}\n${childRow}`)
   }
 
   const working = (label: string): void => {
@@ -2827,6 +2841,12 @@ const createProgress = (tail: Tail, mode: ViewMode): Progress => {
           markdown?.flush()
           const result = incoming.outputs['result']
           const ok = incoming.outputs['isError'] !== true
+          // One compact row per delegation: the hint points at the read view
+          // instead of inlining the child's tool calls into this transcript.
+          const started = state.calls.get(call[1] as string)
+          const runId = (result as { runId?: unknown } | undefined)?.runId
+          const hint =
+            started?.name === SUBAGENT_TOOL_NAME && typeof runId === 'string' ? agentHint(runId) : undefined
           applyEvent(
             viewEvent(
               state,
@@ -2838,6 +2858,7 @@ const createProgress = (tail: Tail, mode: ViewMode): Progress => {
                 durationMs: incoming.durationMs,
                 size: resultSize(result),
                 result,
+                ...(hint === undefined ? {} : { hint }),
               },
               ctx(),
             ),
@@ -2868,11 +2889,40 @@ const createProgress = (tail: Tail, mode: ViewMode): Progress => {
     apply(viewSettle(state, status, ctx()), true)
   }
 
-  return { working, print, stream, event, settle, closeLine }
+  /**
+   * Children started or finished during this turn. The spinner is the only
+   * writer on a live terminal, so a running turn repaints through it; without
+   * a spinner (a pipe, or full mode between rows) there is no transient row to
+   * update and nothing is printed.
+   */
+  const refreshChildren = (): void => {
+    if (!tail.live || mode === 'full' || spinner === undefined) return
+    renderPlate()
+  }
+
+  return { working, print, stream, event, settle, closeLine, agentsChanged: refreshChildren }
 }
 
 /** Abort channel of the turn that is currently running, if any. */
 let activeAbort: AbortController | undefined
+
+/**
+ * Children currently running in this session, for the transient row under the
+ * tail. The registry is the source; this is the counter the progress plate
+ * reads, so `createProgress` needs no registry handle and a finished turn
+ * cannot leave a stale row behind.
+ *
+ * 2b must rework this: a background child outlives the turn, so the count
+ * cannot be reset by `runTurn` and `refreshChildren` must repaint while no
+ * turn is running (the plate is only live during one). v1 children are
+ * foreground, so "no child outlives its turn" holds for now.
+ */
+let runningChildren = 0
+
+/** Mirror the registry's running count into the plate's counter. */
+const syncRunningChildren = (agents: AgentRegistry): void => {
+  runningChildren = agents.running().length
+}
 
 let closed = false
 /** Lines typed while a turn is running: Claude Code queues them, so does z1. */
@@ -3069,6 +3119,15 @@ const COMMANDS: readonly CommandSpec[] = [
     help: ['reset · refresh · --all (all also shows stale entries)'],
   },
   { name: '/context', description: 'show context usage' },
+  // Same shape as `/sessions`: no `args`, so Enter on a bare `/agents` lists
+  // instead of completing. `handleAgents` parses `<n|runId>`.
+  {
+    name: '/agents',
+    description: 'subagents this session started; open one by number or id',
+    usage: '/agents [<n|runId>]',
+    rest: true,
+    help: ['bare lists running first, then finished', '<n> or <runId> opens its transcript (read-only)'],
+  },
   // Same shape as `/tools`: no `args`, so Enter on a bare `/sessions` lists
   // instead of completing. `handleSessions` parses the sub-grammar.
   {
@@ -3234,6 +3293,12 @@ const runTurn = async (
     sessionRoot?: string
     /** This chat's own identity, so the prompt can answer "what session is this?". */
     session?: { name: string; messageCount: number }
+    /**
+     * This session's children, for `/agents`. Observation only: the registry
+     * counts steps and remembers outcomes; it never touches the grant, the
+     * budget or the approvals.
+     */
+    agents?: AgentRegistry
   } = {},
 ): Promise<TurnResult> => {
   const maxSteps = options.maxSteps ?? stepLimit(process.env['Z1_MAX_STEPS'])
@@ -3275,6 +3340,39 @@ const runTurn = async (
         snapshot,
         guardCall,
         signal: controller.signal,
+        ...(options.agents === undefined
+          ? {}
+          : {
+              onStart: (start: { runId: string; description: string }) => {
+                options.agents?.start(start)
+                syncRunningChildren(options.agents as AgentRegistry)
+                progress.agentsChanged()
+              },
+              onEvent: (runId: string, event: RunEvent) => {
+                options.agents?.observe(runId, event)
+              },
+              onFinish: (finish: {
+                runId: string
+                description: string
+                status: 'completed' | 'failed' | 'cancelled' | 'timeout' | 'partial'
+                tools: readonly string[]
+                denied: readonly string[]
+                errorCode?: string
+                detail?: string
+                steps?: number
+              }) => {
+                options.agents?.finish(finish.runId, {
+                  outcome: finish.status,
+                  tools: finish.tools,
+                  denied: finish.denied,
+                  ...(finish.errorCode === undefined ? {} : { errorCode: finish.errorCode }),
+                  ...(finish.detail === undefined ? {} : { detail: finish.detail }),
+                  ...(finish.steps === undefined ? {} : { steps: finish.steps }),
+                })
+                syncRunningChildren(options.agents as AgentRegistry)
+                progress.agentsChanged()
+              },
+            }),
       })
     : handle.services.tools
   const serviceTools = tools.guard(composedTools)
@@ -3401,6 +3499,10 @@ const runTurn = async (
   const output = reply.text
 
   progress.settle(result.status, result.error)
+  // A turn cannot leave a "running" child row behind: v1 children are
+  // foreground, so every child of this turn has been disposed by now. The
+  // counter is resynced from the registry rather than assumed to be zero.
+  if (options.agents !== undefined) syncRunningChildren(options.agents)
 
   const events = runtime.journal.ownedEvents(runId).map(entry => entry.event)
   const loopEvent = events.find(
@@ -3560,10 +3662,17 @@ const oneShot = async (prompt: string, explicitModel: string | undefined, explic
   // the exception: `/tools ↵ what is the weather` carries a command and a real
   // question, so the command is honoured and only the lines under it are asked.
   // `/tools` is the one command a one-shot can genuinely run, because its whole
-  // effect is the list; the rest act on session state a one-shot does not have
-  // and stay the old error rather than being dropped on the floor.
+  // effect is the list; `/agents` is read-only too (it lists and can open a
+  // child transcript), so it is also honoured headless: a listing decides no
+  // exit code, the main run still does.
+  //
+  // Limitation (1.5b): a one-shot runs `/agents` *before* its turn, and the
+  // registry is per process, so a fresh `z1 --once "/agents"` lists nothing.
+  // It is useful when the same process already delegated (a command plus a
+  // prompt: `/agents\n<question>`, or a subsequent read), never as a way to
+  // inspect a previous run's children - use the interactive `/agents` for that.
   const headless = (name: string, rest: string): boolean =>
-    name === '/tools' && shapeAllows(commandSpec(name), rest)
+    (name === '/tools' || name === '/agents') && shapeAllows(commandSpec(name), rest)
   const trimmed = prompt.trimStart()
   const split = splitCommandAndPrompt(trimmed, headless)
   // An unknown `/foo` is not an interactive command, so the error below is not
@@ -3596,6 +3705,11 @@ const oneShot = async (prompt: string, explicitModel: string | undefined, explic
   const model = startModel(explicitModel)
   const config = loadRuntimeConfig({ cwd: process.cwd(), env: process.env, overrides: { live: true } })
   const runtime = await createRuntime(config)
+  // This session's delegated children, for `/agents`. In memory on purpose:
+  // the registry is read-side, and `RunRecord.parentRunId` is fork lineage, not
+  // delegation lineage (SUBAGENT-DESIGN-2, 1.5b).
+  const agents = new AgentRegistry()
+  runningChildren = 0
   // A previous process may have died with a run row still `running`; nothing
   // else reconciles those. Cheap (one listRuns) and once per process.
   reapOrphanedRuns(runtime.journal, {
@@ -3615,19 +3729,26 @@ const oneShot = async (prompt: string, explicitModel: string | undefined, explic
   try {
     const toolState = new ToolStore(() => handle.services.tools.list(), [subagentToolSchema])
     if (split !== undefined) {
-      // What `/tools` prints, on stderr: stdout is the answer and may be piped.
-      const snapshot = await toolState.reload()
-      const names = snapshot.enabled.map((record) => record.name)
-      console.error(
-        dim(
-          `· tools · ${snapshot.inventoryKnown ? `${String(names.length)}/${String(snapshot.installedCount)} enabled` : 'inventory unavailable'}${names.length > 0 ? ` · ${names.join(', ')}` : ''}`,
-        ),
-      )
+      if (split.command.trim().startsWith('/agents')) {
+        // Read-only: a listing decides no exit code; the run below still does.
+        // stderr, like `/tools`, because stdout is the answer and may be piped.
+        for (const text of oneShotAgents(split.command, agents, runtime)) console.error(text)
+      } else {
+        // What `/tools` prints, on stderr: stdout is the answer and may be piped.
+        const snapshot = await toolState.reload()
+        const names = snapshot.enabled.map((record) => record.name)
+        console.error(
+          dim(
+            `· tools · ${snapshot.inventoryKnown ? `${String(names.length)}/${String(snapshot.installedCount)} enabled` : 'inventory unavailable'}${names.length > 0 ? ` · ${names.join(', ')}` : ''}`,
+          ),
+        )
+      }
     }
     const outcome = await runTurn(runtime, handle, model, [], question, progress, {
       toolState,
       cwd: config.cwd,
       sessionRoot: probableSessionRoot(config.cwd),
+      agents,
     })
     if (outcome.context !== undefined) {
       progress.print(
@@ -3667,6 +3788,28 @@ const gitBranch = (cwd: string): string | undefined => {
   }
 }
 
+/** `/agents` in `--once`: the same rows the interactive command prints. */
+const oneShotAgents = (
+  command: string,
+  agents: AgentRegistry,
+  runtime: Runtime,
+): readonly string[] => {
+  const rest = command.trim().slice('/agents'.length).trim()
+  const now = Date.now()
+  if (rest === '') {
+    return agentListLines({ entries: agents.list(), now, columns: terminalColumns(), theme: viewTheme })
+  }
+  const entry = agents.resolveRef(rest)
+  if (!entry.ok) return [red(agentRefusal(rest, entry))]
+  let events: readonly AgentEventRow[] = []
+  try {
+    events = runtime.journal.read(entry.entry.runId) as unknown as readonly AgentEventRow[]
+  } catch {
+    events = []
+  }
+  return agentTranscriptLines({ entry: entry.entry, events, now, width: terminalColumns(), theme: viewTheme })
+}
+
 /**
  * The static context Claude Code keeps above its input: model, directory,
  * branch, how full the context is and the current limits. It is reprinted
@@ -3704,6 +3847,11 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
   let modelPinned = explicitModel !== undefined && explicitModel.trim().length > 0
   const config = loadRuntimeConfig({ cwd: process.cwd(), env: process.env, overrides: { live: true } })
   const runtime = await createRuntime(config)
+  // This session's delegated children, for `/agents`. In memory on purpose:
+  // the registry is read-side, and `RunRecord.parentRunId` is fork lineage
+  // (SUBAGENT-DESIGN-2, 1.5b — rule 9 keeps the journal row free of it).
+  const agents = new AgentRegistry()
+  runningChildren = 0
   let history: ChatMessage[] = []
   let lastTokens = 0
   let lastContext: TurnContext | undefined
@@ -4839,7 +4987,61 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
   }
 
   /**
-   * `/sessions` — the whole sub-grammar, declared once in `COMMANDS`. Bare and
+   * One child's own journal rows, for `/agents`. A journal that cannot read the
+   * id is not a crash: an empty transcript with the header still says what the
+   * registry knows.
+   */
+  const childEvents = (runId: string): readonly AgentEventRow[] => {
+    try {
+      return runtime.journal.read(runId) as unknown as readonly AgentEventRow[]
+    } catch {
+      return []
+    }
+  }
+
+  /**
+   * `/agents` - this session's delegated children.
+   *
+   * Bare lists them (running first, then finished); `<n>` or `<runId>` opens
+   * one child's transcript from its own journal. It is a read view: nothing is
+   * written to the journal, no child is started, stopped or resumed. An unknown
+   * or garbage reference is a plain message, never a crash.
+   */
+  const handleAgents = (line: string): void => {
+    const rest = line.slice('/agents'.length).trim()
+    if (rest === '') {
+      for (const text of agentListLines({
+        entries: agents.list(),
+        now: Date.now(),
+        columns: terminalColumns(),
+        theme: viewTheme,
+      })) {
+        say(text)
+      }
+      return
+    }
+
+    const resolved = agents.resolveRef(rest)
+    if (!resolved.ok) {
+      say(red(agentRefusal(rest, resolved)))
+      return
+    }
+    const entry = resolved.entry
+
+    const events = childEvents(entry.runId)
+    for (const text of agentTranscriptLines({
+      entry,
+      events,
+      now: Date.now(),
+      width: terminalColumns(),
+      theme: viewTheme,
+    })) {
+      say(text)
+    }
+  }
+
+  /**
+   * `/sessions` - the whole sub-grammar, declared once in `COMMANDS`. Bare and
    * `--all` list; bare opens the arrow picker in a terminal.
    */
   const handleSessions = async (line: string): Promise<void> => {
@@ -5056,6 +5258,11 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
       lastContext = undefined
       lastTokens = 0
       forceCompact = false
+      // `/agents` is scoped to this session, so the old conversation's finished
+      // children go with it. A running child would keep its row (v1 children
+      // are foreground, so in practice none is running here).
+      agents.clearFinished()
+      syncRunningChildren(agents)
       // The state is gone; the screen has to say so before the confirmation.
       tail.clear()
       say(
@@ -5154,6 +5361,10 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
     },
     '/sessions': async (raw) => {
       await handleSessions(raw)
+      return 'continue'
+    },
+    '/agents': (raw) => {
+      handleAgents(raw)
       return 'continue'
     },
     '/tools': async (raw) => {
@@ -5375,6 +5586,7 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
                   name: activeSession.meta.name,
                   messageCount: history.filter((message) => message.role !== 'system').length,
                 },
+          agents,
         })
         forceCompact = false
         history = outcome.history

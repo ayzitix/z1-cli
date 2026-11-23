@@ -119,8 +119,8 @@ const waitFor = async (predicate: () => boolean, what: string): Promise<void> =>
     })
 
     const pending = composed.call('subagent', args(['read']))
-    // Attach the rejection handler before aborting so the cancellation can
-    // never surface as an unhandled rejection.
+    // Attach the handler before aborting so the cancellation can never surface
+    // as an unhandled rejection.
     const settled = pending.then(
       (value) => ({ kind: 'resolved' as const, value }),
       (error: unknown) => ({ kind: 'rejected' as const, error }),
@@ -131,9 +131,14 @@ const waitFor = async (predicate: () => boolean, what: string): Promise<void> =>
     const outcome = await settled
     release()
 
-    assert.equal(outcome.kind, 'rejected', 'a cancelled child does not resolve as a result')
-    const message = outcome.kind === 'rejected' ? String((outcome.error as Error).message) : ''
-    assert.match(message, /cancelled by the parent/)
+    // Since 1.5c a finished child is a *result*, not a throw: the cancellation
+    // reaches the host as `status: 'cancelled'` plus the machine-readable code.
+    assert.equal(outcome.kind, 'resolved', 'a cancelled child resolves as a result')
+    const value = outcome.kind === 'resolved' ? (outcome.value as Record<string, unknown>) : {}
+    assert.equal(value['status'], 'cancelled')
+    assert.equal(value['errorCode'], 'child_cancelled')
+    assert.match(String(value['detail']), /cancelled by the parent/)
+    assert.equal(value['isError'], true)
 
     const rows = journal.listRuns()
     assert.equal(rows.length, 1, 'the child created one run row')
