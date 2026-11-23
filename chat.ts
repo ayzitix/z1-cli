@@ -50,6 +50,7 @@ import { toolInventoryText } from './tool-inventory.ts'
 import { type ToolState } from './tool-policy.ts'
 import { ToolState as ToolStore } from './tool-state.ts'
 import { composeSubagentService } from './subagent-host.ts'
+import { reapOrphanedRuns } from './reaper.ts'
 import {
   compactArgs,
   createViewState,
@@ -77,6 +78,12 @@ process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
   if (text.startsWith('z1: [info] service ')) return true
   return (stderrWrite as (...args: unknown[]) => boolean)(chunk, ...rest)
 }) as typeof process.stderr.write
+
+/**
+ * When this process started. The startup reaper uses it to tell an orphaned
+ * `running` row (created by a process that died) from a row that is live now.
+ */
+const processStart = Date.now()
 
 type ModelHandle = { provider: string; model: string; credentialRef?: string; params?: Record<string, unknown> }
 type ToolSchema = Awaited<ReturnType<RunHandle['services']['tools']['list']>>[number]
@@ -3246,6 +3253,14 @@ const runTurn = async (
     debugLog(`tool inventory unavailable: ${snapshot.listError ?? 'unknown error'}`)
   }
 
+  // The turn's cancellation channel. It is created before the delegation
+  // tool so the child runner receives this very signal: Ctrl-C/Escape aborts
+  // the parent turn and its foreground child together (`cancelled`, not a
+  // 240 s timeout with nobody waiting). Background children do not exist yet;
+  // when they do, they get their own controller and must not be tied to this
+  // one (SUBAGENT-DESIGN-2, 2b — a background child outlives its turn).
+  const controller = new AbortController()
+
   // The delegation tool is rebuilt every turn with a trustworthy snapshot:
   // the ceiling is the `/tools`-enabled module set, child approvals are deny,
   // and the call-only guard re-reads the overlay per child tool call. The
@@ -3259,6 +3274,7 @@ const runTurn = async (
         parent: handle.services.tools,
         snapshot,
         guardCall,
+        signal: controller.signal,
       })
     : handle.services.tools
   const serviceTools = tools.guard(composedTools)
@@ -3310,7 +3326,6 @@ const runTurn = async (
   // candidate buffers.
   const sanitizer = createOutputSanitizer()
   let visible = ''
-  const controller = new AbortController()
   activeAbort = controller
   let result: RunResult
   try {
@@ -3581,6 +3596,12 @@ const oneShot = async (prompt: string, explicitModel: string | undefined, explic
   const model = startModel(explicitModel)
   const config = loadRuntimeConfig({ cwd: process.cwd(), env: process.env, overrides: { live: true } })
   const runtime = await createRuntime(config)
+  // A previous process may have died with a run row still `running`; nothing
+  // else reconciles those. Cheap (one listRuns) and once per process.
+  reapOrphanedRuns(runtime.journal, {
+    processStart,
+    onLine: line => console.error(dim(line)),
+  })
   const tail = createTail()
   const progress = createProgress(tail, view.mode)
   if (view.error !== undefined) progress.print(dim(view.error))
@@ -3737,6 +3758,14 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
   tail.setHeader(buildBanner)
   /** Everything the user sees from here on goes through the tail. */
   const say = (line = ''): void => tail.print(line)
+  // Same startup reaper as `--once`: rows from a dead process are `failed`,
+  // rows this or another live process started after `processStart` are left
+  // alone. It runs before the first turn and reports through the tail, never
+  // `console.log`, so a live session's output stays in one place.
+  reapOrphanedRuns(runtime.journal, {
+    processStart,
+    onLine: line => say(dim(line)),
+  })
   // A corrupt display preference has no security consequence: it resets to
   // medium and names the file once, unlike a corrupt tool policy.
   if (startup.error !== undefined) say(dim(startup.error))

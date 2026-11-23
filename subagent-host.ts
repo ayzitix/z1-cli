@@ -93,6 +93,15 @@ export interface ComposeSubagentOptions {
   readonly snapshot: ToolSnapshot
   /** `ToolStore.guardCall()`: live policy for every child tool call. */
   readonly guardCall: SubagentCallGuard
+  /**
+   * The parent turn's `AbortController.signal`. Aborting it (Ctrl-C, Escape)
+   * cancels that turn's child as a `cancelled` run instead of letting it run
+   * to `timeoutMs` with nobody waiting. This is the v1-consistent behaviour
+   * because v1 children are synchronous: a foreground child cannot outlive
+   * the turn that is waiting for it. A future background child gets its own
+   * signal and must *not* be wired to the parent turn (see SUBAGENT-DESIGN-2).
+   */
+  readonly signal?: AbortSignal
 }
 
 /**
@@ -128,6 +137,8 @@ export async function composeSubagentService(
     approval: denyApprovalService,
     moduleApproval: denyApprovalService,
     guardCall: options.guardCall,
+    // `exactOptionalPropertyTypes`: omit rather than pass `undefined`.
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
   })
   return await withSubagentTool(options.parent, tool, {
     inventory: inventory.installed,
