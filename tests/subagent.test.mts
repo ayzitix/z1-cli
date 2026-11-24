@@ -36,6 +36,12 @@ const args = (enable: readonly string[], disable?: readonly string[]) => ({
   tools: { enable, ...(disable === undefined ? {} : { disable }) },
 })
 
+/**
+ * The v1 blocking call. 2b made background the default, so a test that needs
+ * the child's result in hand (not a launch) opts in explicitly.
+ */
+const waitArgs = (enable: readonly string[]) => ({ ...args(enable), wait: true })
+
 /** Event-only journal: no run recorder, so the package skips run rows. */
 const createJournal = () => {
   const events = new Map<string, unknown[]>()
@@ -256,7 +262,10 @@ const composed = await composeSubagentService({
   snapshot: store.current,
   guardCall,
 })
-const revoked = await composed.call(SUBAGENT_TOOL_NAME, args(['read']))
+// The revoked-tool path, in its v1 blocking form: `wait: true` keeps the
+// child's result on the call, so this test still proves what it was written
+// for (the revoked grant), not the 2b launch.
+const revoked = await composed.call(SUBAGENT_TOOL_NAME, waitArgs(['read']))
 assert.equal((revoked as { output: string }).output, 'child done')
 assert.equal(revokeHost.handles.length, 1)
 assert.equal(revokeHost.handles[0]?.disposed, true, 'the child handle is disposed')
@@ -332,7 +341,9 @@ assert.deepEqual(
   ['read', 'subagent'],
   'the turn service advertises subagent before it is turned off',
 )
-const midResult = await midGuarded.call(SUBAGENT_TOOL_NAME, args(['read']))
+// The child is already running when `/tools off subagent` lands; `wait: true`
+// keeps its result on the call so this still asserts the child path (2b).
+const midResult = await midGuarded.call(SUBAGENT_TOOL_NAME, waitArgs(['read']))
 assert.equal((midResult as { output: string }).output, 'child ran')
 assert.deepEqual(
   midHost.toolCalls.map((call) => call.name),
@@ -446,6 +457,64 @@ for (const call of [
   ...onceHost.beginCalls,
 ]) {
   assert.equal('parentRunId' in call, false, 'child beginRun never carries parentRunId')
+}
+
+// ------------------- `wait: true` at the CLI is still the v1 blocking call
+
+// The brief's "`wait: true` behaves exactly like v1", asserted on the composed
+// service (the layer the CLI actually installs): the call blocks and returns
+// the child's result, it never looks like a launch, and the background hook is
+// not involved at all.
+const finishingLlm = {
+  async chat() {
+    return {
+      message: { role: 'assistant', content: 'child done' },
+      toolCalls: [],
+      stopReason: 'stop',
+    }
+  },
+}
+{
+  const v1Host = createFakeRuntime({ tools: [schema('read')], llm: finishingLlm })
+  const background: unknown[] = []
+  const finished: { runId: string; status: string }[] = []
+  const started: { runId: string; mode?: string }[] = []
+  const service = await composeSubagentService({
+    runtime: v1Host.runtime,
+    model: MODEL,
+    parent: parentService(raw),
+    snapshot: store.current,
+    guardCall,
+    onStart: (start) => {
+      started.push(start)
+    },
+    onFinish: (finish) => {
+      finished.push({ runId: finish.runId, status: finish.status })
+    },
+    onBackground: (launch) => {
+      background.push(launch)
+    },
+  })
+
+  const result = (await service.call(SUBAGENT_TOOL_NAME, waitArgs(['read']))) as Record<string, unknown>
+
+  // The v1 shape: a finished result on the call, never a launch.
+  assert.notEqual(result['status'], 'running', 'a `wait: true` call does not return a launch')
+  assert.equal(result['status'], 'completed', 'it returns the child outcome')
+  assert.equal(result['output'], 'child done', 'with the child text, in hand')
+  assert.equal(result['isError'], false, 'as a non-error result')
+  assert.equal(typeof result['runId'], 'string', 'and the run id')
+  assert.ok('steps' in result, 'plus the v1 fields the tool row reads (`steps`, `elapsedMs`, …)')
+
+  // The hooks: the child is a `wait` row, it ends through `onFinish`, and the
+  // background path is never entered for a blocking call.
+  assert.deepEqual(started.map((entry) => entry.mode), ['wait'], 'the row knows it was a wait call')
+  assert.deepEqual(
+    finished.map((entry) => entry.status),
+    ['completed'],
+    'the end is reported once, through onFinish',
+  )
+  assert.equal(background.length, 0, 'a `wait: true` call never takes the background path')
 }
 
 console.log('subagent tests passed')

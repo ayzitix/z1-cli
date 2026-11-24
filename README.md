@@ -89,6 +89,7 @@ z1 ask "prompt"     # same, explicit
 z1 tools            # names, or name<TAB>disabled|deleted, from installed modules
 z1 run ...          # full SDK CLI (run, tree, fork, memory, module, serve, ...)
 z1 --view compact   # start in a density; also works with --once
+z1 --help           # usage, including the subagent and --once behaviour
 ```
 
 A pipe works too:
@@ -96,6 +97,38 @@ A pipe works too:
 ```bash
 printf 'summarise this repo\n/exit\n' | z1
 ```
+
+## Subagents
+
+The `subagent` tool delegates one task to a child agent with its own tool grant.
+The child's approvals are always denied, and it cannot nest.
+
+**Background is the default.** A `subagent` call returns at once with
+`{ runId, status: "running" }` and the child keeps working after the turn that
+started it has ended. Its answer is not the call's result: it arrives as one
+block, marked as subagent output, at the start of your next message. A child
+that settles during a turn is delivered at the next turn, never mid-turn.
+
+Pass `"wait": true` in the call to block the turn until the child finishes and
+return its result directly — the behaviour before background children existed.
+A background child is not tied to the turn's `Ctrl-C`; `wait: true` is.
+
+| Command | What it does |
+| --- | --- |
+| `/agents` | Opens the agents picker: `↑`/`↓` or a digit selects, `⏎` opens that child's transcript, `x`/`Delete` stops the selected child (staying open), `Esc` closes and leaves the draft untouched. It opens **while a turn runs**, so background work is visible without waiting. Without a terminal it prints the list instead: running first, then finished, each marked `background` or `wait`. |
+| `/agents <n\|runId>` | Opens one child's transcript (read-only). |
+| `/agents stop <n\|runId>` (or `x`) | Cancels a running background child. A finished child is refused; a `wait: true` child is stopped with `Ctrl-C` in its turn. |
+
+`/new` keeps a running child (it belongs to the session, not the conversation);
+`/exit` cancels every running child and waits up to five seconds for them to
+settle before leaving.
+
+With `--once` there is no next turn, so a background child's answer could never
+be delivered. By default `--once` waits for every background child, prints each
+one's final status on stderr, and exits; the exit code is still the main run's.
+Set `Z1_NO_WAIT=1` to leave them running instead: the run ids are printed and
+the process exits at once, and the rows stay `running` until the next start
+reaps them.
 
 ## Configuration
 
@@ -115,6 +148,7 @@ repo.
 | `Z1_SESSIONS_DIR` | Override the session root. Default: the nearest repo’s `z1/`, else `~/.local/share/z1/projects/<name>-<hash>/z1`. |
 | `NO_COLOR` | Disable all colour when set (any value). |
 | `Z1_TRAY=off` | Plain readline UI instead of the pinned tray; also used for pipes. |
+| `Z1_NO_WAIT=1` | `--once` does not wait for background subagents; prints their run ids and exits. Any other value (including unset) keeps the default: wait, report each child's status on stderr, then exit. |
 | `Z1_PINNED=off` | Keep the tray but use normal scrollback instead of the alternate screen. |
 | `Z1_UI_DEBUG` | Append UI debug events to that file path. |
 

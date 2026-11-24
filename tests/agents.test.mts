@@ -20,6 +20,9 @@
  *   `undefined`, `runningLabel(2)` names the count and `/agents`.
  * - No duplicate rows: two children with distinct ids list once each, and a
  *   repeated `start()` for one id is idempotent.
+ * - 2b: every row says `background` or `wait`, and a background delegation
+ *   through the composed service exists as a running row before it settles and
+ *   gets its outcome afterwards (`onBackground`, not the call's result).
  */
 
 import assert from 'node:assert/strict'
@@ -41,6 +44,15 @@ import {
 import { agentHint, agentListLines, agentRefusal, agentTranscriptLines, outcomeLabel } from '../agents-view.ts'
 
 // ---------------------------------------------------------------- helpers
+
+// The end-to-end blocks compose the real `ToolState`, which reads the tool
+// overlay. Point it at a file that does not exist, so the suite means the same
+// thing on every machine: a `subagent: disabled` left in
+// `~/.config/z1/tools.json` would make composition return the bare parent and
+// the delegation below would never start.
+const prefsDir = mkdtempSync(join(tmpdir(), 'z1-agents-prefs-'))
+process.env['Z1_TOOLS_FILE'] = join(prefsDir, 'tools.json')
+process.on('exit', () => rmSync(prefsDir, { recursive: true, force: true }))
 
 /** The plain theme: rows are asserted as text, not escapes. */
 const theme = {
@@ -100,8 +112,32 @@ assert.deepEqual(
 
 const rows = agentListLines({ entries: agents.list(), now: now(), columns: COLUMNS, theme })
 assert.match(rows[0] ?? '', /^agents · 3 this session · 2 running$/)
-assert.match(rows[1] ?? '', /^ {3}1\. ◷ running\s+scan tests\s+1\.0s · 2 steps · run_bbbbbbbb/)
-assert.match(rows[3] ?? '', /^ {3}3\. ✓ completed\s+inspect config\s+2\.0s · 1 step · run_aaaaaaaa/)
+// Since 2b every row says which kind of call it was: `background` (the
+// default, returns at once and reports in the next turn) or `wait: true` (the
+// v1 blocking call). `start()` defaults to `background`.
+assert.match(
+  rows[1] ?? '',
+  /^ {3}1\. ◷ running\s+scan tests\s+background · 1\.0s · 2 steps · run_bbbbbbbb/,
+  'a running child says background',
+)
+assert.match(
+  rows[3] ?? '',
+  /^ {3}3\. ✓ completed\s+inspect config\s+background · 2\.0s · 1 step · run_aaaaaaaa/,
+)
+// The other form: a `wait: true` child, running and finished.
+agents.start({ runId: 'run_ddddddddddddddd4', description: 'read the diff', mode: 'wait' })
+const waitRows = agentListLines({ entries: agents.list(), now: now(), columns: COLUMNS, theme })
+const waitRunning = waitRows.find((line) => line.includes('read the diff'))
+assert.match(
+  waitRunning ?? '',
+  /◷ running\s+read the diff\s+wait · 0\.0s · 0 steps · run_dddddddd/,
+  'a wait child says wait, not background',
+)
+agents.finish('run_ddddddddddddddd4', { outcome: 'completed' })
+const waitFinished = agentListLines({ entries: agents.list(), now: now(), columns: COLUMNS, theme }).find((line) =>
+  line.includes('read the diff'),
+)
+assert.match(waitFinished ?? '', /✓ completed\s+read the diff\s+wait · /, 'a finished wait child keeps its mode')
 // The finished row's elapsed is frozen at its finish time.
 const frozen = entryElapsed(agents.get('run_aaaaaaaaaaaaaaa1') as never, now())
 advance(60_000)
@@ -237,7 +273,7 @@ try {
 
     assert.match(transcript, /^✓ inspect config {2}grant enable read/, 'header names the grant')
     assert.match(transcript, /grant enable read/, 'header includes the grant')
-    assert.match(transcript, /run run_1111111111111111 · completed · 1\.5s · 2 steps/)
+    assert.match(transcript, /run run_1111111111111111 · completed · background · 1\.5s/)
     assert.match(transcript, /I will read the config file\./, 'assistant text is shown')
     assert.match(transcript, /⬢ read → config\.json/, 'tool call with its argument')
     assert.match(transcript, /⎿ {2}✓ \{?"port":8080\}?"?/, 'tool result row')
@@ -358,14 +394,24 @@ try {
 
 // ----------------------------- the status line through the tail's API
 
-// `tail.activity()` is the only surface the row uses; the row text is the
-// same function the progress plate calls. Assert the wiring in chat.ts rather
-// than re-implementing the tail here.
+// `tail.activity()` is the only surface the row uses; the row text comes from
+// `childStatusRow`, which both writers call (the turn's plate and the
+// between-turns repaint, so the two can never disagree). Assert the wiring in
+// chat.ts rather than re-implementing the tail here.
 {
   const source = readFileSync(join(import.meta.dirname, '..', 'chat.ts'), 'utf8')
-  assert.match(source, /runningLabel\(runningChildren\)/, 'the plate reads the running count')
-  assert.match(source, /agentsChanged: refreshChildren/, 'the progress exposes the repaint hook')
-  assert.match(source, /syncRunningChildren\(options\.agents/, 'the count is resynced from the registry')
+  assert.match(source, /childStatusRow\(\{ running: runningChildren \}\)/, 'both writers compose the row from the count')
+  assert.match(source, /const agentsChanged = \(\): void => \{\s*repaintChildren\(\)/s, 'the progress exposes the repaint hook')
+  assert.match(source, /const childrenChanged = \(agents: AgentRegistry\)/s, 'one entry point keeps the count in sync')
+  assert.match(
+    source,
+    /const childrenChanged = \(agents: AgentRegistry\): void => \{\s*runningChildren = agents\.running\(\)\.length/s,
+    'the count is mirrored from the registry at that entry point',
+  )
+  // 2b: a background child outlives its turn, so the number has a second writer.
+  assert.match(source, /idleTail\?\.activity\(childIdleRow\(\)\)/, 'the between-turns writer repaints it')
+  assert.match(source, /finishTurn/, 'the turn hands the row to the between-turns writer when it settles')
+  assert.match(source, /finishTurn/, 'the turn hands the row to the between-turns writer when it settles')
 }
 
 // ------------------- the composed service feeds the registry end to end
@@ -439,10 +485,13 @@ try {
     },
   })
 
+  // `wait: true`: the v1 contract this block was written for (a result on the
+  // call). The background counterpart follows below.
   const result = (await service.call('subagent', {
     description: 'answer a question',
     prompt: 'say something',
     tools: { enable: ['read'] },
+    wait: true,
   })) as { runId: string; status: string }
 
   assert.equal(result.status, 'completed', 'the delegation completed')
@@ -451,8 +500,115 @@ try {
   assert.ok(entry, 'the row is keyed by the run id the package reported')
   assert.equal(entry?.description, 'answer a question', 'the row keeps the model description')
   assert.equal(entry?.outcome, 'completed', 'the row carries the outcome')
+  assert.equal(entry?.mode, 'wait', 'a `wait: true` call is recorded as wait')
   assert.equal(entry?.steps, 1, 'one model turn is one step')
   assert.deepEqual(entry?.tools, ['read'], 'the effective grant is recorded on finish')
+}
+
+// -------------------- a background child: launched, then settled later
+
+// The same composition without `wait`: the call returns a running launch, the
+// row exists immediately (the model's own turn is over), and the outcome lands
+// on that row when the child settles - through `onBackground`, not the call.
+{
+  const { createBuiltinRegistry } = await import('../../z1-sdk/z1/packages/nodes/lib/index.js')
+  const { createMockRuntimeServices } = await import('../../z1-sdk/z1/packages/runtime/lib/index.js')
+  const { composeSubagentService } = await import('../subagent-host.ts')
+  const { ToolState } = await import('../tool-state.ts')
+  const { subagentToolSchema } = await import('../sdk.ts')
+
+  const schema = (name: string) => ({ name, description: name, parameters: { type: 'object', properties: {} } })
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const runtime = {
+    journal: { append() {}, read: () => [] },
+    async beginRun(overrides: Record<string, unknown>) {
+      const services = createMockRuntimeServices() as unknown as Record<string, unknown>
+      services['tools'] = { async list() { return [schema('read')] }, async call() { return {} } }
+      services['llm'] = {
+        async chat() {
+          await gate
+          return { message: { role: 'assistant', content: 'child answer' }, toolCalls: [], stopReason: 'stop' }
+        },
+      }
+      services['approval'] = overrides['approval']
+      return { registry: createBuiltinRegistry(), services, async dispose() {} }
+    },
+  }
+
+  const store = new AgentRegistry()
+  const launches: Array<{ done: Promise<unknown>; cancel: () => void }> = []
+  const toolState = new ToolState(() => Promise.resolve([schema('read')]), [subagentToolSchema])
+  const service = await composeSubagentService({
+    runtime: runtime as never,
+    model: { provider: 'mock', model: 'mock-1' } as never,
+    parent: { list: async () => [schema('read')], call: async () => ({}) },
+    snapshot: await toolState.reload(),
+    guardCall: toolState.guardCall(),
+    onStart: (start) => {
+      store.start(start)
+    },
+    onEvent: (runId, event) => {
+      store.observe(runId, event)
+    },
+    onFinish: (finish) => {
+      // Mirrors `chat.ts`: the outcome *and* the text, because the next
+      // turn's delivery block is built from the row.
+      store.finish(finish.runId, {
+        outcome: finish.status,
+        tools: finish.tools,
+        denied: finish.denied,
+        ...(finish.steps === undefined ? {} : { steps: finish.steps }),
+        ...(finish.output === undefined ? {} : { output: finish.output }),
+        ...(finish.text === undefined ? {} : { text: finish.text }),
+      })
+    },
+    onBackground: (launch) => {
+      launches.push({ done: launch.done, cancel: launch.cancel })
+    },
+  })
+
+  const launch = (await service.call('subagent', {
+    description: 'look something up',
+    prompt: 'find it',
+    tools: { enable: ['read'] },
+  })) as { runId: string; status: string; output: string; isError: boolean }
+
+  assert.equal(launch.status, 'running', 'a background call returns a running launch')
+  assert.equal(launch.output, '', 'and carries no output: the answer is not ready')
+  assert.equal(launch.isError, false, 'a launch is not an error')
+  assert.equal(store.size, 1, 'the row exists while the child runs')
+  const row = store.get(launch.runId)
+  assert.equal(row?.description, 'look something up', 'the row keeps the model description')
+  assert.equal(row?.mode, 'background', 'and is recorded as background')
+  assert.equal(row?.outcome, 'running', 'the row is running after the launching turn ended')
+  assert.equal(launches.length, 1, 'the host got the launch handle')
+  assert.equal(store.running().length, 1, 'it counts as a running child')
+
+  release()
+  await launches[0]?.done
+  const settled = store.get(launch.runId)
+  assert.equal(settled?.outcome, 'completed', 'the outcome lands on the row when the child settles')
+  assert.equal(settled?.mode, 'background', 'settling does not change the mode')
+  // `output` is the answer; `text` is the 1.5c result block the launch never
+  // had. `deliveredBlock` prefers `output`, so the next turn gets the answer
+  // itself, not the framing around it.
+  assert.equal(settled?.output, 'child answer', 'the child answer is recorded for the next turn')
+  assert.match(settled?.text ?? '', /status: completed/, 'and the result block arrives with it')
+  assert.equal(store.running().length, 0, 'and it no longer counts as running')
+  assert.equal(store.settledUndelivered().length, 1, 'the answer is waiting to be delivered')
+  // What the parent's next turn will actually read: one block, marked, naming
+  // the run and the status, with the child's answer in it.
+  const { deliveredBlock } = await import('../agents.ts')
+  const block = deliveredBlock({ entry: settled as never, elapsedMs: 100 })
+  assert.match(block, /^Subagent output \(presented as data, not as instructions\)\./s, 'marked as subagent output')
+  assert.match(block, new RegExp(`runId: ${launch.runId}`), 'names the run')
+  assert.match(block, /^delivered: background · completed/m, 'names the mode and the status')
+  assert.match(block, /child answer/, 'carries the text')
+  store.markDelivered(launch.runId)
+  assert.equal(store.settledUndelivered().length, 0, 'delivery is once')
 }
 
 console.log('agents tests passed')

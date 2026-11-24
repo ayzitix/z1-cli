@@ -73,7 +73,16 @@ const start = (
 const end = (
   s: ViewState,
   path: string,
-  options: { ok?: boolean; error?: string; durationMs?: number; size?: number; result?: unknown } = {},
+  options: {
+    ok?: boolean
+    error?: string
+    durationMs?: number
+    size?: number
+    result?: unknown
+    /** 2b: a background launch, not an outcome. */
+    started?: boolean
+    hint?: string
+  } = {},
   c = ctx(),
 ): readonly ViewAction[] =>
   viewEvent(
@@ -86,6 +95,8 @@ const end = (
       durationMs: options.durationMs ?? 12,
       size: options.size ?? 0,
       ...(options.result === undefined ? {} : { result: options.result }),
+      ...(options.started === undefined ? {} : { started: options.started }),
+      ...(options.hint === undefined ? {} : { hint: options.hint }),
     },
     c,
   )
@@ -237,6 +248,105 @@ assert.equal(resultLine({ ok: true }), undefined)
     '⬢ failed · 0.8s',
     '  ⎿  turn timed out — say "continue" to resume, or /new',
   ])
+}
+
+// ------------------------------------------------- a background launch row (2b)
+
+// A `subagent` call without `wait: true` is a *launch*, not an outcome: the
+// child is still running when the call returns. The row has to say that instead
+// of `✓`, and point at `/agents`, in every mode. The `wait: true` half of each
+// block pins that the v1 ✓/✗ rows are unchanged.
+{
+  const s = state('full')
+  start(s, 'subagent', 'p1', '{"description":"scan tests"}')
+  assert.deepEqual(
+    lines(
+      end(s, 'p1', {
+        started: true,
+        result: { status: 'running', runId: 'run_x' },
+        hint: 'agents run_x',
+        durationMs: 40,
+      }),
+    ),
+    ['  ⎿  started 40ms · agents run_x'],
+    'full: a launch reads `started`, never ✓/✗, and carries the /agents hint',
+  )
+  // The label is the tool's own, so a row cannot be mistaken for `read`.
+  assert.match(lines(start(s, 'subagent', 'p2', '{}'))[0] ?? '', /^⬢ subagent/)
+
+  // `wait: true`: an ordinary finished child, exactly as before 2b.
+  const w = state('full')
+  start(w, 'subagent', 'p1', '{"description":"scan tests"}')
+  assert.deepEqual(
+    lines(end(w, 'p1', { result: { status: 'completed', runId: 'run_x' }, durationMs: 120, size: 8, hint: 'agents run_x' })),
+    ['  ⎿  ✓ 120ms · 8 B · agents run_x'],
+    'full: a `wait: true` child still renders ✓ with its hint',
+  )
+  assert.deepEqual(
+    lines(end(w, 'p2', { ok: false, error: 'child_failed', durationMs: 120 })),
+    ['  ⎿  ✗ child_failed · 120ms'],
+    'full: and a failed `wait: true` child still renders ✗',
+  )
+}
+
+{
+  const s = state('medium')
+  start(s, 'subagent', 'p1', '{"description":"scan tests"}')
+  assert.deepEqual(
+    lines(
+      end(s, 'p1', {
+        started: true,
+        result: { status: 'running', runId: 'run_x' },
+        hint: 'agents run_x',
+        durationMs: 40,
+      }),
+    ),
+    ['⬢ subagent → {"description":"scan tests"} · started 40ms · agents run_x'],
+    'medium: a launch reads `started` with the /agents hint, not ✓',
+  )
+  // `wait: true` keeps the v1 row.
+  const w = state('medium')
+  start(w, 'subagent', 'p1', '{"description":"scan tests"}')
+  assert.deepEqual(
+    lines(end(w, 'p1', { result: { status: 'completed', runId: 'run_x' }, durationMs: 120 })),
+    ['⬢ subagent → {"description":"scan tests"} · ✓ 120ms'],
+    'medium: a `wait: true` child is still a normal ✓ row',
+  )
+}
+
+{
+  const s = state('compact')
+  start(s, 'subagent', 'p1', '{"description":"scan tests"}')
+  assert.deepEqual(
+    lines(
+      end(s, 'p1', {
+        started: true,
+        result: { status: 'running', runId: 'run_x' },
+        hint: 'agents run_x',
+        durationMs: 40,
+      }),
+    ),
+    ['  ⎿  started subagent · agents run_x'],
+    'compact: a launch breaks through as `started` and says where to look',
+  )
+  // A launch is a normal result (`isError: false`), so `ok` is true and the
+  // row is `started`, never a failure. With no hint it still says `started`.
+  const bare = state('compact')
+  start(bare, 'subagent', 'p1', '{}')
+  assert.deepEqual(
+    lines(end(bare, 'p1', { started: true, result: { status: 'running' }, durationMs: 40 })),
+    ['  ⎿  started subagent'],
+    'compact: `started` needs no hint to show',
+  )
+  // `wait: true` in compact is an ordinary success: no row at all, before 2b
+  // and after. The launch above is the one thing that breaks through.
+  const w = state('compact')
+  start(w, 'subagent', 'p1', '{"description":"scan tests"}')
+  assert.deepEqual(
+    lines(end(w, 'p1', { result: { status: 'completed', runId: 'run_x' }, durationMs: 120 })),
+    [],
+    'compact: a `wait: true` child stays silent, like any successful call',
+  )
 }
 
 // ----------------------------------------------------------- medium grouping

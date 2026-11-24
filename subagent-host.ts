@@ -34,9 +34,11 @@ import type {
   SubagentCallGuard,
   SubagentHost,
   SubagentInventory,
+  SubagentLaunch,
   SubagentRunHandle,
   SubagentRunOverrides,
   SubagentTool,
+  SubagentToolResult,
   ToolService,
 } from './sdk.ts'
 import type { ToolSnapshot } from './tool-state.ts'
@@ -121,12 +123,21 @@ export interface ComposeSubagentOptions {
   readonly onStart?: (start: SubagentRunStart) => void
   readonly onEvent?: (runId: string, event: RunEvent) => void
   readonly onFinish?: (finish: SubagentRunFinish) => void
+  /**
+   * A background child was launched (2b). The handle carries the child's own
+   * `done` promise, `cancel()` and `controller`; the host keeps it so the child
+   * can be awaited on `/exit`, stopped on `/agents x`, and delivered at the
+   * next turn.
+   */
+  readonly onBackground?: (launch: SubagentLaunch) => void
 }
 
 /** A child that exists now; the effective grant is not known yet. */
 export interface SubagentRunStart {
   readonly runId: string
   readonly description: string
+  /** How the child was launched: `wait: true` or the 2b background default. */
+  readonly mode?: 'background' | 'wait'
 }
 
 /**
@@ -145,6 +156,12 @@ export interface SubagentRunFinish {
   readonly errorCode?: string
   readonly detail?: string
   readonly steps?: number
+  /** The child's answer, kept for a background child's automated block. */
+  readonly output?: string
+  /** The package's model-facing block for this result. */
+  readonly text?: string
+  /** `true` for a finished background child (its text is delivered later). */
+  readonly background?: boolean
 }
 
 /**
@@ -177,14 +194,50 @@ export async function composeSubagentService(
   // synchronously within that call, so a FIFO of the descriptions handed to
   // `call`, plus the ids already announced, is enough to bind id → label.
   const descriptions: string[] = []
+  // Which mode the call for each description asked for. The package reads
+  // `wait` itself; this only labels the row the model sees (`background` vs
+  // `wait`) and is popped with its description.
+  const modes: ('background' | 'wait')[] = []
   const started = new Set<string>()
-  const announce = (runId: string, description: string): void => {
-    if (started.has(runId)) return
+  /**
+   * What the launching call knew about each child, kept until the child
+   * settles. A background child outlives its call, so this cannot be popped
+   * with the call's stack entry (2b).
+   */
+  const labels = new Map<string, { readonly description: string; readonly mode: 'background' | 'wait' }>()
+  const announce = (
+    runId: string,
+    description: string,
+    mode: 'background' | 'wait',
+  ): { readonly description: string; readonly mode: 'background' | 'wait' } => {
+    const label = { description, mode }
+    labels.set(runId, label)
+    if (started.has(runId)) return label
     started.add(runId)
     try {
-      options.onStart?.({ runId, description })
+      options.onStart?.({ runId, description, mode })
     } catch {
       // Observation only; a broken registry must not fail a child.
+    }
+    return label
+  }
+  /** The child's end, reported once, for `wait: true` and background alike. */
+  const reportFinish = (result: SubagentToolResult, description: string): void => {
+    try {
+      options.onFinish?.({
+        runId: result.runId,
+        description,
+        status: result.status as SubagentRunFinish['status'],
+        tools: result.tools,
+        denied: result.denied,
+        ...(result.errorCode === undefined ? {} : { errorCode: result.errorCode }),
+        ...(result.detail === undefined ? {} : { detail: result.detail }),
+        ...(result.steps === undefined ? {} : { steps: result.steps }),
+        ...(result.output === undefined ? {} : { output: result.output }),
+        text: result.text,
+      })
+    } catch {
+      // Observation only.
     }
   }
   const tool = createSubagentTool({
@@ -203,11 +256,50 @@ export async function composeSubagentService(
     onEvent: (event) => {
       const runId = (event as { runId?: unknown }).runId
       if (typeof runId !== 'string') return
-      announce(runId, descriptions.at(-1) ?? '')
+      announce(runId, descriptions.at(-1) ?? '', modes.at(-1) ?? 'background')
       try {
         options.onEvent?.(runId, event as RunEvent)
       } catch {
         // Observation only; a broken consumer must not fail a child.
+      }
+    },
+    // The background child's handle: the host keeps `done`/`cancel()`; the
+    // text itself is reported once below, through `onFinish`, when it settles.
+    onBackground: (launch) => {
+      const runId = launch.result.runId
+      const label = announce(runId, descriptions.at(-1) ?? '', 'background')
+      // The settling child never returns through `call`, so its end is
+      // reported here: `done` resolves with the same result a `wait: true`
+      // call would have returned, and `onFinish` is what turns the registry
+      // row from `running` into its outcome (2b). Ordering matters: `done`
+      // resolves only after the SDK disposed the child and released its
+      // budget slot, so a host that awaits it sees nothing half-open.
+      launch.done.then(
+        (result) => {
+          reportFinish(result, label.description)
+        },
+        // A child that could not record its own row throws; it never had a
+        // result. Report it as a failure rather than leave the row `running`.
+        (error: unknown) => {
+          reportFinish(
+            {
+              runId,
+              status: 'failed',
+              errorCode: 'child_failed',
+              detail: error instanceof Error ? error.message : String(error),
+              tools: [],
+              denied: [],
+              output: '',
+              text: '',
+            },
+            label.description,
+          )
+        },
+      )
+      try {
+        options.onBackground?.(launch)
+      } catch {
+        // Observation only.
       }
     },
   })
@@ -215,31 +307,31 @@ export async function composeSubagentService(
     schema: tool.schema,
     async call(args: Json) {
       const description = descriptionOf(args)
+      const mode = waitOf(args) ? 'wait' : 'background'
       descriptions.push(description)
+      modes.push(mode)
       try {
         const result = await tool.call(args)
         // A journal-less child, or one that fails before its first event, never
         // reaches the hook above; finishing proves the child existed, so it is
         // announced here too (idempotent through `started`).
-        announce(result.runId, description)
-        try {
-          options.onFinish?.({
-            runId: result.runId,
-            description,
-            status: result.status,
-            tools: result.tools,
-            denied: result.denied,
-            ...(result.errorCode === undefined ? {} : { errorCode: result.errorCode }),
-            ...(result.detail === undefined ? {} : { detail: result.detail }),
-            ...(result.steps === undefined ? {} : { steps: result.steps }),
-          })
-        } catch {
-          // Observation only.
+        announce(result.runId, description, mode)
+        if (result.status !== 'running') {
+          // `wait: true` (or a launch that resolved on an edge): it is a real
+          // result the tool row may render as completed/failed. A background
+          // launch is reported by `onBackground`'s `done` instead.
+          reportFinish(result, description)
         }
         return result
       } finally {
+        // Both stacks are parallel pushes; remove the same description and the
+        // mode that belonged to it. The per-child `labels` map is what a
+        // background child's late report reads, so this is safe.
         const index = descriptions.lastIndexOf(description)
-        if (index >= 0) descriptions.splice(index, 1)
+        if (index >= 0) {
+          descriptions.splice(index, 1)
+          modes.splice(index, 1)
+        }
       }
     },
   }
@@ -254,4 +346,11 @@ function descriptionOf(args: Json): string {
   if (typeof args !== 'object' || args === null) return ''
   const value = (args as { description?: unknown }).description
   return typeof value === 'string' ? value.trim() : ''
+}
+
+/** `wait` interpreted the way the package does: only literal true blocks. */
+function waitOf(args: Json): boolean {
+  if (typeof args !== 'object' || args === null) return false
+  const value = (args as { wait?: unknown }).wait
+  return value === true || value === 'true'
 }

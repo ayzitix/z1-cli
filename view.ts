@@ -49,10 +49,17 @@ export type ViewEvent =
       /** The raw result, for the compact background-process notice. */
       result?: unknown
       /**
-       * An extra, dim tail for this one row (e.g. `/agents run_1a2b` after a
-       * completed `subagent` call). Never a child tool call: the row stays one.
+       * An extra, dim tail for this one row (e.g. `started · /agents` after a
+       * background `subagent` launch). Never a child tool call: the row stays
+       * one line.
        */
       hint?: string
+      /**
+       * The delegating call started a background child. The row then reads
+       * `started` (it is neither `✓` nor `✗`) and names `/agents`; `wait: true`
+       * keeps the ordinary completed/failed row.
+       */
+      started?: boolean
     }
   | { type: 'node.failed'; path: string; error: string }
   | { type: 'run.failed'; error: string }
@@ -295,6 +302,18 @@ const singleFail = (
     ctx,
   )
 
+const singleStarted = (
+  name: string,
+  summary: string | undefined,
+  ms: number,
+  ctx: ViewContext,
+  hint?: string,
+): string =>
+  clipLine(
+    `${callLabel(name, summary, ctx.theme)} ${ctx.theme.dim('·')} ${ctx.theme.cyan('started')} ${ctx.theme.dim(durationLabel(ms))}${hintTail(hint, ctx)}`,
+    ctx,
+  )
+
 const failureDetail = (name: string, error: string, ctx: ViewContext): string =>
   clipLine(
     `  ${ctx.theme.dim('⎿')}  ${ctx.theme.red(`✗ ${name} · ${error}`)}`,
@@ -427,6 +446,14 @@ const endEvent = (state: ViewState, event: Extract<ViewEvent, { type: 'tool.end'
   const error = event.error ?? 'error'
   if (state.mode === 'full') {
     const ms = `${String(event.durationMs)}ms`
+    if (event.started === true) {
+      return [
+        {
+          type: 'line',
+          text: `  ${theme.dim('⎿')}  ${theme.cyan('started')} ${theme.dim(ms)}${hintTail(event.hint, ctx)}`,
+        },
+      ]
+    }
     if (!event.ok) {
       state.shown.add(error)
       return [
@@ -448,6 +475,19 @@ const endEvent = (state: ViewState, event: Extract<ViewEvent, { type: 'tool.end'
       state.shown.add(error)
       return [{ type: 'line', text: failureDetail(name, error, ctx) }]
     }
+    // A background child outlives the turn, like a background process: that is
+    // the second compact break-through, and it says where to look.
+    if (event.started === true) {
+      return [
+        {
+          type: 'line',
+          text: clipLine(
+            `  ${theme.dim('⎿')}  ${theme.cyan(`started ${name}${event.hint === undefined ? '' : ` · ${event.hint}`}`)}`,
+            ctx,
+          ),
+        },
+      ]
+    }
     // A background process outlives the turn: that is the one tool break-through.
     if (name === 'process.start' || name === 'process.kill') {
       const detail = resultLine(event.result)
@@ -462,6 +502,12 @@ const endEvent = (state: ViewState, event: Extract<ViewEvent, { type: 'tool.end'
       ]
     }
     return []
+  }
+  // A background launch is neither done nor failed: it is one `started` row.
+  // It never joins a group (groups are counts of finished calls) and it prints
+  // its `/agents` tail on that one row.
+  if (event.started === true) {
+    return [{ type: 'line', text: singleStarted(name, summary, event.durationMs, ctx, event.hint) }]
   }
   // Medium.
   if (family !== undefined && state.group !== undefined && state.group.family === family) {

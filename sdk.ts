@@ -94,11 +94,13 @@ export type { Runtime, RunHandle, Session, SessionStore, SessionSummary } from '
 export type { ChatMessage, Json, ModelHandle } from '@z1/node'
 export type { ApprovalService, RunEvent, RunResult, ToolService } from '@z1/runtime'
 export type {
+  SubagentBackgroundResult,
   SubagentCallGuard,
   SubagentErrorCode,
   SubagentGrantErrorCode,
   SubagentHost,
   SubagentInventory,
+  SubagentLaunch,
   SubagentRunHandle,
   SubagentRunOverrides,
   SubagentTool,

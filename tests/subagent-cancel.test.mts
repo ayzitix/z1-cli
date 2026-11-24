@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { SqliteJournal } from '../../z1-sdk/z1/packages/journal/lib/index.js'
 import { createBuiltinRegistry } from '../../z1-sdk/z1/packages/nodes/lib/index.js'
@@ -13,6 +13,16 @@ import { subagentToolSchema } from '../sdk.ts'
 import { reapOrphanedRuns } from '../reaper.ts'
 
 // ---------------------------------------------------------------- helpers
+
+// A private overlay, because the suite composes the real `ToolState`. Without
+// this it reads the user's `~/.config/z1/tools.json`, and a machine where
+// `subagent` is `disabled` turns every composition below into the unwrapped
+// parent: the child never starts and the first test times out waiting for it.
+// The overlay is absent, so every tool (including `subagent`) is enabled.
+const prefsDir = mkdtempSync(join(tmpdir(), 'z1-cancel-prefs-'))
+process.env['Z1_TOOLS_FILE'] = join(prefsDir, 'tools.json')
+process.on('exit', () => rmSync(prefsDir, { recursive: true, force: true }))
+
 
 const schema = (name: string) => ({
   name,
@@ -75,7 +85,7 @@ const waitFor = async (predicate: () => boolean, what: string): Promise<void> =>
   throw new Error(`timed out waiting for ${what}`)
 }
 
-// ------------------------------------- parent abort cancels the live child
+// ----------------------- parent abort cancels the live wait child (v1 rule)
 {
   const journal = new SqliteJournal(':memory:')
   try {
@@ -118,7 +128,10 @@ const waitFor = async (predicate: () => boolean, what: string): Promise<void> =>
       signal: parent.signal,
     })
 
-    const pending = composed.call('subagent', args(['read']))
+    // `wait: true`: the turn's own child, wired to the turn's signal. Since 2b
+    // this is the only mode a Ctrl-C stops, because a background child outlives
+    // its turn; the background case follows below.
+    const pending = composed.call('subagent', { ...args(['read']), wait: true })
     // Attach the handler before aborting so the cancellation can never surface
     // as an unhandled rejection.
     const settled = pending.then(
@@ -154,6 +167,66 @@ const waitFor = async (predicate: () => boolean, what: string): Promise<void> =>
   }
 }
 
+// -------- a turn abort does not touch a background child; its own cancel does
+{
+  const journal = new SqliteJournal(':memory:')
+  try {
+    let reads = 0
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const blockingLlm = {
+      async chat() {
+        reads += 1
+        await gate
+        return { message: { role: 'assistant', content: 'child finished' }, toolCalls: [], stopReason: 'stop' }
+      },
+    }
+    const parent = new AbortController()
+    let childRunId: string | undefined
+    const host = createFakeRuntime({ tools: [schema('read')], llm: blockingLlm, journal })
+    const raw = [schema('read')]
+    const store = new ToolState(() => Promise.resolve(raw), [subagentToolSchema])
+    const launches: Array<{ runId: string; done: Promise<unknown>; cancel: () => void }> = []
+    const composed = await composeSubagentService({
+      runtime: host.runtime,
+      model: { provider: 'mock', model: 'mock-1' } as never,
+      parent: { list: async () => raw, call: async () => ({}) },
+      snapshot: await store.reload(),
+      guardCall: store.guardCall(),
+      signal: parent.signal,
+      onBackground: (launch) => {
+        launches.push({ runId: launch.result.runId, done: launch.done, cancel: launch.cancel })
+      },
+    })
+
+    // No `wait`: a background launch, even though the turn has a signal.
+    const launched = (await composed.call('subagent', args(['read']))) as Record<string, unknown>
+    assert.equal(launched['status'], 'running', 'a background launch returns at once')
+    childRunId = String(launched['runId'])
+    await waitFor(() => reads === 1, 'the background child model call')
+    assert.equal(launches.length, 1, 'the host received the launch handle')
+
+    // Ctrl-C on the parent turn: a background child must survive it (2b).
+    parent.abort()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(journal.getRun(childRunId)?.status, 'running', 'a turn abort leaves a background child running')
+    assert.equal(host.handles[0]?.disposed, false, 'and does not dispose its handle')
+
+    // Only its own controller stops it, and that records `cancelled`.
+    launches[0]?.cancel()
+    await launches[0]?.done
+    release()
+    assert.equal(journal.getRun(childRunId)?.status, 'cancelled', 'cancel records cancelled, not failed')
+    assert.equal(host.handles[0]?.disposed, true, 'the cancelled background child is disposed')
+    const types = journal.read(childRunId).map((event) => event.type)
+    assert.ok(types.includes('run.cancelled'), 'the child journaled run.cancelled')
+  } finally {
+    journal.close()
+  }
+}
+
 // ----------------------------- no signal: the child still runs to the end
 {
   const journal = new SqliteJournal(':memory:')
@@ -177,7 +250,9 @@ const waitFor = async (predicate: () => boolean, what: string): Promise<void> =>
       snapshot: await store.reload(),
       guardCall: store.guardCall(),
     })
-    const result = (await composed.call('subagent', args(['read']))) as { status: string }
+    // The v1 contract this block pins: a child with no parent signal still
+    // runs to the end and its result is the call's result (`wait: true`).
+    const result = (await composed.call('subagent', { ...args(['read']), wait: true })) as { status: string }
     assert.equal(result.status, 'completed')
     assert.equal(journal.listRuns()[0]?.status, 'completed')
   } finally {

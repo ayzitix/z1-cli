@@ -35,6 +35,7 @@ import type {
   RunHandle,
   RunResult,
   Runtime,
+  SubagentLaunch,
   Session,
   SessionStore,
   SessionSummary,
@@ -46,14 +47,36 @@ import { ensureWebSearch, stopWebSearch, webSearchStatus } from './web-service.t
 import type { WebStatus } from './web-service.ts'
 import { restArguments, splitCommandAndPrompt, splitUnknownCommand } from './input.ts'
 import { charCells, clip, displayCells, fit, stripAnsi } from './width.ts'
+import {
+  composerRowWithCursor,
+  composerTextWidth,
+  cursorPosition,
+  layoutRows,
+} from './chat-canvas.ts'
+import type { DisplayRow } from './chat-canvas.ts'
 import { createOutputSanitizer, finalizeAssistantReply, sanitizeOutput } from './output.ts'
 import { toolInventoryText } from './tool-inventory.ts'
 import { type ToolState } from './tool-policy.ts'
 import { ToolState as ToolStore } from './tool-state.ts'
 import { composeSubagentService } from './subagent-host.ts'
-import { AgentRegistry, runningLabel } from './agents.ts'
-import { agentListLines, agentRefusal, agentTranscriptLines, agentHint } from './agents-view.ts'
-import type { AgentEventRow } from './agents-view.ts'
+import { AgentRegistry, childStatusRow, deliveredBlock, entryElapsed, runningLabel, shortRunId } from './agents.ts'
+import type { AgentEntry } from './agents.ts'
+import {
+  agentListLines,
+  agentPickerLines,
+  agentPickerMove,
+  agentPickerRepaint,
+  agentPickerStop,
+  agentRefusal,
+  agentTranscriptLines,
+  interceptLine,
+  stopViaPicker,
+} from './agents-view.ts'
+import type { AgentEventRow, AgentPickerNotice, AgentStopOutcome } from './agents-view.ts'
+import { onceDetachLines, oncePolicy, onceStatusLine } from './once-policy.ts'
+import type { OncePolicy } from './once-policy.ts'
+import { stopAgent } from './agents-command.ts'
+import { stopChildrenOnExit } from './exit-policy.ts'
 import { reapOrphanedRuns } from './reaper.ts'
 import {
   compactArgs,
@@ -290,8 +313,6 @@ const terminalRows = (): number => {
   return rows === undefined || rows <= 0 ? 24 : rows
 }
 
-type DisplayRow = { text: string; start: number; end: number }
-
 /** One slash command: the menu, `/help`, dispatch, and Tab all read the same list. */
 interface CommandSpec {
   name: string
@@ -311,59 +332,6 @@ interface CommandSpec {
   rest?: true
   /** Extra `/help` rows under the command, one indented line each. */
   help?: readonly string[]
-}
-
-/**
- * Wrap the draft the way the terminal will: hard breaks at `width` cells, and
- * one row per logical newline. Offsets stay in UTF-16 units, which is what the
- * cursor and String#slice use.
- */
-const layoutRows = (value: string, width: number): DisplayRow[] => {
-  const rows: DisplayRow[] = []
-  const limit = Math.max(1, width)
-  let offset = 0
-  const lines = value.split('\n')
-  lines.forEach((line, lineIndex) => {
-    let rowStart = offset
-    let rowText = ''
-    let cells = 0
-    let charOffset = offset
-    for (const char of line) {
-      const cellsForChar = charCells(char)
-      if (cells > 0 && cells + cellsForChar > limit) {
-        rows.push({ text: rowText, start: rowStart, end: charOffset })
-        rowStart = charOffset
-        rowText = ''
-        cells = 0
-      }
-      rowText += char
-      cells += cellsForChar
-      charOffset += char.length
-    }
-    rows.push({ text: rowText, start: rowStart, end: charOffset })
-    offset = charOffset + (lineIndex < lines.length - 1 ? 1 : 0)
-  })
-  return rows
-}
-
-/** Where the caret sits: row index plus a cell column within that row. */
-const cursorPosition = (rows: readonly DisplayRow[], cursor: number): { row: number; col: number } => {
-  let result = { row: 0, col: 0 }
-  for (let index = 0; index < rows.length; index += 1) {
-    const row = rows[index]!
-    if (cursor < row.start) break
-    if (cursor <= row.end) {
-      result = {
-        row: index,
-        col: displayCells(row.text.slice(0, Math.max(0, cursor - row.start))),
-      }
-      if (cursor === row.end && index + 1 < rows.length && rows[index + 1]!.start === cursor) {
-        result = { row: index + 1, col: 0 }
-      }
-      break
-    }
-  }
-  return result
 }
 
 /** One row of the interactive `/tools` menu. */
@@ -412,6 +380,34 @@ interface ViewMenu {
 }
 
 /**
+ * The `/agents` overlay (2b): a row per child, Enter opens one transcript,
+ * `x`/Delete stops the selected one.
+ *
+ * `entries` is a snapshot the caller refills (`refresh`) whenever the registry
+ * changes, so a child that settles or is stopped repaints in place rather than
+ * showing a stale outline. `notice` is a refusal that keeps the picker open
+ * (`x` on a finished child); any successful action clears it.
+ */
+interface AgentMenu {
+  entries: readonly AgentEntry[]
+  index: number
+  /** Refill the snapshot from the registry (outcome, steps, elapsed). */
+  refresh: () => readonly AgentEntry[]
+  /** Enter: close, then the caller shows that child's transcript. */
+  onOpen: (entry: AgentEntry) => void
+  /** `x`/Delete: the caller runs `stopAgent` and returns what it decided. */
+  onStop: (entry: AgentEntry) => AgentStopOutcome
+  /**
+   * The last `x` on the selected row, kept raw so a later refresh can re-derive
+   * the notice (a child that settles after the press must stop being described
+   * as "stopping").
+   */
+  stop?: AgentStopOutcome
+  /** The line under the title; `undefined` is a clean picker. */
+  notice?: AgentPickerNotice
+}
+
+/**
  * The prompt, drawn the way Claude Code draws it (verified against the
  * recovered `PromptInput` code): a rounded rule above and below the draft, no
  * vertical sides, one footer row whose left side is the most important hint and
@@ -448,6 +444,13 @@ class Composer {
   private sessionsMenu: SessionMenu | undefined
   /** Interactive `/view` picker, independent of the other two. */
   private viewMenu: ViewMenu | undefined
+  /**
+   * Interactive `/agents` picker (2b), independent of the others. It exists in
+   * its own right, not as a transcript print, because a submitted command
+   * queues behind a running turn - and the whole point is to see children while
+   * one runs.
+   */
+  private agentsMenu: AgentMenu | undefined
   private buffer = ''
   private escTimer: NodeJS.Timeout | undefined
   private closed = false
@@ -457,6 +460,11 @@ class Composer {
   private readonly onExit: () => void
   private readonly complete: (value: string, cursor: number) => { value: string; cursor: number; message?: string } | undefined
   private readonly commands: () => readonly CommandSpec[]
+  /**
+   * 2b: a submitted line the composer handles itself, before it can be queued.
+   * Returns `true` when it took the line (an overlay is now open).
+   */
+  private readonly intercept: ((text: string) => boolean) | undefined
   /** Pinned mode only: PgUp/PgDn, wheel and Esc-at-bottom drive the transcript. */
   private readonly scroll: ((kind: ScrollKind) => boolean) | undefined
 
@@ -468,6 +476,7 @@ class Composer {
     complete: (value: string, cursor: number) => { value: string; cursor: number; message?: string } | undefined
     commands: () => readonly CommandSpec[]
     scroll?: (kind: ScrollKind) => boolean
+    intercept?: (text: string) => boolean
   }) {
     this.onChange = options.onChange
     this.onLine = options.onLine
@@ -476,6 +485,7 @@ class Composer {
     this.complete = options.complete
     this.commands = options.commands
     this.scroll = options.scroll
+    this.intercept = options.intercept
     stdin.setRawMode(true)
     stdin.resume()
     stdin.setEncoding('utf8')
@@ -588,6 +598,66 @@ class Composer {
   closeViewMenu(): void {
     if (this.viewMenu === undefined) return
     this.viewMenu = undefined
+    this.changed()
+  }
+
+  /**
+   * Open the `/agents` overlay (2b).
+   *
+   * Unlike the other pickers this one is allowed **while a turn runs**: that is
+   * the defect it exists to fix (a submitted `/agents` queues behind the turn).
+   * It takes the keyboard from the others - exactly one picker owns it - and
+   * leaves the draft alone, so Escape returns the user to the same text.
+   */
+  openAgentsMenu(menu: Omit<AgentMenu, 'index' | 'notice'> & { index?: number }): void {
+    if (this.asking !== undefined) {
+      throw new Error('openAgentsMenu: an approval question is pending; answer or cancel it first')
+    }
+    const entries = menu.entries
+    this.toolsMenu = undefined
+    this.sessionsMenu = undefined
+    this.viewMenu = undefined
+    // A lone Escape still inside its disambiguation window must not be read as
+    // the first press of "clear the draft" once the picker is open.
+    if (this.escTimer !== undefined) {
+      clearTimeout(this.escTimer)
+      this.escTimer = undefined
+    }
+    this.agentsMenu = {
+      entries,
+      index: Math.max(0, Math.min(menu.index ?? 0, Math.max(0, entries.length - 1))),
+      refresh: menu.refresh,
+      onOpen: menu.onOpen,
+      onStop: menu.onStop,
+    }
+    this.changed()
+  }
+
+  /** Hide the overlay without touching the draft or any child. */
+  closeAgentsMenu(): void {
+    if (this.agentsMenu === undefined) return
+    this.agentsMenu = undefined
+    this.changed()
+  }
+
+  /** True while the `/agents` overlay owns the keyboard. */
+  get agentsMenuOpen(): boolean {
+    return this.agentsMenu !== undefined
+  }
+
+  /**
+   * Repaint an open `/agents` overlay from the registry. Called when a child
+   * starts, steps or settles, so the list is live while it is on screen.
+   *
+   * The notice is re-derived here rather than cached: a stop is only a request,
+   * so the child may end `failed` or `timeout` after the press, and "stopping …"
+   * beside a finished row would be wrong. `agentPickerNotice` is the one place
+   * that decides what to say for the row now under the pointer.
+   */
+  refreshAgentsMenu(): void {
+    const menu = this.agentsMenu
+    if (menu === undefined) return
+    this.agentsMenu = { ...menu, ...agentPickerRepaint(menu, menu.refresh()) }
     this.changed()
   }
 
@@ -806,6 +876,20 @@ class Composer {
 
   private keyChar(char: string): void {
     const code = char.charCodeAt(0)
+    if (this.agentsMenu !== undefined) {
+      // The overlay owns the keyboard: typing cannot edit the draft under it.
+      if (code === 13) return this.openAgentNow()
+      if (code === 3) return this.ctrlC()
+      if (code === 4) return this.ctrlD()
+      if (code === 14 && this.agentStep(1)) return
+      if (code === 16 && this.agentStep(-1)) return
+      // `x`, and Mac's key labelled Delete (0x7f) which is Backspace elsewhere.
+      const lower = char.toLowerCase()
+      if (lower === 'x') return this.stopAgentNow()
+      const digit = /^[1-9]$/.test(lower) ? Number(lower) : undefined
+      if (digit !== undefined && this.agentSelect(digit)) return
+      return
+    }
     if (this.viewMenu !== undefined) {
       // The picker owns the keyboard. Digits and letters apply immediately; the
       // three-row scale is faster to pick than to arrow through.
@@ -870,6 +954,21 @@ class Composer {
   }
 
   private key(name: string): void {
+    if (this.agentsMenu !== undefined) {
+      // The overlay owns the keyboard; the draft below never moves or edits.
+      switch (name) {
+        case 'up': return void this.agentStep(-1)
+        case 'down': return void this.agentStep(1)
+        case 'home': return void this.agentSelect(1)
+        case 'end': return void this.agentSelect(this.agentsMenu.entries.length)
+        case 'delete': return this.stopAgentNow()
+        case 'backspace': return this.stopAgentNow()
+        case 'escape': return this.escape()
+        case 'pageup': return void this.scroll?.('pageUp')
+        case 'pagedown': return void this.scroll?.('pageDown')
+        default: return
+      }
+    }
     if (this.viewMenu !== undefined) {
       switch (name) {
         case 'up': return void this.viewStep(-1)
@@ -925,6 +1024,12 @@ class Composer {
   }
 
   private escape(): void {
+    if (this.agentsMenu !== undefined) {
+      // Closing is the whole action: the draft is left byte-identical, and the
+      // next Escape is not the first press of "clear the draft".
+      this.closeAgentsMenu()
+      return
+    }
     if (this.viewMenu !== undefined) {
       // Closing is the whole action: the next Escape must not be read as the
       // first press of "clear the draft".
@@ -1042,6 +1147,10 @@ class Composer {
   private submit(): void {
     if (this.asking !== undefined) {
       this.endAsk(this.value)
+      return
+    }
+    if (this.agentsMenu !== undefined) {
+      this.openAgentNow()
       return
     }
     if (this.viewMenu !== undefined) {
@@ -1165,6 +1274,73 @@ class Composer {
     return true
   }
 
+  /** The highlighted `/agents` row, or `undefined` for an empty list. */
+  private selectedAgent(): AgentEntry | undefined {
+    const menu = this.agentsMenu
+    if (menu === undefined || menu.entries.length === 0) return undefined
+    return menu.entries[Math.max(0, Math.min(menu.index, menu.entries.length - 1))]
+  }
+
+  /**
+   * Repoint the picker and drop the previous row's stop report.
+   *
+   * Moving to another row drops it: the notice describes one child, and must
+   * not appear to describe the new selection. `agentPickerMove` both clears
+   * `stop` and recomputes the notice, so a later repaint cannot resurrect the
+   * old line - the rule lives in one tested pure function, not here.
+   */
+  private moveAgentPointer(index: number): boolean {
+    const menu = this.agentsMenu
+    if (menu === undefined || menu.entries.length === 0) return false
+    this.agentsMenu = { ...menu, ...agentPickerMove(menu, index) }
+    this.changed()
+    return true
+  }
+
+  /** `↑`/`↓`: move the pointer, wrapping. */
+  private agentStep(delta: number): boolean {
+    const menu = this.agentsMenu
+    if (menu === undefined || menu.entries.length === 0) return false
+    return this.moveAgentPointer((menu.index + delta + menu.entries.length) % menu.entries.length)
+  }
+
+  /** A digit (1-based row) or Home/End: select that row directly. */
+  private agentSelect(oneBased: number): boolean {
+    return this.moveAgentPointer(oneBased - 1)
+  }
+
+  /** Enter: close first, then the caller shows that child's transcript. */
+  private openAgentNow(): void {
+    const menu = this.agentsMenu
+    const entry = this.selectedAgent()
+    if (menu === undefined) return
+    this.agentsMenu = undefined
+    this.changed()
+    if (entry !== undefined) menu.onOpen(entry)
+  }
+
+  /**
+   * `x`/Delete: stop the selected child and **stay open**, so the row's state
+   * change is what the user sees. Every outcome leaves a notice inside the
+   * picker - a refusal with its reason (the only place a `wait` child's Ctrl-C
+   * advice can appear) and an accepted stop with its confirmation. A child that
+   * settles after the press has its notice replaced by what actually happened.
+   */
+  private stopAgentNow(): void {
+    const menu = this.agentsMenu
+    const entry = this.selectedAgent()
+    if (menu === undefined) return
+    if (entry === undefined) return
+    const outcome = menu.onStop(entry)
+    // `onStop` may have finished a child and rebuilt the snapshot; reload so the
+    // row reflects it rather than the entries captured when the picker opened.
+    // The raw outcome is stored and the notice derived by the pure helper, so a
+    // later repaint can replace "stopping …" with what actually happened.
+    const repainted = agentPickerRepaint(menu, menu.refresh())
+    this.agentsMenu = { ...menu, ...agentPickerStop(repainted, outcome) }
+    this.changed()
+  }
+
   /** Enter: close the picker first, then hand the mode to the command layer. */
   private selectViewNow(): void {
     const menu = this.viewMenu
@@ -1185,9 +1361,25 @@ class Composer {
   }
 
   /** Send the draft as one turn, leaving the composer ready for the next one. */
+  /**
+   * Submit the draft, or hand a line the composer owns to an overlay.
+   *
+   * This is where `/agents` is intercepted for 2b. A submitted line normally
+   * goes to `onLine`, which queues it while a turn runs - and a command that
+   * prints to the transcript would then only appear after the turn. `intercept`
+   * runs *here*, synchronously, before the line ever reaches that queue: the
+   * command can open its overlay immediately, exactly like pressing a key, and
+   * returning `true` means "handled - do not submit".
+   */
   private submitText(): void {
     const text = this.value
     if (text.trim().length === 0) return
+    if (this.intercept !== undefined && this.intercept(text)) {
+      // The overlay replaces the draft exactly as a submitted command does.
+      this.clearDraft()
+      this.changed()
+      return
+    }
     this.history.push(text)
     if (this.history.length > 200) this.history.shift()
     this.historyIndex = -1
@@ -1306,6 +1498,36 @@ class Composer {
   }
 
   /**
+   * The `/agents` overlay (2b): a title with counts, one optional refusal line,
+   * then a scrolling window of rows from the pure `agentPickerLines`. It reuses
+   * the pointer/selection accent of the other pickers and adds no box.
+   */
+  private renderAgentsMenu(columns: number): string[] {
+    const menu = this.agentsMenu
+    if (menu === undefined) return []
+    // Leave room for the title, the notice, the composer and the tray; a 24-row
+    // terminal must still show the title and one row.
+    const maxRows = Math.max(1, Math.min(menu.entries.length, terminalRows() - 12))
+    let start = Math.max(0, menu.index - Math.floor(maxRows / 2))
+    start = Math.min(start, Math.max(0, menu.entries.length - maxRows))
+    const visible: readonly AgentEntry[] =
+      menu.entries.length <= maxRows ? menu.entries : menu.entries.slice(start, start + maxRows)
+    // `firstIndex` keeps each row's absolute number (`/agents <n>` takes it) even
+    // when the window is scrolled.
+    return [
+      ...agentPickerLines({
+        entries: visible,
+        firstIndex: start,
+        index: menu.index - start,
+        now: Date.now(),
+        columns,
+        theme: viewTheme,
+        ...(menu.notice === undefined ? {} : { notice: menu.notice }),
+      }),
+    ]
+  }
+
+  /**
    * The `/tools` picker: a title with counts, an optional delete confirmation,
    * then a scrolling window of `on/off/del` rows. It reuses the slash menu's
    * pointer and selection colours so the two read as one control.
@@ -1380,7 +1602,12 @@ class Composer {
   }
 
   private insert(text: string): void {
-    if (this.toolsMenu !== undefined || this.sessionsMenu !== undefined || this.viewMenu !== undefined) return
+    if (
+      this.toolsMenu !== undefined ||
+      this.sessionsMenu !== undefined ||
+      this.viewMenu !== undefined ||
+      this.agentsMenu !== undefined
+    ) return
     const clean = text.replace(/\r\n?/g, '\n').replace(/\t/g, '  ').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
     if (clean.length === 0) return
     this.value = `${this.value.slice(0, this.cursor)}${clean}${this.value.slice(this.cursor)}`
@@ -1484,7 +1711,7 @@ class Composer {
   }
 
   private vertical(delta: number): void {
-    const rows = layoutRows(this.value, Math.max(1, terminalColumns() - 2))
+    const rows = layoutRows(this.value, composerTextWidth(terminalColumns()))
     if (rows.length <= 1) {
       if (delta < 0) this.historyPrev()
       else this.historyNext()
@@ -1544,9 +1771,44 @@ class Composer {
     this.onChange()
   }
 
+  /**
+   * The footer's left hint.
+   *
+   * Precedence, highest first, and why:
+   *
+   * 1. an open `ask` (an approval) - it is a question only the user can answer;
+   * 2. an open picker - it owns the keyboard, so its keys are what to show;
+   * 3. an armed confirm (`esc again to clear`, `press ctrl+c again to exit`) -
+   *    it describes what the *next* press does, and the user has to be able to
+   *    see that they are one key from losing their draft or the session;
+   * 4. a notice - a one-off result the user just caused;
+   * 5. the slash menu's own keys when it is open;
+   * 6. **the running-agents line** - 2b. It outranks `esc to interrupt` and
+   *    `? for shortcuts` because the user asked to see background work whenever
+   *    a child runs: `esc to interrupt` describes *this turn*, not the children,
+   *    and interrupt still works - only the hint yields. It is also shown while
+   *    idle (between turns), where `? for shortcuts` used to be;
+   * 7. `esc to interrupt` / `N queued · esc to interrupt` while a turn runs;
+   * 8. the argument hint (`usage: /model …`) when the draft is a bare command;
+   * 9. `esc to clear` for a non-empty draft, then `? for shortcuts`.
+   *
+   * The argument hint sits *below* the running line on purpose: it repeats the
+   * `usage:` line the command itself prints, while a running child is live
+   * state that changes on its own. Everything after 6 has a draft or a turn
+   * meaning, and none of it is urgent enough to hide live work.
+   */
   private hint(menuOpen: boolean): string {
     if (this.asking !== undefined) return this.asking.label
     if (this.viewMenu !== undefined) return '↑↓ · ⏎ apply · 1/2/3 · esc'
+    if (this.agentsMenu !== undefined) {
+      // The footer must not offer `x stop` when the row cannot be stopped: a
+      // settled row has nothing to stop, and a refused press has just said why.
+      // An accepted stop on a still-running child keeps offering `x` (a second
+      // press is refused harmlessly, and the notice already names the stop).
+      const selected = this.selectedAgent()
+      const stoppable = selected !== undefined && selected.outcome === 'running'
+      return stoppable ? '↑↓ · ⏎ open · x stop · esc' : '↑↓ · ⏎ open · esc'
+    }
     if (this.sessionsMenu !== undefined) return '↑↓ · ⏎ switch · r rename · d delete · esc'
     if (this.toolsMenu !== undefined) {
       return this.toolsMenu.confirmDelete !== undefined
@@ -1559,6 +1821,9 @@ class Composer {
     if (confirm !== undefined) return confirm === 'exit' ? 'press ctrl+c again to exit' : 'esc again to clear'
     if (this.notice !== undefined && Date.now() < this.notice.until) return this.notice.text
     if (menuOpen) return '↑↓ select · ⏎ run · esc close'
+    // 2b: live background work, in the slot `? for shortcuts` used to take.
+    const running = runningLabel(runningChildren)
+    if (running !== undefined) return running
     if (this.busy) return pendingLines.length > 0 ? `${String(pendingLines.length)} queued · esc to interrupt` : 'esc to interrupt'
     if (this.value.length > 0) return this.argumentHint() ?? 'esc to clear'
     return '? for shortcuts'
@@ -1581,6 +1846,7 @@ class Composer {
     const viewLines = this.renderViewMenu(width)
     const toolLines = this.renderToolMenu(width)
     const sessionLines = this.renderSessionMenu(width)
+    const agentLines = this.renderAgentsMenu(width)
     // The composer is a full sharp box: top/bottom rules and vertical sides.
     // It is accented only while the field is active (idle, asking, or a draft
     // is being edited); during a run with an empty draft it stays dim.
@@ -1588,7 +1854,7 @@ class Composer {
     // brighter edge that would read as a bold outline.
     const leftEdge = dim('│')
     const rightEdge = dim('│')
-    const textWidth = Math.max(1, width - 4)
+    const textWidth = composerTextWidth(width)
     const rows = layoutRows(this.value, textWidth)
     const position = cursorPosition(rows, this.cursor)
     const maxVisible = Math.max(3, Math.min(12, terminalRows() - 8))
@@ -1598,9 +1864,30 @@ class Composer {
       start = Math.max(0, Math.min(rows.length - maxVisible, position.row - half))
     }
     const visible = rows.slice(start, start + maxVisible)
-    const input: string[] = visible.map((row) => `${leftEdge} ${padTo(row.text, textWidth)} ${rightEdge}`)
+    // 2b/UX: a visible cursor block at the draft caret. It is drawn *into* the
+    // row, so a wrap and a CJK line are the wrap helper's answer, not a second
+    // width calculation. An overlay owns the keyboard, so no block is drawn for
+    // it - the terminal's own caret is all the user needs there.
+    const overlayOwnsKeyboard =
+      this.agentsMenu !== undefined ||
+      this.toolsMenu !== undefined ||
+      this.sessionsMenu !== undefined ||
+      this.viewMenu !== undefined ||
+      this.asking !== undefined
+    const cursorIndex = overlayOwnsKeyboard ? -1 : position.row - start
+    const steady = this.busy
+    const input: string[] = visible.map((row, offset) =>
+      offset === cursorIndex
+        ? `${leftEdge} ${composerRowWithCursor({ row, cursor: this.cursor, cells: textWidth, steady })} ${rightEdge}`
+        : `${leftEdge} ${padTo(row.text, textWidth)} ${rightEdge}`,
+    )
     if (this.value.length === 0) {
-      input[0] = `${leftEdge} ${padTo(dim('Ask z1…'), textWidth)} ${rightEdge}`
+      // An empty draft still shows where typing goes: the block sits on the
+      // placeholder, which is the one thing the old empty box never did.
+      input[0] =
+        cursorIndex === 0
+          ? `${leftEdge} ${composerRowWithCursor({ row: { text: '', start: 0, end: 0 }, cursor: 0, cells: textWidth, steady })} ${rightEdge}`
+          : `${leftEdge} ${padTo(dim('Ask z1…'), textWidth)} ${rightEdge}`
     }
     const rule = (left: string, right: string): string =>
       dim(`${left}${'─'.repeat(Math.max(0, width - 2))}${right}`)
@@ -1628,7 +1915,17 @@ class Composer {
         footer += `${' '.repeat(Math.max(0, available - stripAnsi(left).length - stripAnsi(rightText).length))}${rightText}`
       }
     }
-    const lines = [...sessionLines, ...toolLines, ...viewLines, ...menuLines, header, ...input, footerRule, dim(footer)]
+    const lines = [
+      ...sessionLines,
+      ...toolLines,
+      ...viewLines,
+      ...agentLines,
+      ...menuLines,
+      header,
+      ...input,
+      footerRule,
+      dim(footer),
+    ]
     const key = [
       this.value,
       String(this.cursor),
@@ -1640,6 +1937,10 @@ class Composer {
       viewLines.join('\n'),
       toolLines.join('\n'),
       sessionLines.join('\n'),
+      agentLines.join('\n'),
+      this.agentsMenu === undefined
+        ? ''
+        : `${String(this.agentsMenu.index)}:${this.agentsMenu.notice?.text ?? ''}`,
       this.sessionsMenu === undefined
         ? ''
         : `${String(this.sessionsMenu.index)}:${this.sessionsMenu.label}`,
@@ -1652,7 +1953,13 @@ class Composer {
     return {
       lines,
       cursorRow:
-        sessionLines.length + toolLines.length + viewLines.length + menuLines.length + 1 + (position.row - start),
+        sessionLines.length +
+        toolLines.length +
+        viewLines.length +
+        agentLines.length +
+        menuLines.length +
+        1 +
+        (position.row - start),
       cursorCol: 2 + position.col,
       key,
     }
@@ -2451,7 +2758,36 @@ interface Progress {
    * the transient "N subagents running" row; a no-op when nothing changed.
    */
   agentsChanged(): void
+  /**
+   * The turn that owns this progress is over (or never started painting). After
+   * this the between-turns writer owns the child row, so a late
+   * `agentsChanged()` (a background child settling between turns) must not
+   * paint through a finished turn's plate.
+   */
+  finishTurn(): void
 }
+
+/**
+ * One automated block from a settled child for the parent's next turn (2b).
+ *
+ * It is a `user`-role message on purpose: the transcript has no other role for
+ * host-authored text, and it keeps the model's own assistant turns intact. The
+ * body (`deliveredBlock`) is marked as subagent output, names the run, and
+ * neutralises the child's text exactly like the 1.5c tool result, so a child
+ * cannot forge a system or tool message through it.
+ */
+const deliveryMessage = (body: string): ChatMessage => ({ role: 'user', content: body })
+
+/**
+ * Take every settled background child that has not been delivered yet, oldest
+ * first. The caller builds one block per entry and marks them delivered once the
+ * turn has them in its seed.
+ *
+ * A running child is never taken (it has no answer), and a `wait: true` child
+ * never is either (it already answered its launching call); `settledUndelivered`
+ * filters both.
+ */
+const drainSettled = (agents: AgentRegistry): readonly AgentEntry[] => agents.settledUndelivered()
 
 
 /**
@@ -2706,8 +3042,10 @@ const createProgress = (tail: Tail, mode: ViewMode): Progress => {
     const label = viewActivity(state, ctx())
     // The child row is not a spinner: it stays while any child runs and is a
     // plain sentence (`◷ 2 subagents running · /agents`), appended under the
-    // plate when there is one. Reusing `tail.activity()` is the whole point.
-    const children = runningLabel(runningChildren)
+    // plate when there is one. Both writers compose it with `childStatusRow`,
+    // so the plate and the between-turns row cannot disagree. Reusing
+    // `tail.activity()` is the whole point.
+    const children = childStatusRow({ running: runningChildren })
     const childRow = children === undefined ? undefined : dim(children)
     if (label === undefined) {
       tail.activity(childRow)
@@ -2718,6 +3056,9 @@ const createProgress = (tail: Tail, mode: ViewMode): Progress => {
 
   const working = (label: string): void => {
     stopSpinner()
+    // A new turn takes the child row back from the between-turns writer: in
+    // compact/medium the plate is the painter from here on.
+    if (mode !== 'full' && tail.live) turnPainter = renderPlate
     if (mode === 'full') {
       if (!tail.live) {
         // No cursor tricks without the tail: the label is just a line.
@@ -2735,6 +3076,7 @@ const createProgress = (tail: Tail, mode: ViewMode): Progress => {
     // Compact/medium: the plate is the turn's only status, so it lives until
     // settle. Without a tail there is nowhere to draw it.
     if (!tail.live) return
+    turnPainter = renderPlate
     renderPlate()
     spinner = setInterval(() => {
       frame = (frame + 1) % frames.length
@@ -2841,12 +3183,20 @@ const createProgress = (tail: Tail, mode: ViewMode): Progress => {
           markdown?.flush()
           const result = incoming.outputs['result']
           const ok = incoming.outputs['isError'] !== true
-          // One compact row per delegation: the hint points at the read view
-          // instead of inlining the child's tool calls into this transcript.
+          // One compact row per delegation. A background launch (2b) is not an
+          // outcome: its row reads `started · /agents` and carries no duration
+          // and no payload. A `wait: true` call keeps the v1 ✓/✗ row.
           const started = state.calls.get(call[1] as string)
+          const launched =
+            started?.name === SUBAGENT_TOOL_NAME &&
+            typeof result === 'object' &&
+            result !== null &&
+            (result as { status?: unknown }).status === 'running'
           const runId = (result as { runId?: unknown } | undefined)?.runId
           const hint =
-            started?.name === SUBAGENT_TOOL_NAME && typeof runId === 'string' ? agentHint(runId) : undefined
+            started?.name === SUBAGENT_TOOL_NAME && typeof runId === 'string'
+              ? `agents ${shortRunId(runId)}`
+              : undefined
           applyEvent(
             viewEvent(
               state,
@@ -2859,6 +3209,7 @@ const createProgress = (tail: Tail, mode: ViewMode): Progress => {
                 size: resultSize(result),
                 result,
                 ...(hint === undefined ? {} : { hint }),
+                ...(launched ? { started: true } : {}),
               },
               ctx(),
             ),
@@ -2890,38 +3241,74 @@ const createProgress = (tail: Tail, mode: ViewMode): Progress => {
   }
 
   /**
-   * Children started or finished during this turn. The spinner is the only
-   * writer on a live terminal, so a running turn repaints through it; without
-   * a spinner (a pipe, or full mode between rows) there is no transient row to
-   * update and nothing is printed.
+   * Children started, stepped or finished. While the plate is live it owns the
+   * row and repaints; otherwise (`full`, a pipe, or a settled turn) the
+   * between-turns writer does, because a background child outlives its turn.
    */
-  const refreshChildren = (): void => {
-    if (!tail.live || mode === 'full' || spinner === undefined) return
-    renderPlate()
+  const agentsChanged = (): void => {
+    repaintChildren()
   }
 
-  return { working, print, stream, event, settle, closeLine, agentsChanged: refreshChildren }
+  /**
+   * The turn is over: hand the child row to the between-turns writer. Called
+   * after `settle`, so a finished turn does not leave the plate's row behind
+   * and a background child that is still live keeps being shown.
+   */
+  const finishTurn = (): void => {
+    turnPainter = undefined
+    idleTail?.activity(childIdleRow())
+  }
+
+  return { working, print, stream, event, settle, closeLine, agentsChanged, finishTurn }
 }
 
 /** Abort channel of the turn that is currently running, if any. */
 let activeAbort: AbortController | undefined
 
 /**
- * Children currently running in this session, for the transient row under the
- * tail. The registry is the source; this is the counter the progress plate
- * reads, so `createProgress` needs no registry handle and a finished turn
- * cannot leave a stale row behind.
+ * The transient child row (`◷ 2 subagents running · /agents`) has two writers
+ * (2b) and they must never fight:
  *
- * 2b must rework this: a background child outlives the turn, so the count
- * cannot be reset by `runTurn` and `refreshChildren` must repaint while no
- * turn is running (the plate is only live during one). v1 children are
- * foreground, so "no child outlives its turn" holds for now.
+ * - the turn's plate, while a turn runs in compact/medium (its spinner is the
+ *   turn's status) - `turnPainter` is that plate's `renderPlate`;
+ * - the between-turns writer: a background child outlives its turn, so the row
+ *   has to survive `settle()` and be repainted when a child starts or ends
+ *   between prompts - `idleTail` is the tail and `childIdleRow()` the row.
+ *
+ * Both compose the row with `childStatusRow`, so they cannot disagree, and
+ * `childrenChanged` is the one entry point that decides who paints.
  */
 let runningChildren = 0
+let turnPainter: (() => void) | undefined
+let idleTail: Tail | undefined
 
-/** Mirror the registry's running count into the plate's counter. */
-const syncRunningChildren = (agents: AgentRegistry): void => {
+/**
+ * Mirror the registry's running count and repaint whichever writer owns the
+ * row. Called from the delegation hooks (launch, step, settle) and from the
+ * command handlers, so a child started between turns appears at once.
+ */
+const childrenChanged = (agents: AgentRegistry): void => {
   runningChildren = agents.running().length
+  // An open `/agents` overlay is a live view: a child that starts, steps or
+  // settles while it is on screen repaints in place (2b, and the reason the
+  // overlay exists: it is opened *while* a turn runs).
+  if (activeComposer?.agentsMenuOpen === true) activeComposer.refreshAgentsMenu()
+  repaintChildren()
+}
+
+/** Repaint with the count already in sync (the settle path has no registry call). */
+const repaintChildren = (): void => {
+  if (turnPainter !== undefined) {
+    turnPainter()
+    return
+  }
+  idleTail?.activity(childIdleRow())
+}
+
+/** The row while no turn runs; `undefined` to clear it. */
+const childIdleRow = (): string | undefined => {
+  const row = childStatusRow({ running: runningChildren })
+  return row === undefined ? undefined : dim(row)
 }
 
 let closed = false
@@ -3120,13 +3507,19 @@ const COMMANDS: readonly CommandSpec[] = [
   },
   { name: '/context', description: 'show context usage' },
   // Same shape as `/sessions`: no `args`, so Enter on a bare `/agents` lists
-  // instead of completing. `handleAgents` parses `<n|runId>`.
+  // instead of completing. `handleAgents` parses `<n|runId>` and the verbs.
   {
     name: '/agents',
-    description: 'subagents this session started; open one by number or id',
-    usage: '/agents [<n|runId>]',
+    description: 'background subagents; list them, open one, or stop one',
+    usage: '/agents [<n|runId> | stop|x <n|runId>]',
     rest: true,
-    help: ['bare lists running first, then finished', '<n> or <runId> opens its transcript (read-only)'],
+    help: [
+      'a subagent call runs in the background by default; `wait: true` blocks',
+      'bare opens the agents picker (↑↓ · ⏎ transcript · x stop · esc), even mid-turn;',
+      '  without a terminal it prints the list: running first, then finished',
+      '<n> or <runId> opens its transcript (read-only)',
+      'stop <n|runId> (or x <n|runId>) cancels a running child',
+    ],
   },
   // Same shape as `/tools`: no `args`, so Enter on a bare `/sessions` lists
   // instead of completing. `handleSessions` parses the sub-grammar.
@@ -3320,10 +3713,10 @@ const runTurn = async (
 
   // The turn's cancellation channel. It is created before the delegation
   // tool so the child runner receives this very signal: Ctrl-C/Escape aborts
-  // the parent turn and its foreground child together (`cancelled`, not a
-  // 240 s timeout with nobody waiting). Background children do not exist yet;
-  // when they do, they get their own controller and must not be tied to this
-  // one (SUBAGENT-DESIGN-2, 2b — a background child outlives its turn).
+  // the parent turn and its `wait: true` child together (`cancelled`, not a
+  // 240 s timeout with nobody waiting). A *background* child gets its own
+  // controller inside `@z1/subagent` (`onBackground` → `launch.cancel`) and is
+  // deliberately not wired to this one: it outlives its turn (2b).
   const controller = new AbortController()
 
   // The delegation tool is rebuilt every turn with a trustworthy snapshot:
@@ -3332,6 +3725,18 @@ const runTurn = async (
   // parent `guard` stays outermost so `/tools off subagent` also revokes the
   // composite name before a child can start.
   const guardCall = tools.guardCall()
+  // This turn's children (2b). Every launch goes through the session registry,
+  // which is also what the next turn delivers and `/exit` stops.
+  const agents = options.agents
+  // 2b delivery: a background child's output reaches the parent here, once, at
+  // the start of a turn - never mid-turn, never as the launching call's tool
+  // result. Only children settled *before* this point are drained, so a child
+  // that finishes while this turn runs waits for the next one.
+  const delivered = agents === undefined ? [] : drainSettled(agents)
+  const historyWithDelivery: readonly ChatMessage[] =
+    delivered.length === 0
+      ? history
+      : [...history, ...delivered.map((entry) => deliveryMessage(deliveredBlock({ entry, elapsedMs: entryElapsed(entry, Date.now()) })))]
   const composedTools = snapshot.inventoryKnown
     ? await composeSubagentService({
         runtime,
@@ -3340,16 +3745,45 @@ const runTurn = async (
         snapshot,
         guardCall,
         signal: controller.signal,
-        ...(options.agents === undefined
+        ...(agents === undefined
           ? {}
           : {
-              onStart: (start: { runId: string; description: string }) => {
-                options.agents?.start(start)
-                syncRunningChildren(options.agents as AgentRegistry)
-                progress.agentsChanged()
+              onStart: (start: {
+                runId: string
+                description: string
+                mode?: 'background' | 'wait'
+              }) => {
+                agents.start({
+                  runId: start.runId,
+                  description: start.description,
+                  ...(start.mode === undefined ? {} : { mode: start.mode }),
+                })
+                childrenChanged(agents)
               },
               onEvent: (runId: string, event: RunEvent) => {
-                options.agents?.observe(runId, event)
+                agents.observe(runId, event)
+                // A step is a live count in `/agents`; repaint so the status
+                // row and any open list stay honest while the child works.
+                if (event.type === 'node.started') childrenChanged(agents)
+              },
+              onBackground: (launch: SubagentLaunch) => {
+                // The row exists from `onStart`; the handle adds `cancel()` and
+                // the lifetime promise `/exit` waits on. Ownership is the
+                // session registry's: every child, background or `wait`, is
+                // recorded here and nowhere else. A turn owns nothing, which is
+                // why this entry - and its cancel/lifetime promise - survives
+                // the turn that launched it (`handle.dispose()` never touches
+                // it); `/exit` and the `--once` policy are what end them.
+                agents.start({
+                  runId: launch.result.runId,
+                  mode: 'background',
+                  cancel: (reason?: unknown) => launch.cancel(reason),
+                  promise: launch.done.then(
+                    () => undefined,
+                    () => undefined,
+                  ),
+                })
+                childrenChanged(agents)
               },
               onFinish: (finish: {
                 runId: string
@@ -3360,17 +3794,20 @@ const runTurn = async (
                 errorCode?: string
                 detail?: string
                 steps?: number
+                output?: string
+                text?: string
               }) => {
-                options.agents?.finish(finish.runId, {
+                agents.finish(finish.runId, {
                   outcome: finish.status,
                   tools: finish.tools,
                   denied: finish.denied,
                   ...(finish.errorCode === undefined ? {} : { errorCode: finish.errorCode }),
                   ...(finish.detail === undefined ? {} : { detail: finish.detail }),
                   ...(finish.steps === undefined ? {} : { steps: finish.steps }),
+                  ...(finish.output === undefined ? {} : { output: finish.output }),
+                  ...(finish.text === undefined ? {} : { text: finish.text }),
                 })
-                syncRunningChildren(options.agents as AgentRegistry)
-                progress.agentsChanged()
+                childrenChanged(agents)
               },
             }),
       })
@@ -3397,7 +3834,7 @@ const runTurn = async (
     // The SDK owns history placement: it drops the transcript's own `system`
     // entries and fills the loop seed, so the system prompt above is rebuilt
     // from this turn's snapshot and the full previous transcript is safe here.
-    history,
+    history: historyWithDelivery,
     // An empty explicit list is "no override" in the SDK, which would ask the
     // guard per iteration; the guard's empty answer is the same, so omit it.
     ...(enabledSchemas.length > 0 ? { tools: enabledSchemas } : {}),
@@ -3405,6 +3842,9 @@ const runTurn = async (
   })
   if (options.forceCompact === true) built = forceCompaction(built, options.lastTokens ?? 2_000)
   const graph = built
+  // The graph now carries the delivered blocks in its seed: they have been
+  // handed to the parent exactly once, whether or not the run later throws.
+  for (const entry of delivered) agents?.markDelivered(entry.runId)
   const runId = `run_${randomUUID()}`
   const now = Date.now()
   runtime.journal.createRun({
@@ -3416,6 +3856,11 @@ const runTurn = async (
     updatedAt: now,
   })
   progress.working('Thinking…')
+  // What the model now sees, the user sees too: one block per child, marked as
+  // subagent output, before the turn's own `⬢` answer starts.
+  for (const entry of delivered) {
+    progress.print(dim(deliveredBlock({ entry, elapsedMs: entryElapsed(entry, Date.now()) })))
+  }
 
   let streamed = false
   // One sanitizer per turn: every streamed delta and the final text pass
@@ -3499,10 +3944,10 @@ const runTurn = async (
   const output = reply.text
 
   progress.settle(result.status, result.error)
-  // A turn cannot leave a "running" child row behind: v1 children are
-  // foreground, so every child of this turn has been disposed by now. The
-  // counter is resynced from the registry rather than assumed to be zero.
-  if (options.agents !== undefined) syncRunningChildren(options.agents)
+  // The turn is over; a live background child keeps its row through the
+  // between-turns writer (2b). Nothing here stops, disposes or awaits a child:
+  // the session owns it, not the turn.
+  progress.finishTurn()
 
   const events = runtime.journal.ownedEvents(runId).map(entry => entry.event)
   const loopEvent = events.find(
@@ -3595,12 +4040,49 @@ interface Options {
   view?: ViewMode
 }
 
+/**
+ * `--help` and a bad argument both need to say how to call this, so the usage
+ * lives in one place. Plain lines, like the argument errors above it: `--help`
+ * must work before any terminal, completer or runtime exists.
+ */
+const printUsage = (print: (line?: string) => void): void => {
+  print('chat: a terminal agent for this workspace')
+  print('')
+  print('  usage: z1 [--model provider/model] [--view compact|medium|full] [--help]')
+  print('         z1 --once "<prompt>"')
+  print('')
+  print('  --model <provider/model>  model for this session (also /model)')
+  print('  --view <mode>             compact, medium or full (also /view)')
+  print('  --once <prompt>           answer one prompt, print it, exit')
+  print('  --help                    show this and exit')
+  print('')
+  print('  subagents')
+  print('    The `subagent` tool runs a child agent. It is a background launch by')
+  print('    default: the call returns a run id and the child keeps working. Its')
+  print('    answer arrives at the start of your next message.')
+  print('    Pass "wait": true in the call to block until the child finishes.')
+  print('    /agents lists them; /agents stop <n|runId> stops one.')
+  print('')
+  print('  --once and background children')
+  print('    By default --once waits for every background child, prints each final')
+  print('    status on stderr, and exits. Set Z1_NO_WAIT=1 to leave them running')
+  print('    and exit at once: the run ids are printed, and the rows stay `running`')
+  print('    until the next start reaps them.')
+  print('')
+}
+
 const parseArgs = (): Options => {
   const options: Options = {}
   // argv[0] is the interpreter and argv[1] the script, under `tsx script.ts`.
   const rest = argv.slice(2)
   for (let index = 0; index < rest.length; index += 1) {
     const arg = rest[index] ?? ''
+    if (arg === '--help' || arg === '-h') {
+      printUsage(line => {
+        console.log(line ?? '')
+      })
+      process.exit(0)
+    }
     if (arg === '--once') {
       const value = rest[index + 1]
       if (value === undefined) {
@@ -3758,11 +4240,48 @@ const oneShot = async (prompt: string, explicitModel: string | undefined, explic
       )
     }
     progress.closeLine()
+    // 2b exit policy: a one-shot has no next turn, so a background child's text
+    // can never be delivered. Wait for it (the default Shift) and print each
+    // final status on stderr, or detach under `Z1_NO_WAIT=1`. The exit code
+    // stays the main run's (`outcome.status` below): a child's outcome is
+    // reported, never folded into it.
+    await settleOnceChildren(agents, oncePolicy(process.env), (line) => console.error(dim(line)))
     return outcome.status === 'completed' ? 0 : 1
   } finally {
     await handle.dispose()
     await runtime.close()
     rl?.close()
+  }
+}
+
+/**
+ * `--once`'s background children (2b).
+ *
+ * - `wait` (default): await every child's own promise, then print one
+ *   `onceStatusLine` per settled child on stderr.
+ * - `detach` (`Z1_NO_WAIT=1`): print the still-running run ids and return; the
+ *   rows stay `running` until the next process reaps them, the same contract as
+ *   killing the host.
+ *
+ * It never throws: a child that could not record its row is reported like any
+ * other ended child, and the main run's exit code is not affected.
+ */
+const settleOnceChildren = async (
+  agents: AgentRegistry,
+  policy: OncePolicy,
+  onLine: (line: string) => void,
+): Promise<void> => {
+  // Only background children: a `wait: true` child already returned its answer
+  // to the launching call, so it is neither waited for here nor reported.
+  const started = agents.list().filter((entry) => entry.mode === 'background')
+  if (started.length === 0) return
+  if (policy === 'detach') {
+    for (const line of onceDetachLines(started)) onLine(line)
+    return
+  }
+  await agents.settleAll(started)
+  for (const entry of started) {
+    onLine(onceStatusLine(entry, entryElapsed(entry, Date.now())))
   }
 }
 
@@ -3904,6 +4423,10 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
 
   const tail = createTail({ live: process.env['Z1_TRAY'] !== 'off', pinned: pinnedMode })
   tail.setHeader(buildBanner)
+  // The between-turns writer of the child row (2b): the tail outlives every
+  // turn's plate, so it can show `◷ N subagents running · /agents` while the
+  // prompt waits - which is the whole point of a background child.
+  idleTail = tail
   /** Everything the user sees from here on goes through the tail. */
   const say = (line = ''): void => tail.print(line)
   // Same startup reaper as `--once`: rows from a dead process are `failed`,
@@ -4555,6 +5078,18 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
       complete,
       commands: () => COMMANDS,
       scroll: (kind) => tail.scroll(kind),
+      /**
+       * 2b: `/agents` opens the overlay here, at submission time, so it works
+       * while a turn runs. The decision itself is the pure `interceptLine`:
+       * only a bare `/agents` opens it. Every other line - `/agents stop 2`,
+       * `/agents <ref>`, a prompt - falls through to `onLine` exactly as
+       * before, which is why the printed forms still behave identically.
+       */
+      intercept: (text) => {
+        if (interceptLine(text) !== 'open') return false
+        openAgentsMenu()
+        return true
+      },
     })
     activeComposer = composer
     tail.setComposer(composer)
@@ -4999,35 +5534,8 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
     }
   }
 
-  /**
-   * `/agents` - this session's delegated children.
-   *
-   * Bare lists them (running first, then finished); `<n>` or `<runId>` opens
-   * one child's transcript from its own journal. It is a read view: nothing is
-   * written to the journal, no child is started, stopped or resumed. An unknown
-   * or garbage reference is a plain message, never a crash.
-   */
-  const handleAgents = (line: string): void => {
-    const rest = line.slice('/agents'.length).trim()
-    if (rest === '') {
-      for (const text of agentListLines({
-        entries: agents.list(),
-        now: Date.now(),
-        columns: terminalColumns(),
-        theme: viewTheme,
-      })) {
-        say(text)
-      }
-      return
-    }
-
-    const resolved = agents.resolveRef(rest)
-    if (!resolved.ok) {
-      say(red(agentRefusal(rest, resolved)))
-      return
-    }
-    const entry = resolved.entry
-
+  /** One child's transcript, printed to the scrollback (the non-TTY view). */
+  const printAgentTranscript = (entry: AgentEntry): void => {
     const events = childEvents(entry.runId)
     for (const text of agentTranscriptLines({
       entry,
@@ -5038,6 +5546,105 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
     })) {
       say(text)
     }
+  }
+
+  /** The printed list: the fallback for a pipe, `Z1_TRAY=off`, and `--once`. */
+  const printAgentList = (): void => {
+    for (const text of agentListLines({
+      entries: agents.list(),
+      now: Date.now(),
+      columns: terminalColumns(),
+      theme: viewTheme,
+    })) {
+      say(text)
+    }
+  }
+
+  /**
+   * Open the `/agents` overlay (2b).
+   *
+   * `refresh` re-reads the registry, so the rows are live: a child that settles
+   * or is stopped repaints in place. `onStop` runs the same pure `stopAgent`
+   * the printed command uses, so `x` and `/agents stop <ref>` refuse alike - and
+   * its `line` reaches the picker either way, which is how the user learns why a
+   * `wait` child must be stopped with Ctrl-C in its own turn. Nothing is printed
+   * to the transcript here: the picker stays open and shows the line itself.
+   */
+  const openAgentsMenu = (): void => {
+    if (composer === undefined || !useComposer) {
+      // No keyboard to own: the printed list is the honest fallback.
+      printAgentList()
+      return
+    }
+    composer.openAgentsMenu({
+      entries: agents.list(),
+      refresh: () => agents.list(),
+      onOpen: (entry) => {
+        printAgentTranscript(agents.get(entry.runId) ?? entry)
+      },
+      onStop: (entry) => {
+        // `stopViaPicker` states the rule as a value: the line is the picker's
+        // notice, never a transcript print. `print` is honoured rather than
+        // assumed, so a future edit that wants to print has to say so.
+        const result = stopViaPicker(stopAgent(agents, entry.runId))
+        if (result.print) say(result.notice.text)
+        if (result.stopped) childrenChanged(agents)
+        return { stopped: result.stopped, line: result.notice.text }
+      },
+    })
+  }
+
+  /**
+   * `/agents` - this session's delegated children.
+   *
+   * Bare opens the overlay (or prints, without a composer); `<n>` or `<runId>`
+   * prints one child's transcript from its own journal. `stop <ref>` (or
+   * `x <ref>`) cancels a *running* child through its own controller; a finished
+   * one is refused with a line that says so. An unknown or garbage reference is
+   * a plain message, never a crash.
+   */
+  const handleAgents = (line: string): void => {
+    const rest = line.slice('/agents'.length).trim()
+    if (rest === '') {
+      openAgentsMenu()
+      return
+    }
+
+    const words = rest.split(/\s+/)
+    const verb = (words[0] ?? '').toLowerCase()
+    if (verb === 'stop' || verb === 'x') {
+      // The whole decision (including every refusal) is a pure function in
+      // `agents-command.ts`; the handler only prints it and repaints.
+      const decision = stopAgent(agents, rest.slice((words[0] ?? '').length))
+      say(decision.kind === 'stop' ? dim(decision.line) : red(decision.line))
+      if (decision.kind === 'stop') childrenChanged(agents)
+      return
+    }
+
+    const resolved = agents.resolveRef(rest)
+    if (!resolved.ok) {
+      say(red(agentRefusal(rest, resolved)))
+      return
+    }
+    printAgentTranscript(resolved.entry)
+  }
+
+  /**
+   * The exit policy for background children (2b): a child that outlives the
+   * session is a leak. The cancel-and-wait bound lives in `exit-policy.ts`
+   * so it is testable; this only prints its lines and repaints the row.
+   *
+   * It cancels every child in `running()`, with no mode filter. A `wait: true`
+   * child is in that set while it blocks, but `/exit` cannot be reached then:
+   * the REPL is inside `runTurn`, awaiting that very call, and only `Ctrl-C`
+   * (the turn's own cancel) gets control back. So the filter would be dead
+   * code, and the honest statement is `exit-policy.ts`'s: everything still
+   * running is cancelled.
+   */
+  const cancelChildrenForExit = async (): Promise<void> => {
+    const result = await stopChildrenOnExit(agents)
+    for (const line of result.lines) say(dim(line))
+    if (result.cancelled > 0) childrenChanged(agents)
   }
 
   /**
@@ -5247,8 +5854,19 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
       printHelp(say)
       return 'continue'
     },
-    '/exit': () => 'exit',
-    '/quit': () => 'exit',
+    // A background child is session work, not conversation state: `/new`
+    // starts another conversation in the same session, so a live child keeps
+    // running (and is delivered into the new turn); only finished rows go. Its
+    // row would otherwise be orphaned by `tail.clear()` with no `/agents`
+    // entry, so running rows are kept and the status row is reprinted.
+    '/exit': async (): Promise<CommandResult> => {
+      await cancelChildrenForExit()
+      return 'exit'
+    },
+    '/quit': async (): Promise<CommandResult> => {
+      await cancelChildrenForExit()
+      return 'exit'
+    },
     '/new': () => {
       // A fresh conversation is a fresh session: this one stays on disk and
       // stays listed, and the next prompt creates its replacement. That new
@@ -5259,14 +5877,18 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
       lastTokens = 0
       forceCompact = false
       // `/agents` is scoped to this session, so the old conversation's finished
-      // children go with it. A running child would keep its row (v1 children
-      // are foreground, so in practice none is running here).
+      // children go with it. A running background child is still doing work
+      // that was asked for, so it stays (2b): it is listed here and delivered
+      // at the next turn of the new conversation.
+      const kept = agents.running().length
       agents.clearFinished()
-      syncRunningChildren(agents)
+      childrenChanged(agents)
       // The state is gone; the screen has to say so before the confirmation.
       tail.clear()
       say(
-        'new conversation · nothing is saved until your first message · the previous session stays in /sessions',
+        `new conversation · nothing is saved until your first message · the previous session stays in /sessions${
+          kept === 0 ? '' : ` · ${String(kept)} ${kept === 1 ? 'subagent' : 'subagents'} still running`
+        }`,
       )
       refreshStatus()
       return 'continue'
@@ -5478,7 +6100,16 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
       // Another session may have changed the policy while this one waited.
       tools.reloadPrefs()
       refreshStatus()
-      if (pendingLines.length === 0) tail.idle()
+      // `tail.idle()` closes a pending streamed row and clears the activity
+      // line (the last turn's plate). A background child still running is the
+      // exception (2b): its row is reprinted here, so it is visible between
+      // turns and not only while a turn paints, and it stays while the prompt
+      // waits below.
+      if (pendingLines.length === 0) {
+        tail.idle()
+        const row = childIdleRow()
+        if (row !== undefined) tail.activity(row)
+      }
 
       // A trailing backslash continues on the next line in the readline path
       // (a pipe, or `Z1_TRAY=off`); the composer has a real newline key.
@@ -5553,8 +6184,11 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
       }
 
       composer?.setBusy(true)
-      // A queued prompt may start while the picker is open; a running turn
-      // owns the transcript, so the picker must not float over it.
+      // A queued prompt may start while a command picker is open; a running turn
+      // owns the transcript, so those pickers must not float over it. The
+      // `/agents` overlay is the exception and stays open on purpose: it is the
+      // one view that is *about* the work a running turn started, and it was
+      // opened during the turn it describes (2b).
       composer?.closeToolMenu()
       composer?.closeSessionMenu()
       composer?.closeViewMenu()
