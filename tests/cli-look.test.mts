@@ -11,6 +11,8 @@
  */
 
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 import { shortError } from '../view.ts'
 import { callLine, resultSummary } from '../tool-label.ts'
@@ -57,7 +59,22 @@ assert.equal(shortError('  exit   1  '), 'exit 1', 'runs of whitespace collapse'
   assert.ok(short.endsWith('…'), 'and says it was cut')
 }
 
-// --------------------------- the call row is not JSON
+// --------------------------- the user's own words
+
+// The prompt keeps a full-width tinted band: it is the one row that is not the
+// agent talking, and the band is what makes a long transcript scannable. `❯`
+// sits in front of it, so the marker survives a pipe (where the band cannot be
+// drawn) and a theme that renders the background faintly.
+{
+  const source = readFileSync(join(import.meta.dirname, '..', 'chat.ts'), 'utf8')
+  assert.match(source, /\? '❯ ' : '  '/, 'the live prompt is marked with ❯')
+  assert.match(source, /paint\('48;5;237', bar\)/, 'the live prompt is a full-width band')
+  assert.match(source, /padTo\(line, Math\.max\(1, terminalColumns\(\) - 1\)\)/, 'the band spans the row')
+  // A reopened session must look like the one that produced it.
+  const stored = source.slice(source.indexOf('const printStoredUser'))
+  assert.match(stored.slice(0, 600), /48;5;237/, 'the stored prompt draws the same band')
+  assert.match(stored.slice(0, 600), /'❯ ' : '  '/, 'and the same marker')
+}
 
 // The exact complaint that started this work: `read({"path":"a.ts"})`.
 {
