@@ -42,6 +42,13 @@ import type {
 } from './sdk.ts'
 
 import { ownStateText } from './workspace-state.ts'
+import {
+  discoverProjectContextFiles,
+  projectContextBudget,
+  projectContextRoot,
+  projectContextSummary,
+  projectContextText,
+} from './project-context.ts'
 import { probableSessionRoot } from './session-root.ts'
 import { ensureWebSearch, stopWebSearch, webSearchStatus } from './web-service.ts'
 import type { WebStatus } from './web-service.ts'
@@ -3938,6 +3945,15 @@ const runTurn = async (
     : handle.services.tools
   const serviceTools = tools.guard(composedTools)
 
+  // The project's own rules, read on every turn on purpose: the system prompt is
+  // rebuilt from this turn's snapshot, so an `AGENTS.md` edited mid-session
+  // reaches the model on the next message without a reload command and without
+  // a restart.
+  const projectText =
+    options.cwd === undefined
+      ? ''
+      : projectContextText(discoverProjectContextFiles(options.cwd), projectContextRoot(options.cwd))
+
   let built: unknown = buildAgentGraph({
     model,
     maxSteps,
@@ -3952,9 +3968,19 @@ const runTurn = async (
             sessionRoot: options.sessionRoot,
             session: options.session,
           }),
+      // The project's own rules, in the same slot.
+      projectText,
     ]
       .filter(Boolean)
       .join('\n\n'),
+    // The prompt stack drops the whole custom section once it passes its
+    // ceiling, and the default ceiling (6000) is what an `AGENTS.md` above
+    // roughly 6.5 KiB used to blow past — the tool list disappeared with it.
+    // Raising the
+    // ceiling by exactly this section's estimate keeps the default behaviour
+    // untouched for a project without `AGENTS.md` and stops a big one from
+    // costing the model its tools.
+    ...(projectText === '' ? {} : { budgetTokens: projectContextBudget(projectText) }),
     // The SDK owns history placement: it drops the transcript's own `system`
     // entries and fills the loop seed, so the system prompt above is rebuilt
     // from this turn's snapshot and the full previous transcript is safe here.
@@ -6159,6 +6185,10 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
           `context · ${formatTokens(lastContext.tokens)}/${formatTokens(lastContext.window)} (${String(Math.round(lastContext.ratio * 100))}%)${lastContext.compactedTurns > 0 ? ` · compacted ${String(lastContext.compactedTurns)} turns` : ''}`,
         )
       }
+      // The project's `AGENTS.md` chain, read again instead of remembered: the
+      // files are re-read on every turn, so this line has to describe the next
+      // request — including what the budgets dropped.
+      say(dim(projectContextSummary(discoverProjectContextFiles(config.cwd), projectContextRoot(config.cwd))))
       return 'continue'
     },
     '/compact': () => {

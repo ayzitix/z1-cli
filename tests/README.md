@@ -17,6 +17,7 @@ From the repo root:
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/tool-inventory.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/workspace-state.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/session-root.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/project-context.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/input.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/output.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/width.test.mts
@@ -51,6 +52,31 @@ whose `z1/` is a populated non-session tree (the SDK checkout) reports
 `<dataHome>/z1/projects/<name>-<sha1>/z1`, an owned or empty `z1/` is reported
 in place, `Z1_SESSIONS_DIR` wins with `~` expansion, a foreign override falls
 back, and resolving any of them creates no directory.
+
+`project-context.test.mts`: the project's own rules in the system prompt. A repo
+with `.git` at the top carries three `AGENTS.md` files from the root down to the
+workspace, farthest first and the nearest last, with one `### a/b/AGENTS.md`
+posix heading each (never a backslash); without a repo root only the workspace
+file is read, and no files and no omission means no section rather than an empty
+one. A 40 KiB file is cut at 32 KiB with a visible marker, a `ї` or an emoji
+sitting on the cut is dropped whole instead of halved (no U+FFFD), a file that
+ends exactly on the limit is left alone, a BOM and every CRLF are gone, an empty
+or whitespace-only file is no context at all, and a directory named `AGENTS.md`
+is skipped without throwing. The ceiling counts *normalized* text, so a CRLF
+file of 36 000 disk bytes (24 000 after CRLF→LF) is not cut, one that normalizes
+to exactly 32 768 bytes still fits, one that normalizes to 40 000 is cut with no
+CR left in it, and only a file too big for the `2 × limit + 4` read window is
+read as a head — a 1 MiB one, whose metadata line still spends the whole budget
+on text. A cut file with an all-blank head is kept with its marker rather than
+dropped as empty. The chain budget keeps the nearest file and names the dropped
+one at the top of the section — in bytes below 1 KiB, in KiB above it — and a
+chain that dropped everything still answers with that marker. The `/context`
+line is pinned as a pure value too: file count, `N earlier omitted`, the chars/4
+estimate, the clock and the relative paths — including the dropped file's label
+when nothing was kept. `projectContextBudget` is pinned as well: the SDK's
+default 6000 tokens with no section, and 6000 + chars/4 + 256 with one — without
+that raise the prompt stack drops the whole custom section (tool list included)
+for an `AGENTS.md` above roughly 6.5 KiB.
 
 `input.test.mts` covers the command-plus-prompt split: `/foo` followed by text is
 reported as unknown and the text under it is still sent as a prompt, while an
