@@ -88,17 +88,12 @@ let parentChats = 0
 const parentLlm = {
   async chat() {
     parentChats += 1
-    if (parentChats === 1) {
-      return {
-        message: { role: 'assistant', content: '' },
-        toolCalls: [{ id: 'call_launch', name: SUBAGENT_TOOL_NAME, arguments: launch }],
-        stopReason: 'tool_calls',
-      }
-    }
+    // One step: the model says what it is doing and launches. The turn ends on
+    // the launch, so there is no second answer to produce.
     return {
-      message: { role: 'assistant', content: 'Launched one child; I will report when it settles.' },
-      toolCalls: [],
-      stopReason: 'stop',
+      message: { role: 'assistant', content: 'Delegating; the report will arrive on its own.' },
+      toolCalls: [{ id: 'call_launch', name: SUBAGENT_TOOL_NAME, arguments: launch }],
+      stopReason: 'tool_calls',
     }
   },
 }
@@ -220,22 +215,28 @@ const result = await runGraph({
   },
 })
 
-// --- the turn closed normally
+// --- the turn closed on the launch, and the prompt is free
 
-assert.equal(parentChats, 2, 'the model was asked again after the launch, then stopped')
+// One model call, not two: a step that only launched a background child is a
+// hand-off, so the loop closes the turn instead of asking the model for a
+// "delegated, waiting" message. That second call was what kept the prompt busy
+// after the work had already left.
+assert.equal(parentChats, 1, 'the model was asked once: the launch, then the turn ended')
 assert.equal(
   result.status,
   'completed',
   'the turn completed on its own - it did not stall waiting for the child',
 )
 
-// --- with a real final message, not an empty one
+// --- the turn's answer is what the model said in that step
 
+// The last transcript message is the tool result (`core.last` would publish its
+// JSON payload); `lastText` reads the last *assistant* message instead.
 const outputs = (result as unknown as { outputs?: Record<string, unknown> }).outputs ?? {}
 assert.equal(
   outputs['output'],
-  'Launched one child; I will report when it settles.',
-  'the turn ends on the model’s own answer, so the parent does not go silent after a launch',
+  'Delegating; the report will arrive on its own.',
+  'the turn ends on the model’s own text, not on the tool payload',
 )
 
 // --- and the launch really happened in the background
@@ -274,13 +275,13 @@ const settled = await new Promise<boolean>((resolve) => {
 })
 assert.equal(settled, true, 'the background child settles and the session registry sees it')
 assert.equal(agents.list()[0]?.outcome, 'completed', 'with the child’s own outcome')
-// The step counter follows the model, exactly like any other turn: one model
-// call that asked for the launch, one that answered. A turn that had stopped at
-// the launch would show one call and no answer.
+// Still one model call after the child settled: the loop did not wake up for a
+// "delegated, waiting" message, and settling the child did not run the parent
+// again either. The report is what the next turn carries.
 assert.equal(
   parentChats,
-  2,
-  'two model steps: the launch, then the answer - the loop kept going past the launch',
+  1,
+  'one model step for the whole turn: the launch is the hand-off',
 )
 
-console.log('PASS: subagent-turn (a background launch keeps its turn: final message, completed, child still live)')
+console.log('PASS: subagent-turn (a background launch ends the turn: one step, completed, child still live)')

@@ -275,7 +275,7 @@ try {
     assert.match(transcript, /grant enable read/, 'header includes the grant')
     assert.match(transcript, /run run_1111111111111111 · completed · background · 1\.5s/)
     assert.match(transcript, /I will read the config file\./, 'assistant text is shown')
-    assert.match(transcript, /⬢ read → config\.json/, 'tool call with its argument')
+    assert.match(transcript, /⬢ Read config\.json/, 'tool call with its argument')
     assert.match(transcript, /⎿ {2}✓ \{?"port":8080\}?"?/, 'tool result row')
     assert.match(transcript, /The server listens on 8080\./, 'the second assistant turn is shown')
     assert.match(transcript, /⬢ done · 1\.5s/, 'terminal completed row')

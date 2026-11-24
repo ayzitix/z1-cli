@@ -200,9 +200,10 @@ assert.equal(resultLine({ ok: true }), undefined)
 // ---------------------------------------------------------- full-mode strings
 {
   const s = state('full')
-  assert.deepEqual(lines(start(s, 'read', 'p1', '{"path":"a.ts"}')), ['⬢ read({"path":"a.ts"})'])
+  // A call reads as a verb and its target, never as the argument JSON.
+  assert.deepEqual(lines(start(s, 'read', 'p1', '{"path":"a.ts"}')), ['⬢ Read a.ts'])
   assert.deepEqual(lines(end(s, 'p1', { durationMs: 12, size: 4 })), ['  ⎿  ✓ 12ms · 4 B'])
-  assert.deepEqual(lines(start(s, 'todo.read', 'p2', '{}')), ['⬢ todo.read({})'])
+  assert.deepEqual(lines(start(s, 'todo.read', 'p2', '{}')), ['⬢ Todo'])
   assert.deepEqual(lines(end(s, 'p2', { ok: false, error: 'ENOENT', durationMs: 12 })), ['  ⎿  ✗ ENOENT · 12ms'])
   assert.deepEqual(lines(viewEvent(s, { type: 'node.failed', path: 'loop/1/chat', error: 'boom' }, ctx())), [
     '  ⎿  ✗ loop/1/chat · boom',
@@ -272,7 +273,7 @@ assert.equal(resultLine({ ok: true }), undefined)
     'full: a launch reads `started`, never ✓/✗, and carries the /agents hint',
   )
   // The label is the tool's own, so a row cannot be mistaken for `read`.
-  assert.match(lines(start(s, 'subagent', 'p2', '{}'))[0] ?? '', /^⬢ subagent/)
+  assert.match(lines(start(s, 'subagent', 'p2', '{}'))[0] ?? '', /^⬢ Subagent/)
 
   // `wait: true`: an ordinary finished child, exactly as before 2b.
   const w = state('full')
@@ -301,16 +302,17 @@ assert.equal(resultLine({ ok: true }), undefined)
         durationMs: 40,
       }),
     ),
-    ['⬢ subagent → {"description":"scan tests"} · started 40ms · agents run_x'],
+    ['⬢ Subagent scan tests · started 40ms · agents run_x'],
     'medium: a launch reads `started` with the /agents hint, not ✓',
   )
-  // `wait: true` keeps the v1 row.
+  // `wait: true` keeps the v1 row - and its summary is the delegation's own
+  // description, not the raw argument JSON it used to print.
   const w = state('medium')
   start(w, 'subagent', 'p1', '{"description":"scan tests"}')
   assert.deepEqual(
     lines(end(w, 'p1', { result: { status: 'completed', runId: 'run_x' }, durationMs: 120 })),
-    ['⬢ subagent → {"description":"scan tests"} · ✓ 120ms'],
-    'medium: a `wait: true` child is still a normal ✓ row',
+    ['⬢ Subagent scan tests · ✓'],
+    'medium: a `wait: true` child is a normal ✓ row named by its description',
   )
 }
 
@@ -359,14 +361,14 @@ assert.equal(resultLine({ ok: true }), undefined)
     start(s, name, paths[index]!, '{"query":"tsx 4"}')
     end(s, paths[index]!, { durationMs: durations[index]!, size: sizes[index]! })
   })
-  assert.deepEqual(lines(viewNotice(s, ctx())), ['⬢ searches · 3 · ✓ 1.4s · 42.1 KB'])
+  assert.deepEqual(lines(viewNotice(s, ctx())), ['⬢ Searched 3 lookups · ✓'])
   assert.deepEqual(lines(viewSettle(s, 'completed', ctx({ now: 800 }))), ['⬢ done · 0.8s'])
 }
 {
   const s = state('medium')
   start(s, 'read', 'p1', '{"path":"src/a.ts"}')
   end(s, 'p1', { durationMs: 12, size: 4 })
-  assert.deepEqual(lines(viewNotice(s, ctx())), ['⬢ read → src/a.ts · ✓ 12ms'])
+  assert.deepEqual(lines(viewNotice(s, ctx())), ['⬢ Read src/a.ts · ✓'])
 }
 {
   const s = state('medium')
@@ -378,8 +380,8 @@ assert.equal(resultLine({ ok: true }), undefined)
   end(s, 'p2', { durationMs: 12 })
   start(s, 'read', 'p3', '{"path":"src/b.ts"}')
   end(s, 'p3', { durationMs: 12 })
-  assert.deepEqual(lines(barrier), ['⬢ read → src/a.ts · ✓ 12ms'], 'the barrier closes the read group first')
-  assert.deepEqual(lines(viewNotice(s, ctx())), ['⬢ read → src/b.ts · ✓ 12ms'])
+  assert.deepEqual(lines(barrier), ['⬢ Read src/a.ts · ✓'], 'the barrier closes the read group first')
+  assert.deepEqual(lines(viewNotice(s, ctx())), ['⬢ Read src/b.ts · ✓'])
 }
 {
   const s = state('medium')
@@ -388,13 +390,13 @@ assert.equal(resultLine({ ok: true }), undefined)
   start(s, 'read', 'p2', '{"path":"missing.ts"}')
   const failed = end(s, 'p2', { ok: false, error: 'ENOENT: no such file', durationMs: 12 })
   assert.deepEqual(lines(failed), [
-    '⬢ reads · 2 · ✗ 1 · 24ms',
+    '⬢ Read 2 files · ✗ 1',
     '  ⎿  ✗ read · ENOENT: no such file',
   ])
   // A failure never sits inside a later ✓ line: the third call starts a new group.
   start(s, 'read', 'p3', '{"path":"c.ts"}')
   end(s, 'p3', { durationMs: 12 })
-  assert.deepEqual(lines(viewNotice(s, ctx())), ['⬢ read → c.ts · ✓ 12ms'])
+  assert.deepEqual(lines(viewNotice(s, ctx())), ['⬢ Read c.ts · ✓'])
 }
 {
   const s = state('medium')
@@ -403,7 +405,7 @@ assert.equal(resultLine({ ok: true }), undefined)
   start(s, 'read', 'p2', '{"path":"b.ts"}')
   end(s, 'p2', { durationMs: 12 })
   // The first committed assistant row closes the group *before* the text row.
-  assert.deepEqual(lines(viewTextStart(s, ctx())), ['⬢ reads · 2 · ✓ 24ms · 0 B'])
+  assert.deepEqual(lines(viewTextStart(s, ctx())), ['⬢ Read 2 files · ✓'])
   assert.deepEqual(lines(viewTextStart(s, ctx())), [], 'only the first text row is a boundary')
 }
 {
@@ -411,7 +413,7 @@ assert.equal(resultLine({ ok: true }), undefined)
   start(s, 'read', 'p1', '{"path":"a.ts"}')
   assert.deepEqual(lines(viewNotice(s, ctx())), [], 'a notice while a call is pending never claims ✓')
   end(s, 'p1', { durationMs: 12 })
-  assert.deepEqual(lines(viewNotice(s, ctx())), ['⬢ read → a.ts · ✓ 12ms'])
+  assert.deepEqual(lines(viewNotice(s, ctx())), ['⬢ Read a.ts · ✓'])
 }
 {
   const s = state('medium')
@@ -420,7 +422,7 @@ assert.equal(resultLine({ ok: true }), undefined)
   start(s, 'read', 'p2', '{"path":"b.ts"}')
   end(s, 'p2', { durationMs: 12 })
   assert.deepEqual(lines(viewSettle(s, 'completed', ctx({ now: 800 }))), [
-    '⬢ reads · 2 · ✓ 24ms · 0 B',
+    '⬢ Read 2 files · ✓',
     '⬢ done · 0.8s',
   ])
 }
@@ -428,7 +430,7 @@ assert.equal(resultLine({ ok: true }), undefined)
   const s = state('medium')
   start(s, 'read', 'p1', '{"path":"a.ts"}')
   const actions = lines(viewSettle(s, 'cancelled', ctx({ now: 1200 })))
-  assert.deepEqual(actions, ['⬡ read → a.ts · cancelled', '⬡ cancelled · 1.2s'])
+  assert.deepEqual(actions, ['⬡ Read a.ts · cancelled', '⬡ cancelled · 1.2s'])
   assert.equal(actions.some((line) => line.includes('✓')), false, 'a pending call never claims success')
 }
 {
@@ -436,7 +438,7 @@ assert.equal(resultLine({ ok: true }), undefined)
   start(s, 'read', 'p1', '{"path":"a.ts"}')
   start(s, 'read', 'p2', '{"path":"b.ts"}')
   const actions = lines(viewSettle(s, 'failed', ctx({ now: 800 })))
-  assert.deepEqual(actions, ['⬡ reads · 2 · failed', '⬢ failed · 0.8s'])
+  assert.deepEqual(actions, ['⬡ Read 2 files · failed', '⬢ failed · 0.8s'])
 }
 
 // ------------------------------------------------------- medium edge cases
@@ -456,7 +458,9 @@ assert.equal(resultLine({ ok: true }), undefined)
   const wide = state('medium')
   start(wide, 'read', 'p1', JSON.stringify({ path: long }))
   end(wide, 'p1', { durationMs: 12 })
-  assert.equal(lines(viewNotice(wide, ctx({ columns: 200 })))[0]?.endsWith('12ms'), true, 'wide terminals keep the line')
+  // The row ends with the outcome, not a duration: `medium` reports what came
+  // back, and the wide case must keep that whole rather than clip it.
+  assert.equal(lines(viewNotice(wide, ctx({ columns: 200 })))[0]?.endsWith('✓'), true, 'wide terminals keep the line')
   const narrow = state('medium')
   start(narrow, 'read', 'p1', JSON.stringify({ path: long }))
   end(narrow, 'p1', { durationMs: 12 })
@@ -482,10 +486,11 @@ assert.equal(resultLine({ ok: true }), undefined)
   assert.equal(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text), false, 'no lone low surrogate')
 }
 {
-  // Unknown tools print their raw name and a summary, never crash and never fold.
+  // Unknown tools print a humanised verb and their first argument, never the
+  // payload JSON and never a fold.
   const s = state('medium')
   start(s, 'mystery.tool', 'p1', '{"x":1}')
-  assert.deepEqual(lines(end(s, 'p1', { durationMs: 5 })), ['⬢ mystery.tool → {"x":1} · ✓ 5ms'])
+  assert.deepEqual(lines(end(s, 'p1', { durationMs: 5 })), ['⬢ Mystery tool 1 · ✓'])
 }
 
 // ----------------------------------------------------------- compact matrix
@@ -553,7 +558,7 @@ assert.equal(resultLine({ ok: true }), undefined)
   assert.equal(viewActivity(s, ctx({ tty: false })), undefined)
   start(s, 'read', 'p1', '{"path":"a.ts"}')
   end(s, 'p1', { durationMs: 12 })
-  assert.deepEqual(lines(viewNotice(s, ctx({ tty: false }))), ['⬢ read → a.ts · ✓ 12ms'])
+  assert.deepEqual(lines(viewNotice(s, ctx({ tty: false }))), ['⬢ Read a.ts · ✓'])
 }
 
 // ------------------------------------------------------- no ANSI with plain
@@ -586,9 +591,9 @@ assert.equal(viewStatus('compact', plain), 'view · compact · compact | medium 
     { name: 'read', args: '{"path":"b.ts"}' },
     { name: 'stat', args: '{"path":"c.ts"}' },
   ]
-  assert.deepEqual(groupStoredCalls(calls, ctx()), ['⬢ reads · 3'], 'a stored group makes no result claim')
+  assert.deepEqual(groupStoredCalls(calls, ctx()), ['⬢ Read 3 files'], 'a stored group makes no result claim')
 }
-assert.deepEqual(groupStoredCalls([{ name: 'read', args: '{"path":"src/a.ts"}' }], ctx()), ['⬢ read → src/a.ts'])
+assert.deepEqual(groupStoredCalls([{ name: 'read', args: '{"path":"src/a.ts"}' }], ctx()), ['⬢ Read src/a.ts'])
 assert.deepEqual(
   groupStoredCalls(
     [
@@ -598,7 +603,7 @@ assert.deepEqual(
     ],
     ctx(),
   ),
-  ['⬢ read → a.ts', '⬢ write → c.ts', '⬢ read → b.ts'],
+  ['⬢ Read a.ts', '⬢ Write c.ts', '⬢ Read b.ts'],
   'a write is never grouped in replay either',
 )
 assert.deepEqual(
@@ -612,7 +617,7 @@ assert.deepEqual(
     ],
     ctx(),
   ),
-  ['⬢ reads · 2', '⬢ write → c.ts', '⬢ reads · 2'],
+  ['⬢ Read 2 files', '⬢ Write c.ts', '⬢ Read 2 files'],
 )
 
 // ------------------------------------------------------------- view picker

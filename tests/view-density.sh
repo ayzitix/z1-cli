@@ -6,7 +6,7 @@
 #
 # Pty half: the stock mock returns one tool call per assistant message, which
 # cannot prove grouping. tests/fake-openai.py answers one assistant message with
-# three `read` calls, so medium must fold them into one `reads · 3` row and full
+# three `read` calls, so medium must fold them into one `Read 3 files` row and full
 # must print all three.
 set -u -o pipefail
 
@@ -108,7 +108,7 @@ printf '[[tool:todo.read]]\n/exit\n' | env "${env_args[@]}" \
   exit 1
 }
 assert_no_esc "$tmp/compact.out" "piped compact"
-if grep -q '⬢ todo.read' "$tmp/compact.out"; then
+if grep -q '⬢ Todo' "$tmp/compact.out"; then
   echo "FAIL: compact printed the tool call" >&2
   exit 1
 fi
@@ -133,7 +133,7 @@ printf '[[tool:todo.read]]\n/exit\n' | env "${env_args[@]}" \
   exit 1
 }
 assert_no_esc "$tmp/full.out" "piped full"
-for needle in '⬢ todo.read({})' '  ⎿  ✓'; do
+for needle in '⬢ Todo' '  ⎿  ✓'; do
   if ! grep -qF "$needle" "$tmp/full.out"; then
     echo "FAIL: full lost '$needle'" >&2
     sed -n '1,20p' "$tmp/full.out" >&2
@@ -151,7 +151,7 @@ printf '[[tool:todo.read]]\n/exit\n' | env "${env_args[@]}" \
   exit 1
 }
 assert_no_esc "$tmp/medium.out" "piped medium"
-if ! grep -q '⬢ todo.read · ✓' "$tmp/medium.out"; then
+if ! grep -q '⬢ Todo · ✓' "$tmp/medium.out"; then
   echo "FAIL: medium did not print one call line" >&2
   sed -n '1,20p' "$tmp/medium.out" >&2
   exit 1
@@ -166,7 +166,7 @@ fi
   exit 1
 }
 assert_no_esc "$tmp/once-compact.out" "--once compact"
-if grep -q '⬢ todo.read' "$tmp/once-compact.out"; then
+if grep -q '⬢ Todo' "$tmp/once-compact.out"; then
   echo "FAIL: --once compact printed the tool call" >&2
   exit 1
 fi
@@ -181,7 +181,7 @@ fi
   sed -n '1,20p' "$tmp/once-full.err" >&2
   exit 1
 }
-for needle in '⬢ todo.read({})' '  ⎿  ✓'; do
+for needle in '⬢ Todo' '  ⎿  ✓'; do
   if ! grep -qF "$needle" "$tmp/once-full.out"; then
     echo "FAIL: --once full lost '$needle'" >&2
     sed -n '1,20p' "$tmp/once-full.out" >&2
@@ -241,11 +241,11 @@ def clean(data):
     return re.sub(rb'\x1b\[[0-9;?]*[A-Za-z]', b'', data).decode('utf-8', 'replace')
 
 text = clean(medium)
-if text.count('⬢ reads · 3') != 1:
-    raise SystemExit(f'medium: expected one committed "⬢ reads · 3", found {text.count("⬢ reads · 3")}')
+if text.count('⬢ Read 3 files') != 1:
+    raise SystemExit(f'medium: expected one committed "⬢ Read 3 files", found {text.count("⬢ Read 3 files")}')
 if 'read({"path"' in text:
     raise SystemExit('medium printed a per-call row')
-match = re.search(r'⬢ reads · 3[^\n⬢⬡│]*', text)
+match = re.search(r'⬢ Read 3 files[^\n⬢⬡│]*', text)
 if match is None or len(match.group(0)) > 80:
     raise SystemExit(f'medium: the group row did not fit 80 cells: {match.group(0) if match else None!r}')
 if 'The three reads are done.' not in text:
@@ -254,9 +254,9 @@ if '⬢ done' not in text:
     raise SystemExit('medium lost the terminal row')
 
 text = clean(full)
-if text.count('⬢ read({"path"') != 3:
+if text.count('⬢ Read ') != 3:
     raise SystemExit(f'full: expected three per-call rows, found {text.count("⬢ read({\"path\"")}')
-if '⬢ reads · 3' in text:
+if '⬢ Read 3 files' in text:
     raise SystemExit('full folded a group')
 
 text = clean(compact)
@@ -294,9 +294,9 @@ python3 - "$tmp/fail.raw" <<'PY' || exit 1
 import re
 import sys
 text = re.sub(rb'\x1b\[[0-9;?]*[A-Za-z]', b'', open(sys.argv[1], 'rb').read()).decode('utf-8', 'replace')
-if '⬢ reads · 2 · ✗ 1' not in text:
+if '⬢ Read 2 files · ✗ 1' not in text:
     raise SystemExit('a failed call did not close its group with ✗ 1')
-if '  ⎿  ✗ read ·' not in text:
+if '  ⎿  ✗ Read ·' not in text:
     raise SystemExit('the failure detail row is missing')
 if 'read → c.txt' not in text:
     raise SystemExit('the call after the failure did not start a new group')
@@ -319,9 +319,9 @@ def clean(data):
     return re.sub(rb'\x1b\[[0-9;?]*[A-Za-z]', b'', data).decode('utf-8', 'replace')
 
 text = clean(medium)
-if '⬢ reads · 3' not in text:
+if '⬢ Read 3 files' not in text:
     raise SystemExit('medium replay did not group the stored calls')
-if '⬢ reads · 3 · ✓' in text:
+if '⬢ Read 3 files · ✓' in text:
     raise SystemExit('medium replay claimed a result the stored message does not carry')
 
 text = clean(compact)
@@ -329,7 +329,7 @@ if 'read({"path"' in text or '⬢ read' in text:
     raise SystemExit('compact replay printed a stored call')
 
 text = clean(full)
-if text.count('⬢ read({"path"') != 3:
+if text.count('⬢ Read ') != 3:
     raise SystemExit(f'full replay expected three stored call rows, found {text.count("⬢ read({\"path\"")}')
 PY
 

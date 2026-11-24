@@ -59,7 +59,15 @@ import { toolInventoryText } from './tool-inventory.ts'
 import { type ToolState } from './tool-policy.ts'
 import { ToolState as ToolStore } from './tool-state.ts'
 import { composeSubagentService } from './subagent-host.ts'
+import {
+  AUTO_DELIVERY_LINE as AUTOMATED_DELIVERY_LINE,
+  AUTO_DELIVERY_PROMPT,
+  AUTO_DELIVERY_ROW,
+  afterTurnSignal,
+  settleSignal,
+} from './auto-delivery.ts'
 import { AgentRegistry, childStatusRow, deliveredBlock, entryElapsed, runningLabel, shortRunId } from './agents.ts'
+import { deliveredLines } from './agents-output.ts'
 import type { AgentEntry } from './agents.ts'
 import {
   agentListLines,
@@ -78,6 +86,7 @@ import type { OncePolicy } from './once-policy.ts'
 import { stopAgent } from './agents-command.ts'
 import { stopChildrenOnExit } from './exit-policy.ts'
 import { reapOrphanedRuns } from './reaper.ts'
+import { callLine } from './tool-label.ts'
 import {
   compactArgs,
   createViewState,
@@ -1896,25 +1905,35 @@ class Composer {
     const hint = this.hint(menu.open)
     const right = status
     const available = Math.max(1, width - 2)
-    let footer = '  '
+    // 2b: live background work is a *state*, and this theme spends hue only on
+    // states - green is running. The row is the exact string `hint()` returned,
+    // so this is equality with the one source, not a second copy of the rule.
+    const runningHint = runningLabel(runningChildren)
+    const liveChildRow = runningHint !== undefined && hint === runningHint
+    let left = ''
+    let after = ''
     if (this.asking !== undefined) {
       // A question owns the row: an approval must be readable before the status.
-      footer += clip(hint, available)
+      left = clip(hint, available)
     } else if (hint.length > 0 && right.length > 0 && hint.length + right.length <= available) {
       // The happy path: hint on the left, session status on the right.
-      footer += `${hint}${' '.repeat(available - hint.length - right.length)}${right}`
+      left = hint
+      after = `${' '.repeat(available - hint.length - right.length)}${right}`
     } else {
       // The hint always keeps its room; the status is truncated from the right,
       // so model and context survive. This is Claude Code's footer rule.
       const leftBudget = right.length === 0 ? available : Math.max(0, available - Math.min(right.length, 24) - 1)
-      const left = clip(hint, leftBudget)
+      left = clip(hint, leftBudget)
       const rightBudget = Math.max(0, available - stripAnsi(left).length - (left.length > 0 ? 2 : 0))
       const rightText = clip(right, rightBudget)
-      footer += left
       if (rightText.length > 0) {
-        footer += `${' '.repeat(Math.max(0, available - stripAnsi(left).length - stripAnsi(rightText).length))}${rightText}`
+        after = `${' '.repeat(Math.max(0, available - stripAnsi(left).length - stripAnsi(rightText).length))}${rightText}`
       }
     }
+    // The frame stays dim; only the live row keeps its state hue. Everything
+    // else is byte-identical to the footer without children.
+    const footer =
+      liveChildRow && left.length > 0 ? `  ${green(left)}${dim(after)}` : dim(`  ${left}${after}`)
     const lines = [
       ...sessionLines,
       ...toolLines,
@@ -1924,7 +1943,7 @@ class Composer {
       header,
       ...input,
       footerRule,
-      dim(footer),
+      footer,
     ]
     const key = [
       this.value,
@@ -3026,7 +3045,12 @@ const createMarkdownPrinter = (emit: (line: string) => void): MarkdownPrinter =>
 const createProgress = (tail: Tail, mode: ViewMode): Progress => {
   const state = createViewState(mode, Date.now())
   let spinner: NodeJS.Timeout | undefined
-  const frames = [paint('0', '⬡'), dim('⬡')]
+  // The spinner alternates a bright and a dim glyph rather than moving a
+  // frame: one steady mark that pulses is calmer than a rotating one at the
+  // bottom of a screen the reader is trying to read. `∴` is the "therefore"
+  // mark, the same one the reference CLIs use for a model that is thinking -
+  // distinct from the `⬢` of a finished block and the `⬡` of an interruption.
+  const frames = [paint('0', '∴'), dim('∴')]
   let frame = 0
 
   const ctx = (): ViewContext => ({ columns: terminalColumns(), now: Date.now(), tty: tail.live, theme: viewTheme })
@@ -3045,8 +3069,10 @@ const createProgress = (tail: Tail, mode: ViewMode): Progress => {
     // plate when there is one. Both writers compose it with `childStatusRow`,
     // so the plate and the between-turns row cannot disagree. Reusing
     // `tail.activity()` is the whole point.
+    // A live child is a state, so this row carries the state hue (green) while
+    // everything else in the plate stays dim.
     const children = childStatusRow({ running: runningChildren })
-    const childRow = children === undefined ? undefined : dim(children)
+    const childRow = children === undefined ? undefined : green(children)
     if (label === undefined) {
       tail.activity(childRow)
       return
@@ -3087,6 +3113,15 @@ const createProgress = (tail: Tail, mode: ViewMode): Progress => {
 
   let markdown: MarkdownPrinter | undefined
 
+  let assistantStarted = false
+  /**
+   * A tool row has been printed since the last assistant text. The next
+   * assistant block then gets one blank row above it, which is what separates
+   * "what the model said" from "what it did" - without it a tool result and the
+   * prose after it read as one paragraph.
+   */
+  let toolRowPrinted = false
+
   /**
    * Apply formatter actions. Raw actions come from inside `emit`, where calling
    * `markdown.flush()` would re-enter the printer; everything else flushes the
@@ -3099,6 +3134,9 @@ const createProgress = (tail: Tail, mode: ViewMode): Progress => {
         continue
       }
       if (!raw) markdown?.flush()
+      // A committed view row is a tool row for the purpose of block spacing:
+      // the next assistant block must not butt against it.
+      if (stripAnsi(action.text).trim().length > 0) toolRowPrinted = true
       tail.print(action.text)
     }
   }
@@ -3112,14 +3150,16 @@ const createProgress = (tail: Tail, mode: ViewMode): Progress => {
     apply(actions, true)
   }
 
-  let assistantStarted = false
-
   const emit = (line: string): void => {
     if (!assistantStarted && stripAnsi(line).trim() === '') return
     apply(viewTextStart(state, ctx()), true)
     if (!assistantStarted) {
       if (mode === 'full' && spinner !== undefined) stopSpinner()
       assistantStarted = true
+      if (toolRowPrinted) {
+        tail.print('')
+        toolRowPrinted = false
+      }
       tail.print(`${bold('⬢')} ${line}`)
     } else {
       tail.print(line)
@@ -3131,6 +3171,9 @@ const createProgress = (tail: Tail, mode: ViewMode): Progress => {
     markdown?.flush()
     if (mode === 'full') stopSpinner()
     apply(viewNotice(state, ctx()), false)
+    // A view line is a tool row for the purpose of block spacing: the next
+    // assistant block must not butt against it.
+    if (stripAnsi(line).trim().length > 0) toolRowPrinted = true
     tail.print(line)
   }
 
@@ -3305,10 +3348,10 @@ const repaintChildren = (): void => {
   idleTail?.activity(childIdleRow())
 }
 
-/** The row while no turn runs; `undefined` to clear it. */
+/** The row while no turn runs; `undefined` to clear it. Green: a live state. */
 const childIdleRow = (): string | undefined => {
   const row = childStatusRow({ running: runningChildren })
-  return row === undefined ? undefined : dim(row)
+  return row === undefined ? undefined : green(row)
 }
 
 let closed = false
@@ -3316,6 +3359,23 @@ let closed = false
 const pendingLines: string[] = []
 let lineWaiter: ((line: string) => void) | undefined
 let activeComposer: Composer | undefined
+
+/**
+ * The automated turn for a settled background child (2b). The decision lives
+ * in `auto-delivery.ts`; this block is only the mutable state around it.
+ */
+const AUTO_DELIVERY_LINE = AUTOMATED_DELIVERY_LINE
+/** One automated turn waiting at most: several settles coalesce into it. */
+let autoDeliveryQueued = false
+/** A child settled while a turn ran; the turn's own drain could not see it yet. */
+let settleArrivedDuringTurn = false
+/** A turn owns the transcript right now: a settle during it must be deferred. */
+let turnActive = false
+/**
+ * `interactive()` only: a one-shot has no next turn to deliver into, so its
+ * settle policy stays `once-policy.ts` and never queues a sentinel line.
+ */
+let autoDeliveryEnabled = false
 
 const deliverLine = (line: string): void => {
   const waiter = lineWaiter
@@ -3325,6 +3385,46 @@ const deliverLine = (line: string): void => {
     return
   }
   pendingLines.push(line)
+}
+
+/**
+ * A background child settled (2b): wake an automated delivery turn, or defer it
+ * to the end of the turn that is running.
+ */
+const wakeForSettledChild = (): void => {
+  const signal = settleSignal({
+    enabled: autoDeliveryEnabled,
+    closed,
+    turnActive,
+    queued: autoDeliveryQueued,
+  })
+  if (signal === 'ignore') return
+  if (signal === 'defer') {
+    settleArrivedDuringTurn = true
+    return
+  }
+  settleArrivedDuringTurn = false
+  autoDeliveryQueued = true
+  deliverLine(AUTO_DELIVERY_LINE)
+}
+
+/**
+ * The top of the loop: a settle deferred from the previous turn (`runTurn`'s
+ * seed already existed) is delivered now, before the prompt waits for input
+ * the user may never type.
+ */
+const wakeDeferredSettle = (): void => {
+  const signal = afterTurnSignal({
+    enabled: autoDeliveryEnabled,
+    closed,
+    turnActive,
+    queued: autoDeliveryQueued,
+    deferred: settleArrivedDuringTurn,
+  })
+  if (signal !== 'wake') return
+  settleArrivedDuringTurn = false
+  autoDeliveryQueued = true
+  deliverLine(AUTO_DELIVERY_LINE)
 }
 
 // A pipe (or the no-tray fallback) keeps readline: it is the right tool there,
@@ -3692,11 +3792,20 @@ const runTurn = async (
      * budget or the approvals.
      */
     agents?: AgentRegistry
+    /** `/view` mode; decides how much of a delivered child reaches the screen. */
+    viewMode?: ViewMode
   } = {},
 ): Promise<TurnResult> => {
   const maxSteps = options.maxSteps ?? stepLimit(process.env['Z1_MAX_STEPS'])
   const contextWindow =
     options.contextWindow ?? (Number(process.env['Z1_CONTEXT_WINDOW'] ?? '128000') || 128_000)
+  // 2b: children this turn launched, even ones that already finished. The
+  // closing row reads this, not the live count, so a fast child (it can settle
+  // before the turn closes) still gets an honest line instead of "nothing ran".
+  const launchedThisTurn: string[] = []
+  // `/view` decides how much of a delivered child is printed. The *seed* never
+  // changes with it: the model always gets the full block.
+  const dashMode: ViewMode = options.viewMode ?? 'medium'
 
   // One inventory read for the whole turn. The prompt, the wire `tools` array
   // and the guarded service all come from this snapshot, so they cannot
@@ -3745,6 +3854,7 @@ const runTurn = async (
         snapshot,
         guardCall,
         signal: controller.signal,
+        contextWindow,
         ...(agents === undefined
           ? {}
           : {
@@ -3774,6 +3884,7 @@ const runTurn = async (
                 // why this entry - and its cancel/lifetime promise - survives
                 // the turn that launched it (`handle.dispose()` never touches
                 // it); `/exit` and the `--once` policy are what end them.
+                launchedThisTurn.push(launch.result.runId)
                 agents.start({
                   runId: launch.result.runId,
                   mode: 'background',
@@ -3797,6 +3908,7 @@ const runTurn = async (
                 output?: string
                 text?: string
               }) => {
+                const before = agents.get(finish.runId)?.outcome
                 agents.finish(finish.runId, {
                   outcome: finish.status,
                   tools: finish.tools,
@@ -3808,6 +3920,18 @@ const runTurn = async (
                   ...(finish.text === undefined ? {} : { text: finish.text }),
                 })
                 childrenChanged(agents)
+                // 2b: the report is delivered on its own, once. Mid-turn the
+                // current seed could not carry it (the drain already ran), so
+                // the wake happens right after this turn instead.
+                const after = agents.get(finish.runId)
+                if (
+                  after !== undefined &&
+                  before === 'running' &&
+                  after.mode === 'background' &&
+                  after.delivered !== true
+                ) {
+                  wakeForSettledChild()
+                }
               },
             }),
       })
@@ -3856,10 +3980,24 @@ const runTurn = async (
     updatedAt: now,
   })
   progress.working('Thinking…')
-  // What the model now sees, the user sees too: one block per child, marked as
-  // subagent output, before the turn's own `⬢` answer starts.
+  // The seed above always carries the model's own `deliveredBlock`; what is
+  // printed here depends on `/view`. `full` shows that same block byte for byte
+  // (this mode's promise is "what was actually sent"), while `compact` and
+  // `medium` use the display renderer - `compact` promises prose and errors
+  // only, and five lines of metadata before every answer breaks that promise.
   for (const entry of delivered) {
-    progress.print(dim(deliveredBlock({ entry, elapsedMs: entryElapsed(entry, Date.now()) })))
+    const elapsedMs = entryElapsed(entry, Date.now())
+    const block = deliveredBlock({ entry, elapsedMs })
+    for (const line of deliveredLines({
+      entry,
+      elapsedMs,
+      mode: dashMode,
+      columns: terminalColumns(),
+      theme: viewTheme,
+      block,
+    })) {
+      progress.print(line)
+    }
   }
 
   let streamed = false
@@ -3931,11 +4069,17 @@ const runTurn = async (
     visible = sanitizer.push(rawOutput) + sanitizer.flush()
     if (visible.length > 0) progress.print(visible)
   }
-  // Empty after sanitizing: say what actually happened instead of leaving a
-  // blank turn (0 tools) or a silent one (markup with no tool call).
+  // Empty after sanitizing. A hand-off is its own case: the model launched
+  // background work and said nothing, so the empty-turn notices would be false
+  // ("nothing ran"), and a launch row here would *duplicate* the live child row
+  // the footer already shows (`◷ 1 subagent running · /agents`). The turn
+  // therefore prints nothing and leaves the footer to speak - which it does,
+  // for as long as the child runs and again when the report arrives.
   const toolsEnabled = snapshot.enabled.length > 0
-  const reply =
-    result.status === 'completed'
+  const handOff = result.status === 'completed' && visible.trim().length === 0 && launchedThisTurn.length > 0
+  const reply = handOff
+    ? { text: '', notice: undefined as string | undefined }
+    : result.status === 'completed'
       ? finalizeAssistantReply(visible, toolsEnabled)
       : { text: visible, notice: undefined as string | undefined }
   if (reply.notice !== undefined) {
@@ -4059,7 +4203,8 @@ const printUsage = (print: (line?: string) => void): void => {
   print('  subagents')
   print('    The `subagent` tool runs a child agent. It is a background launch by')
   print('    default: the call returns a run id and the child keeps working. Its')
-  print('    answer arrives at the start of your next message.')
+  print('    answer is delivered back on its own - the session runs a turn for it')
+  print('    as soon as the child settles, without waiting for you to type.')
   print('    Pass "wait": true in the call to block until the child finishes.')
   print('    /agents lists them; /agents stop <n|runId> stops one.')
   print('')
@@ -4298,6 +4443,8 @@ const gitBranch = (cwd: string): string | undefined => {
   try {
     const name = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
       cwd,
+      // Invisible probe: without this Windows allocates a console for it.
+      windowsHide: true,
       stdio: ['ignore', 'pipe', 'ignore'],
       encoding: 'utf8',
     }).trim()
@@ -4359,6 +4506,9 @@ const statusBar = (input: {
 
 const interactive = async (explicitModel: string | undefined, explicitView: ViewMode | undefined): Promise<void> => {
   const startup = startupView(explicitView)
+  // 2b: the interactive session is the only surface with a next turn, so it is
+  // the only one where a settled child can wake the prompt by itself.
+  autoDeliveryEnabled = true
   let viewMode: ViewMode = startup.mode
   let model = startModel(explicitModel)
   // `--model` and `/model` are instructions that survive a session switch; a
@@ -4688,7 +4838,9 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
   /** A stored user turn, drawn with the same full-width bar as a live one. */
   const printStoredUser = (text: string): void => {
     for (const [index, part] of text.split('\n').entries()) {
-      const line = `${index === 0 ? '│ ' : '  '}${part}`
+      // The same band and `❯` a live prompt uses: a reopened session must look
+      // like the session that produced it.
+      const line = `${index === 0 ? '❯ ' : '  '}${part}`
       const bar = colorEnabled ? padTo(line, Math.max(1, terminalColumns() - 1)) : line
       say(paint('48;5;237', bar))
     }
@@ -4714,7 +4866,9 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
     const calls = message.toolCalls ?? []
     if (mode === 'full') {
       for (const call of calls) {
-        say(dim(`⬢ ${call.name}(${compactArgs(call.arguments)})`))
+        // The same label a live row uses: a reopened session must read like the
+        // session that produced it, not like the argument JSON it stored.
+        say(dim(`⬢ ${callLine(call.name, call.arguments)}`))
       }
       return
     }
@@ -6100,6 +6254,10 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
       // Another session may have changed the policy while this one waited.
       tools.reloadPrefs()
       refreshStatus()
+      // 2b: a child that settled during the previous turn was not in that
+      // turn's seed. Wake an automated delivery now, before the prompt waits
+      // for input the user may never type.
+      wakeDeferredSettle()
       // `tail.idle()` closes a pending streamed row and clears the activity
       // line (the last turn's plate). A background child still running is the
       // exception (2b): its row is reprinted here, so it is visible between
@@ -6131,17 +6289,42 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
       line = line.trim()
       if (line.length === 0) continue
 
-      // The submitted prompt becomes ordinary scrollback; the composer below
-      // stays exactly once.
-      const parts = line.split('\n')
-      if (composer !== undefined || rl?.terminal !== true) {
-        parts.forEach((part, index) => {
-          const line = `${index === 0 ? '│ ' : '  '}${part}`
-          // A full-width, one-cell-short bar stays a single row and makes the
-          // user's turn easy to spot between assistant blocks.
-          const bar = colorEnabled ? padTo(line, Math.max(1, terminalColumns() - 1)) : line
-          say(paint('48;5;237', bar))
-        })
+      // 2b: the session woke itself because a background child settled. The
+      // report is the turn's seed (printed by `runTurn` as a marked block), so
+      // there is no user row and no command dispatch: this is not user input.
+      const autoDelivery = line === AUTO_DELIVERY_LINE
+      if (autoDelivery) {
+        autoDeliveryQueued = false
+        // The wake can be overtaken by a turn the user had already queued: that
+        // turn drains the report (its seed is built later), so by the time this
+        // sentinel is read there is nothing left to deliver. A turn that says
+        // "the report is delivered above" with no report above would be worse
+        // than no turn at all. The same check covers `/new`'s `clearFinished`.
+        if (agents === undefined || agents.settledUndelivered().length === 0) continue
+        // A wake queued before the user asked to quit must not start a model
+        // turn during shutdown: the `closed` guard in `settleSignal` only stops
+        // new wakes, and this one is already in the queue.
+        if (closed) break
+        // The session is speaking, not the user: one green row says so, where a
+        // typed prompt gets the grey bar. The report itself follows from the
+        // turn's seed, marked as subagent output.
+        say(green(AUTO_DELIVERY_ROW))
+      } else {
+        // The submitted prompt becomes ordinary scrollback; the composer below
+        // stays exactly once.
+        const parts = line.split('\n')
+        if (composer !== undefined || rl?.terminal !== true) {
+          parts.forEach((part, index) => {
+            // The user's own words get a full-width tinted band: it is the one
+            // row that is *not* the agent talking, and the band is what makes a
+            // long transcript scannable when every other row is prose. `❯`
+            // stays in front of it, so the marker survives a pipe and a theme
+            // that renders the background faintly.
+            const line = `${index === 0 ? '❯ ' : '  '}${part}`
+            const bar = colorEnabled ? padTo(line, Math.max(1, terminalColumns() - 1)) : line
+            say(paint('48;5;237', bar))
+          })
+        }
       }
 
       // A command on the first line of a multi-line submission runs first, and
@@ -6152,12 +6335,17 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
       // and whose shape allows its own arguments splits; anything else is one
       // prompt, exactly as before. A `rest: true` command owns the lines below
       // it as arguments, so `/tools` + `off 3` is one command and never a prompt.
-      const split = splitCommandAndPrompt(
-        line,
-        (name, rest) => handlers[name] !== undefined && shapeAllows(commandSpec(name), rest),
-        (name, args) => commandSpec(name)?.rest === true && restArguments(name, args),
-      )
-      if (split !== undefined) {
+      // An auto-delivery line is neither: it is the session's own prompt and
+      // must never reach the command table.
+      const split = autoDelivery
+        ? undefined
+        : splitCommandAndPrompt(
+            line,
+            (name, rest) => handlers[name] !== undefined && shapeAllows(commandSpec(name), rest),
+            (name, args) => commandSpec(name)?.rest === true && restArguments(name, args),
+          )
+      if (autoDelivery) line = AUTO_DELIVERY_PROMPT
+      else if (split !== undefined) {
         if ((await runCommand(split.command)) === 'exit') break
         // Nothing under the command: it was the whole submission.
         if (split.prompt.length === 0) continue
@@ -6193,11 +6381,17 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
       composer?.closeSessionMenu()
       composer?.closeViewMenu()
       const progress = createProgress(tail, viewMode)
-      const handle = await runtime.beginRun({ approval })
-      // The first prompt of a conversation creates its session; later prompts
-      // keep using it. A store failure returns undefined and the turn still runs.
-      const activeSession = ensureSession()
       try {
+        const handle = await runtime.beginRun({ approval })
+        // The first prompt of a conversation creates its session; later prompts
+        // keep using it. A store failure returns undefined and the turn still runs.
+        const activeSession = ensureSession()
+        // From here until the turn settles, a child that ends cannot be in this
+        // turn's seed (`drainSettled` already ran); it is remembered for the
+        // automated delivery right after this turn. Inside the `try` because
+        // it must be released on every path, including a `beginRun` throw.
+        turnActive = true
+        try {
         const outcome = await runTurn(runtime, handle, model, history, line, progress, {
           forceCompact,
           lastTokens,
@@ -6221,6 +6415,7 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
                   messageCount: history.filter((message) => message.role !== 'system').length,
                 },
           agents,
+          viewMode,
         })
         forceCompact = false
         history = outcome.history
@@ -6257,9 +6452,15 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
         }
         progress.closeLine()
       } finally {
-        await handle.dispose()
+          await handle.dispose()
+          // The turn no longer owns delivery: a settle that arrived during it is
+          // woken at the top of the loop, an idle one was already woken by
+          // `onFinish`.
+          turnActive = false
+        }
+      } finally {
+        composer?.setBusy(false)
       }
-      composer?.setBusy(false)
     }
   } finally {
     composer?.close()

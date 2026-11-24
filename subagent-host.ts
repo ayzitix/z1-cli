@@ -109,6 +109,12 @@ export interface ComposeSubagentOptions {
    */
   readonly signal?: AbortSignal
   /**
+   * The child model's context window, in tokens. The child stops at 75% of it
+   * and reports instead of dying on a provider error. The session passes its
+   * own window: the child runs on the same model.
+   */
+  readonly contextWindow?: number
+  /**
    * Read-side hooks for `/agents` (SUBAGENT-DESIGN-2, 1.5b).
    *
    * `onStart` fires when the package creates the child's run id, before the
@@ -245,6 +251,10 @@ export async function composeSubagentService(
     host: subagentHost(options.runtime),
     inventory,
     depth: 0,
+    // The child stops at 75% of this window and reports instead of running into
+    // a provider failure. The session's own window is the best number the CLI
+    // has: the child runs on the same model.
+    contextWindow: options.contextWindow ?? 128_000,
     approval: denyApprovalService,
     moduleApproval: denyApprovalService,
     guardCall: options.guardCall,

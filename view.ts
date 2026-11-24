@@ -15,6 +15,7 @@
  */
 
 import { clip } from './width.ts'
+import { callLine, resultSummary, toolTarget, toolVerb } from './tool-label.ts'
 
 export type ViewMode = 'compact' | 'medium' | 'full'
 
@@ -84,6 +85,8 @@ export interface ViewGroup {
   failures: number
   names: string[]
   summaries: (string | undefined)[]
+  /** What the last result of the group was, for a one-call group's detail. */
+  detail?: string
   failureName?: string
   failureError?: string
 }
@@ -227,31 +230,13 @@ const asText = (value: unknown): string | undefined => {
 }
 
 /**
- * The terse target a medium row names: `path`, `from → to`, `pattern`, `query`,
- * `url`, `command`, `id`, else the compact argument payload. `undefined` when
- * the call carries nothing worth printing.
+ * The terse target a medium row names: `package.json`, `a.ts → b.ts`, `TODO`.
+ *
+ * Delegates to `tool-label.ts`, so a call reads the same in every mode and an
+ * unknown tool falls back to its first argument rather than to JSON.
  */
-export const toolSummary = (name: string, args: string): string | undefined => {
-  const raw = args.trim()
-  if (raw === '' || raw === '{}' || raw === 'null') return undefined
-  let value: unknown
-  try {
-    value = JSON.parse(raw)
-  } catch {
-    return raw
-  }
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return asText(value)
-  const record = value as Record<string, unknown>
-  const from = asText(record['from'])
-  const to = asText(record['to'])
-  if (from !== undefined && to !== undefined) return `${from} → ${to}`
-  for (const key of ['path', 'file', 'pattern', 'query', 'url', 'command', 'id', 'taskId', 'name']) {
-    const text = asText(record[key])
-    if (text !== undefined) return text
-  }
-  const fallback = compactArgs(value)
-  return fallback === '{}' ? undefined : fallback
-}
+export const toolSummary = (name: string, args: string): string | undefined =>
+  toolTarget(name, args)
 
 /** The first meaningful line of a tool result, for the compact process notice. */
 export const resultLine = (value: unknown): string | undefined => {
@@ -272,33 +257,65 @@ export const resultLine = (value: unknown): string | undefined => {
 const clipLine = (text: string, ctx: ViewContext): string =>
   clip(text, Math.max(1, ctx.columns - 2))
 
-const callLabel = (name: string, summary: string | undefined, theme: ViewTheme): string =>
-  `${theme.bold('⬢')} ${theme.cyan(name)}${summary === undefined ? '' : ` ${theme.dim('→')} ${summary}`}`
-
 const hintTail = (hint: string | undefined, ctx: ViewContext): string =>
   hint === undefined || hint.length === 0 ? '' : ` ${ctx.theme.dim('·')} ${ctx.theme.dim(hint)}`
+
+/**
+ * The label a medium row starts with: `⬢ Read package.json`.
+ *
+ * The verb is the tool; the summary is what identifies this call. The old form
+ * was `⬢ read → package.json` - an id in lowercase with an arrow, which read
+ * as machine output rather than as a sentence.
+ */
+const callLabel = (name: string, summary: string | undefined, theme: ViewTheme): string =>
+  `${theme.bold('⬢')} ${theme.cyan(toolVerb(name))}${summary === undefined ? '' : ` ${summary}`}`
+
+/**
+ * What a folded group of calls did, in words: `Read 3 files`, `Scanned 2
+ * paths`.
+ *
+ * The old row was `⬢ scans · 2 · ✓ 41ms · 765 B`: a family id, a count, a
+ * duration and a byte size. Three of those four are telemetry. The sentence
+ * says the one thing a reader wants - what happened, and to how many things.
+ */
+const GROUP_NOUNS: Readonly<Record<string, string>> = {
+  reads: 'files',
+  scans: 'paths',
+  searches: 'lookups',
+  git: 'calls',
+  todos: 'calls',
+}
+
+const groupLabel = (family: string, count: number, ctx: ViewContext, mark = '⬢'): string => {
+  const { theme } = ctx
+  const verb = family === 'reads' ? 'Read' : family === 'scans' ? 'Scanned' : family === 'searches' ? 'Searched' : family === 'git' ? 'Git' : 'Todo'
+  const noun = GROUP_NOUNS[family] ?? 'calls'
+  return `${mark === '⬢' ? theme.bold(mark) : theme.dim(mark)} ${theme.cyan(`${verb} ${String(count)} ${noun}`)}`
+}
 
 const singleOk = (
   name: string,
   summary: string | undefined,
-  ms: number,
+  detail: string | undefined,
   ctx: ViewContext,
   hint?: string,
 ): string =>
   clipLine(
-    `${callLabel(name, summary, ctx.theme)} ${ctx.theme.dim('·')} ${ctx.theme.green('✓')} ${ctx.theme.dim(durationLabel(ms))}${hintTail(hint, ctx)}`,
+    `${callLabel(name, summary, ctx.theme)} ${ctx.theme.dim('·')} ${ctx.theme.green('✓')}${
+      detail === undefined ? '' : ` ${ctx.theme.dim(detail)}`
+    }${hintTail(hint, ctx)}`,
     ctx,
   )
 
 const singleFail = (
   name: string,
   summary: string | undefined,
-  ms: number,
+  _detail: string | undefined,
   ctx: ViewContext,
   hint?: string,
 ): string =>
   clipLine(
-    `${callLabel(name, summary, ctx.theme)} ${ctx.theme.dim('·')} ${ctx.theme.red('✗')} ${ctx.theme.dim(durationLabel(ms))}${hintTail(hint, ctx)}`,
+    `${callLabel(name, summary, ctx.theme)} ${ctx.theme.dim('·')} ${ctx.theme.red('✗')}${hintTail(hint, ctx)}`,
     ctx,
   )
 
@@ -314,9 +331,42 @@ const singleStarted = (
     ctx,
   )
 
+/**
+ * A failure short enough to read.
+ *
+ * The error text used to carry the whole absolute path:
+ *
+ *     ✗ cannot read "x.txt": ENOENT: no such file or directory, lstat 'C:\Users\…
+ *
+ * Two things are noise on this row. The `cannot read "x.txt":` prefix repeats
+ * what the call row above already says (`Read x.txt`), and the absolute path
+ * spends the row's width saying where the home directory is. What identifies
+ * the failure is the code and the sentence.
+ *
+ * Only *absolute* paths are shortened: a relative one (`tests/x.ts`) is the
+ * file's own name and stays. Matching a bare `/` was how the first version
+ * mangled `tests/does-not-exist.ts` into `testsdoes-not-exist.ts`.
+ */
+export const shortError = (error: string): string => {
+  const text = error
+    .replace(/\s+/g, ' ')
+    // The tool's own decoration: `cannot read "<path>": `. The call row names
+    // the file, so the prefix only repeats it.
+    .replace(/^cannot (?:read|stat|list|write|open|rename) "[^"]*":\s*/, '')
+    // An absolute Windows path (`C:\…`, `C:/…`) or POSIX path (`/…` at the
+    // start of a token). Both keep their last two segments.
+    .replace(/[A-Za-z]:[\\/][^'"\s]*|(?<=^|[\s'"(])\/[^\s'")]*/g, (match) => {
+      const segments = match.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean)
+      const tail = segments.slice(-2).join('/')
+      return tail.length > 0 ? tail : match
+    })
+    .trim()
+  return text.length <= 100 ? text : `${text.slice(0, 99)}…`
+}
+
 const failureDetail = (name: string, error: string, ctx: ViewContext): string =>
   clipLine(
-    `  ${ctx.theme.dim('⎿')}  ${ctx.theme.red(`✗ ${name} · ${error}`)}`,
+    `  ${ctx.theme.dim('⎿')}  ${ctx.theme.red(`✗ ${name} · ${shortError(error)}`)}`,
     ctx,
   )
 
@@ -326,23 +376,14 @@ const groupLine = (group: ViewGroup, ctx: ViewContext): string => {
     const name = group.names[0] ?? 'tool'
     const summary = group.summaries[0]
     return group.failures > 0
-      ? singleFail(name, summary, group.durationMs, ctx)
-      : singleOk(name, summary, group.durationMs, ctx)
+      ? singleFail(name, summary, undefined, ctx)
+      : singleOk(name, summary, group.detail, ctx)
   }
+  const label = groupLabel(group.family, group.count, ctx)
   if (group.failures > 0) {
-    return clipLine(
-      `${theme.bold('⬢')} ${theme.cyan(group.family)} ${theme.dim(`· ${String(group.count)} ·`)} ${theme.red(
-        `✗ ${String(group.failures)}`,
-      )} ${theme.dim(`· ${durationLabel(group.durationMs)}`)}`,
-      ctx,
-    )
+    return clipLine(`${label} ${theme.dim('·')} ${theme.red(`✗ ${String(group.failures)}`)}`, ctx)
   }
-  return clipLine(
-    `${theme.bold('⬢')} ${theme.cyan(group.family)} ${theme.dim(`· ${String(group.count)} ·`)} ${theme.green(
-      '✓',
-    )} ${theme.dim(`${durationLabel(group.durationMs)} · ${sizeLabel(group.size)}`)}`,
-    ctx,
-  )
+  return clipLine(`${label} ${theme.dim('·')} ${theme.green('✓')}`, ctx)
 }
 
 const interruptedLine = (group: ViewGroup, status: string, ctx: ViewContext): string => {
@@ -351,14 +392,11 @@ const interruptedLine = (group: ViewGroup, status: string, ctx: ViewContext): st
     const name = group.names[0] ?? 'tool'
     const summary = group.summaries[0]
     return clipLine(
-      `${theme.dim('⬡')} ${theme.dim(name)}${summary === undefined ? '' : ` ${theme.dim('→')} ${theme.dim(summary)}`} ${theme.dim(`· ${status}`)}`,
+      `${theme.dim('⬡')} ${theme.dim(toolVerb(name))}${summary === undefined ? '' : ` ${theme.dim(summary)}`} ${theme.dim(`· ${status}`)}`,
       ctx,
     )
   }
-  return clipLine(
-    `${theme.dim('⬡')} ${theme.dim(group.family)} ${theme.dim(`· ${String(group.count)} · ${status}`)}`,
-    ctx,
-  )
+  return clipLine(`${groupLabel(group.family, group.count, ctx, '⬡')} ${theme.dim(`· ${status}`)}`, ctx)
 }
 
 /** Emit a buffered group once and forget it. `status` forces the interrupted form. */
@@ -398,11 +436,13 @@ const startEvent = (state: ViewState, event: Extract<ViewEvent, { type: 'tool.st
   const summary = toolSummary(event.name, event.args)
   state.calls.set(event.path, { name: event.name, args: event.args, summary, family })
   if (state.mode === 'full') {
-    const args = event.args
+    // `Read package.json`, not `read({"path":"package.json"})`: the transcript
+    // is prose, and a JSON payload in the middle of it is the single loudest
+    // reason the output read as machine noise.
     return [
       {
         type: 'line',
-        text: `${ctx.theme.bold('⬢')} ${ctx.theme.cyan(event.name)}${args.length === 0 ? '' : ctx.theme.dim(`(${args})`)}`,
+        text: `${ctx.theme.bold('⬢')} ${ctx.theme.cyan(callLine(event.name, event.args))}`,
       },
     ]
   }
@@ -459,14 +499,18 @@ const endEvent = (state: ViewState, event: Extract<ViewEvent, { type: 'tool.end'
       return [
         {
           type: 'line',
-          text: `  ${theme.dim('⎿')}  ${theme.red(`✗ ${error}`)} ${theme.dim(`· ${ms}`)}${hintTail(event.hint, ctx)}`,
+          text: `  ${theme.dim('⎿')}  ${theme.red(`✗ ${shortError(error)}`)} ${theme.dim(`· ${ms}`)}${hintTail(event.hint, ctx)}`,
         },
       ]
     }
+    // What came back, not how long it took: `Read 120 lines` answers "did it
+    // work?", where `✓ 408ms · 163 B` answers a question nobody asked. The
+    // duration stays in `medium` and in the journal for anyone debugging speed.
+    const result = resultSummary(name, event.result)
     return [
       {
         type: 'line',
-        text: `  ${theme.dim('⎿')}  ${theme.green('✓')} ${theme.dim(`${ms} · ${sizeLabel(event.size)}`)}${hintTail(event.hint, ctx)}`,
+        text: `  ${theme.dim('⎿')}  ${theme.green('✓')} ${theme.dim(result ?? `${ms} · ${sizeLabel(event.size)}`)}${hintTail(event.hint, ctx)}`,
       },
     ]
   }
@@ -516,6 +560,9 @@ const endEvent = (state: ViewState, event: Extract<ViewEvent, { type: 'tool.end'
     group.durationMs += event.durationMs
     if (event.ok) {
       group.size += event.size
+      // A one-call group prints its result on the line; a folded group names
+      // only the count, because five different sizes on one row say nothing.
+      group.detail = resultSummary(name, event.result, { verb: false })
       return []
     }
     group.failures += 1
@@ -525,10 +572,14 @@ const endEvent = (state: ViewState, event: Extract<ViewEvent, { type: 'tool.end'
     return flushGroup(state, ctx)
   }
   // A solitary or ungrouped call is one line, printed when its result arrives.
-  if (event.ok) return [{ type: 'line', text: singleOk(name, summary, event.durationMs, ctx, event.hint) }]
+  // The detail is what came back (`7 lines`), not how long it took.
+  if (event.ok) {
+    const detail = resultSummary(name, event.result, { verb: false })
+    return [{ type: 'line', text: singleOk(name, summary, detail, ctx, event.hint) }]
+  }
   state.shown.add(error)
   return [
-    { type: 'line', text: singleFail(name, summary, event.durationMs, ctx, event.hint) },
+    { type: 'line', text: singleFail(name, summary, undefined, ctx, event.hint) },
     { type: 'line', text: failureDetail(name, error, ctx) },
   ]
 }
@@ -564,6 +615,11 @@ export const viewEvent = (state: ViewState, event: ViewEvent, ctx: ViewContext):
  * The first committed row of an assistant block. It closes a medium group only
  * when no call is still pending; the graph guarantees results arrive before the
  * next block's text, so a pending call here means the turn was cut off.
+ *
+ * It also sets `state.assistantStarted`, which `chat.ts` reads to decide whether
+ * a blank line belongs above the block. One blank line between blocks and none
+ * within one is the strongest structural cue a transcript has: without it a
+ * tool row and the prose that follows read as the same paragraph.
  */
 export const viewTextStart = (state: ViewState, ctx: ViewContext): readonly ViewAction[] => {
   state.assistantStarted = true
@@ -779,10 +835,7 @@ export const groupStoredCalls = (
       return
     }
     lines.push(
-      clipLine(
-        `${ctx.theme.bold('⬢')} ${ctx.theme.cyan(current.family)} ${ctx.theme.dim(`· ${String(current.count)}`)}`,
-        ctx,
-      ),
+      clipLine(groupLabel(current.family, current.count, ctx), ctx),
     )
   }
   for (const call of calls) {

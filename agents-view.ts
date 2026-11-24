@@ -27,7 +27,9 @@ import {
   type AgentResolution,
 } from './agents.ts'
 import { clip } from './width.ts'
+import { callLine } from './tool-label.ts'
 import type { ViewTheme } from './view.ts'
+import { shortError } from './view.ts'
 
 /** The colours a row may use; the same set `view.ts` takes. */
 export interface AgentsTheme extends ViewTheme {}
@@ -528,10 +530,9 @@ export const agentTranscriptLines = (input: AgentViewOptions): readonly string[]
       if (inputCall !== null) {
         const item = (outputs['value'] as { item?: { name?: unknown; arguments?: unknown } } | undefined)?.item ?? {}
         const name = typeof item.name === 'string' && item.name.length > 0 ? item.name : 'tool'
-        const summary = summarize(item.arguments)
-        lines.push(
-          clip(`${theme.bold('⬢')} ${theme.cyan(name)}${summary === '' ? '' : ` ${theme.dim('→')} ${summary}`}`, cols),
-        )
+        // The same `Read package.json` the parent transcript prints: a child's
+        // transcript is read next to it, and two dialects would be one too many.
+        lines.push(clip(`${theme.bold('⬢')} ${theme.cyan(callLine(name, item.arguments))}`, cols))
         continue
       }
       const callResult = /toolMap\/\d+\/mapCall$/.exec(path)
@@ -543,7 +544,7 @@ export const agentTranscriptLines = (input: AgentViewOptions): readonly string[]
           : (textOf(result, 200)?.split('\n')[0] ?? '')
         lines.push(
           clip(
-            `  ${theme.dim('⎿')}  ${failed ? theme.red(`✗ ${detail}`) : theme.green('✓')}${failed || detail === '' ? '' : ` ${theme.dim(detail)}`}`,
+            `  ${theme.dim('⎿')}  ${failed ? theme.red(`✗ ${shortError(detail)}`) : theme.green('✓')}${failed || detail === '' ? '' : ` ${theme.dim(detail)}`}`,
             cols,
           ),
         )
