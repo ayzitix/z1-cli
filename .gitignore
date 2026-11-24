@@ -2,6 +2,8 @@
 runs.db*
 modules/
 proposals/
+# The workspace-local state a run writes (journal, spilled tool output).
+.z1/
 *.log
 
 # secrets and local config

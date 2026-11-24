@@ -751,6 +751,9 @@ async function run(
       child = spawn(command, [...args], {
         cwd: options.cwd,
         env: options.env ?? process.env,
+        // A probe process is invisible work: on Windows a plain spawn allocates
+        // a console window, and every web tool call flashed one on screen.
+        windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       })
     } catch (error) {
