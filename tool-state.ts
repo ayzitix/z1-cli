@@ -38,6 +38,18 @@ import {
 /** The wire shape of a declared tool, exactly as the run's service returns it. */
 export type ToolSchema = Awaited<ReturnType<ToolService['list']>>[number]
 
+/**
+ * Tools every listing marks as `system`: the CLI composes them, or the engine
+ * adds them behind a feature switch. They can be turned **off** (hidden from the
+ * model) but never deleted: a tombstone for a tool the host recreates on the
+ * next start is noise, not a decision.
+ *
+ * `tool.create` mirrors `TOOL_CREATE_NAME` in `@z1/tool-creator`; the engine
+ * adds it only when `Z1_TOOL_CREATOR` is on. Host schemas such as `subagent`
+ * are system by construction and are added from the constructor argument.
+ */
+const SYSTEM_TOOL_NAMES: ReadonlySet<string> = new Set(['tool.create'])
+
 export interface ToolRecord {
   readonly name: string
   readonly description: string
@@ -45,6 +57,12 @@ export interface ToolRecord {
   readonly state: ToolMode
   /** False for an orphan preference: a decision about a tool no module ships now. */
   readonly installed: boolean
+  /**
+   * True for a tool the host owns: listed and policy-controlled like the others,
+   * but it cannot be deleted (only turned off, or switched off at its source).
+   * See {@link SYSTEM_TOOL_NAMES}.
+   */
+  readonly system: boolean
   readonly schema?: ToolSchema
 }
 
@@ -145,9 +163,21 @@ export class ToolState {
     return this.#loaded.path
   }
 
+  /**
+   * The names {@link SYSTEM_TOOL_NAMES} covers for this store: the built-in set
+   * plus whatever the CLI composed itself (`subagent`).
+   */
+  #systemNames(): ReadonlySet<string> {
+    if (this.#hostSchemas.length === 0) return SYSTEM_TOOL_NAMES
+    const names = new Set(SYSTEM_TOOL_NAMES)
+    for (const tool of this.#hostSchemas) names.add(tool.name)
+    return names
+  }
+
   #build(): ToolSnapshot {
     const prefs = this.#loaded.prefs
     const schemas = this.#installedSchemas()
+    const systemNames = this.#systemNames()
     const installed = new Set<string>()
     const records: ToolRecord[] = []
     for (const schema of schemas) {
@@ -158,13 +188,22 @@ export class ToolState {
           description: schema.description ?? '',
           state: toolState(prefs, schema.name),
           installed: true,
+          system: systemNames.has(schema.name),
           schema,
         }),
       )
     }
     for (const [name, entry] of Object.entries(prefs.tools)) {
       if (installed.has(name)) continue
-      records.push(Object.freeze({ name, description: '', state: entry.state, installed: false }))
+      records.push(
+        Object.freeze({
+          name,
+          description: '',
+          state: entry.state,
+          installed: false,
+          system: systemNames.has(name),
+        }),
+      )
     }
     const enabled = records.filter((record) => record.installed && record.state === 'enabled')
     return Object.freeze({
@@ -259,6 +298,22 @@ export class ToolState {
   apply(names: readonly string[], state: ToolMode): ToolSetResult {
     const targets = [...names]
     if (targets.length === 0) return { ok: false, message: 'tools · nothing to change' }
+    if (state === 'deleted') {
+      // A system tool is recreated by its host on the next start, so a tombstone
+      // is either ignored or silently resurrected. Refuse, and name the two
+      // levers that do work: turn it off, or switch its source off.
+      const systemNames = this.#systemNames()
+      const system = targets.filter((name) => systemNames.has(name))
+      if (system.length > 0) {
+        const which = system.join(', ')
+        return {
+          ok: false,
+          message:
+            `tools · ${which} ${system.length === 1 ? 'is a' : 'are'} system tool${system.length === 1 ? '' : 's'}: it cannot be deleted · ` +
+            '/tools off hides it from the agent · Z1_TOOL_CREATOR=0 removes tool.create entirely',
+        }
+      }
+    }
     const fresh = loadToolPreferences()
     // Merging onto a fallback is not a merge: the caller would be editing the
     // last-good (or empty) policy and then atomically replacing the file, which

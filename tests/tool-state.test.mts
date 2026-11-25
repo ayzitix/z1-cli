@@ -114,4 +114,42 @@ assert.deepEqual(store.current.enabled.map((row) => row.name), ['read'])
 }
 process.env['Z1_TOOLS_FILE'] = file
 
+// System tools: listed, policy-controlled, but never deletable. `tool.create`
+// is added by the engine behind Z1_TOOL_CREATOR; `subagent` is a host schema and
+// is system by construction.
+{
+  const systemFile = join(dir, 'system-tools.json')
+  process.env['Z1_TOOLS_FILE'] = systemFile
+  const hostSchema = { name: 'subagent', description: 'delegate', parameters: { type: 'object' } }
+  const systemStore = new ToolState(
+    async () => [schema('read'), schema('tool.create'), hostSchema],
+    [hostSchema],
+  )
+  await systemStore.reload()
+  const record = (name: string) => systemStore.current.records.find((row) => row.name === name)
+
+  assert.equal(record('tool.create')?.system, true)
+  assert.equal(record('subagent')?.system, true, 'a host schema is system by construction')
+  assert.equal(record('read')?.system, false)
+
+  const refusedCreate = systemStore.apply(['tool.create'], 'deleted')
+  assert.equal(refusedCreate.ok, false, 'a system tool cannot be deleted')
+  if (!refusedCreate.ok) {
+    assert.match(refusedCreate.message, /system tool/)
+    assert.match(refusedCreate.message, /Z1_TOOL_CREATOR=0/)
+  }
+  const refusedHost = systemStore.apply(['subagent'], 'deleted')
+  assert.equal(refusedHost.ok, false)
+
+  // Turning it off is allowed: the agent stops seeing it, the row stays.
+  const off = systemStore.apply(['tool.create'], 'disabled')
+  assert.equal(off.ok, true)
+  assert.deepEqual(systemStore.current.enabled.map((row) => row.name), ['read', 'subagent'])
+  assert.equal(record('tool.create')?.state, 'disabled')
+
+  // A real tool is still deletable.
+  assert.equal(systemStore.apply(['read'], 'deleted').ok, true)
+  process.env['Z1_TOOLS_FILE'] = file
+}
+
 console.log('tool-state tests passed')

@@ -24,8 +24,13 @@ const main = async (): Promise<void> => {
       const store = new ToolStore(() => handle.services.tools.list(), [subagentToolSchema])
       const snapshot = await store.reload()
       for (const record of snapshot.records.filter((row) => row.installed)) {
+        // `system` is a marker, not a state: such a tool can be turned off but
+        // never deleted (the host recreates it on the next start).
+        const owned = record.system ? '\tsystem' : ''
         console.log(
-          record.state === 'enabled' ? record.name : `${record.name}\t${record.state}`,
+          record.state === 'enabled'
+            ? `${record.name}${owned}`
+            : `${record.name}\t${record.state}${owned}`,
         )
       }
       if (snapshot.installedCount === 0) console.error('no tools installed')

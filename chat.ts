@@ -5350,7 +5350,10 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
       const room = Math.max(8, terminalColumns() - displayCells(prefix) - nameWidth - 2)
       const suffix = description.length > 0 ? `  ${dim(fit(description, room))}` : ''
       const missing = row.installed ? '' : dim(' (not installed)')
-      say(`${prefix}${padTo(fit(row.name, nameWidth), nameWidth)}${suffix}${missing}`)
+      // A system tool is listed like the others but cannot be deleted; say so
+      // where the user decides, not only when a delete is refused.
+      const owned = row.system ? dim(' · system') : ''
+      say(`${prefix}${padTo(fit(row.name, nameWidth), nameWidth)}${suffix}${missing}${owned}`)
     }
     if (deleted > 0) {
       say(dim('  deleted tools stay installed but are hidden from the agent.'))
