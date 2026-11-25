@@ -62,6 +62,29 @@ const resolveSdkRoot = (): string => {
 
 export const SDK_ROOT = resolveSdkRoot()
 
+/**
+ * Point `tool.create` at a z2q checkout when the caller has not.
+ *
+ * `Z1_TOOL_SDK_PATH` is the engine's documented lever, but the two checkouts are
+ * siblings in this layout, so the common case should not need an environment
+ * variable. Only an unset variable is filled in: an explicit value — including a
+ * deliberately wrong one — is the caller's decision and is never overwritten.
+ */
+const resolveToolSdkPath = (): string => {
+  const explicit = process.env['Z1_TOOL_SDK_PATH']?.trim()
+  if (explicit !== undefined && explicit !== '') return explicit
+  const sibling = resolve(here, '..', 'z1-tool-sdk')
+  for (const candidate of [sibling, resolve(process.cwd(), 'z1-tool-sdk')]) {
+    if (existsSync(join(candidate, 'dist', 'index.js'))) {
+      process.env['Z1_TOOL_SDK_PATH'] = candidate
+      return candidate
+    }
+  }
+  return ''
+}
+
+export const TOOL_SDK_ROOT = resolveToolSdkPath()
+
 const load = async <T>(packageName: string): Promise<T> => {
   const file = join(SDK_ROOT, 'z1', 'packages', packageName, 'lib', 'index.js')
   return (await import(pathToFileURL(file).href)) as T
