@@ -213,6 +213,16 @@ repo.
   enabled the key is absent from the request. The model can now answer "what
   tools do you have?" and cannot invent a disabled one. Names only, so the block
   is about 40 tokens.
+- **Reply language**: the same prompt names the language of this turn's message
+  when its script decides it — Ukrainian or Russian by their own letters, and
+  Japanese, Chinese, Korean, Arabic, Hebrew, Greek, Thai or Hindi by their
+  alphabet. A Cyrillic message with neither `і/ї/є/ґ` nor `ы/э/ё/ъ` gets the pair
+  said out loud instead of a guess, and a Latin-script message gets no line at
+  all (English, Spanish, Polish and French share the alphabet). It repeats the
+  SDK's own rule rather than replacing it; the point is that a small model read
+  an eight-kilobyte English prompt as a reason to answer in English. Code,
+  paths and URLs are stripped first, so a Ukrainian sentence about `git status`
+  is still Ukrainian.
 - **Sessions**: every turn is appended to `z1/sessions/<id>/{meta,events.jsonl}`
   in the project (ignored through `.git/info/exclude`). `/sessions` opens an
   arrow picker; `new`, `rename`, `delete`, `archive` and `--all` are the text

@@ -1,6 +1,6 @@
 # z1 CLI tests
 
-Sixteen dependency-free checks: no test framework, no external network, nothing
+Seventeen dependency-free checks: no test framework, no external network, nothing
 installed — and deliberately **not** a full CLI suite. The density pty case
 starts a loopback OpenAI-compatible server in `tests/fake-openai.py`.
 
@@ -18,6 +18,7 @@ From the repo root:
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/workspace-state.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/session-root.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/project-context.test.mts
+~/Projects/z1-sdk/node_modules/.bin/tsx tests/language.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/input.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/output.test.mts
 ~/Projects/z1-sdk/node_modules/.bin/tsx tests/width.test.mts

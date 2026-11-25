@@ -51,6 +51,7 @@ import {
   projectContextText,
 } from './project-context.ts'
 import { probableSessionRoot } from './session-root.ts'
+import { languageHintText } from './language.ts'
 import { ensureWebSearch, stopWebSearch, webSearchStatus } from './web-service.ts'
 import type { WebStatus } from './web-service.ts'
 import { restArguments, splitCommandAndPrompt, splitUnknownCommand } from './input.ts'
@@ -3958,6 +3959,11 @@ const runTurn = async (
     model,
     maxSteps,
     system: [
+      // First, because it is about this very turn: the SDK core states the rule
+      // in the abstract ("the user's language") and a small model read an
+      // English answer into an English prompt instead. Naming the language of
+      // the message it is answering removes that reading.
+      languageHintText(prompt) ?? '',
       toolInventoryText(snapshot),
       // Where z1 keeps its own state, in the same slot: without it the model
       // reads the transcript folder and `.z1/` as project files.
