@@ -31,6 +31,7 @@ import {
 import type {
   ApprovalService,
   ChatMessage,
+  ModelHandle,
   RunEvent,
   RunHandle,
   RunResult,
@@ -128,7 +129,6 @@ process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
  */
 const processStart = Date.now()
 
-type ModelHandle = { provider: string; model: string; credentialRef?: string; params?: Record<string, unknown> }
 type ToolSchema = Awaited<ReturnType<RunHandle['services']['tools']['list']>>[number]
 type MutableGraph = {
   id: string
@@ -4378,7 +4378,7 @@ const oneShot = async (prompt: string, explicitModel: string | undefined, explic
   void ensureWebSearch({ onLine: line => console.error(dim(line)) })
   // Without a terminal an approval would block forever, so it is declined and
   // reported instead of silently hanging the run.
-  const handle = await runtime.beginRun({ approval: quietApproval(progress) })
+  const handle = await runtime.beginRun({ approval: quietApproval(progress), model })
   try {
     const toolState = new ToolStore(() => handle.services.tools.list(), [subagentToolSchema])
     if (split !== undefined) {
@@ -6412,7 +6412,10 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
       composer?.closeViewMenu()
       const progress = createProgress(tail, viewMode)
       try {
-        const handle = await runtime.beginRun({ approval })
+        // `model` is the turn's own handle: the run passes it to the host hooks
+        // that make a model call of their own (today `tool.create`), so a tool
+        // proposal is billed and journaled like the turn that asked for it.
+        const handle = await runtime.beginRun({ approval, model })
         // The first prompt of a conversation creates its session; later prompts
         // keep using it. A store failure returns undefined and the turn still runs.
         const activeSession = ensureSession()
