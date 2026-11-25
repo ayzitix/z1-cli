@@ -98,6 +98,27 @@ A pipe works too:
 printf 'summarise this repo\n/exit\n' | z1
 ```
 
+## Tools from z2q
+
+`tool.create` builds a tool proposal; installing one is a person's step, and the
+command it prints (`z1 tool install <proposalDir>`) is the one that works: `z1`
+finds the z2q checkout the same way `tool.create` does — `Z1_TOOL_SDK_PATH`,
+then a sibling `../z1-tool-sdk`, then `./z1-tool-sdk` — and runs its CLI, so
+`z1-tool` never has to be on `PATH`.
+
+```bash
+z1 tool --help
+z1 tool installed
+z1 tool build examples/find-todos
+z1 tool run examples/find-todos --args '{"glob":"**/*.ts"}' --workspace .
+z1 tool install .z2q/proposals/tool.find-todos-1-1795640390307
+```
+
+A proposal is untrusted content: it is model-written source that passed a static
+review and a sandboxed smoke test. Read its capability lines (what it may read,
+write, run, fetch from the network, which environment variables it may see)
+before installing.
+
 ## Subagents
 
 The `subagent` tool delegates one task to a child agent with its own tool grant.

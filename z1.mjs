@@ -39,13 +39,43 @@ const sdkCommands = new Set([
   'model',
 ])
 
+/**
+ * The z2q checkout, resolved the same way `sdk.ts` resolves it for `tool.create`:
+ * `Z1_TOOL_SDK_PATH`, then a sibling `../z1-tool-sdk`, then one under the cwd.
+ * `z1 tool …` runs that package's own CLI, so a proposal built by `tool.create`
+ * can be installed from the same command the user already types.
+ */
+const resolveToolSdk = () => {
+  const candidates = []
+  const explicit = process.env['Z1_TOOL_SDK_PATH']?.trim()
+  if (explicit !== undefined && explicit !== '') candidates.push(explicit)
+  candidates.push(resolve(here, '..', 'z1-tool-sdk'), resolve(process.cwd(), 'z1-tool-sdk'))
+  for (const candidate of candidates) {
+    if (existsSync(join(candidate, 'dist', 'cli.js'))) return candidate
+  }
+  return undefined
+}
+
 const args = process.argv.slice(2)
 const first = args[0]
 
 let entry = join(here, 'chat.ts')
 let pass = args
+/** A plain node entry point, without tsx: the z2q CLI is already compiled. */
+let nodeEntry
 
-if (first === 'tools') {
+if (first === 'tool') {
+  // `z1 tool install <dir>` — the name every proposal's next step prints, so the
+  // console's own instruction works even though `z1-tool` is not on PATH.
+  const root = resolveToolSdk()
+  if (root === undefined) {
+    console.error('z1: z2q is not installed or not built')
+    console.error('    set Z1_TOOL_SDK_PATH to the z1-tool-sdk root and run: npm run build')
+    process.exit(1)
+  }
+  nodeEntry = join(root, 'dist', 'cli.js')
+  pass = args.slice(1)
+} else if (first === 'tools') {
   entry = join(here, 'tools.ts')
   pass = args.slice(1)
 } else if (first === 'chat') {
@@ -59,10 +89,15 @@ if (first === 'tools') {
   pass = ['--once', args.join(' ')]
 }
 
-const child = spawn(process.execPath, [tsx, '--tsconfig', runtimeConfig, entry, ...pass], {
-  stdio: 'inherit',
-  env: { ...process.env, Z1_SDK_REPO: sdk },
-})
+const child = nodeEntry === undefined
+  ? spawn(process.execPath, [tsx, '--tsconfig', runtimeConfig, entry, ...pass], {
+      stdio: 'inherit',
+      env: { ...process.env, Z1_SDK_REPO: sdk },
+    })
+  : spawn(process.execPath, [nodeEntry, ...pass], {
+      stdio: 'inherit',
+      env: { ...process.env, Z1_TOOL_SDK_PATH: resolveToolSdk() ?? '' },
+    })
 
 child.on('error', (error) => {
   console.error(`z1: ${error.message}`)
