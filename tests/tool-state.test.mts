@@ -152,4 +152,39 @@ process.env['Z1_TOOLS_FILE'] = file
   process.env['Z1_TOOLS_FILE'] = file
 }
 
+// `env.keys` is the always-on case: a system tool whose `off` is refused too,
+// because the engine composes it into every run that has a workspace. The
+// refusal has to name the one lever that exists instead of the two that do not.
+{
+  const envFile = join(dir, 'env-keys-tools.json')
+  process.env['Z1_TOOLS_FILE'] = envFile
+  const envStore = new ToolState(async () => [schema('read'), schema('env.keys')])
+  await envStore.reload()
+  const record = (name: string) => envStore.current.records.find((row) => row.name === name)
+
+  assert.equal(record('env.keys')?.system, true, 'env.keys is system')
+  assert.equal(record('read')?.system, false)
+
+  const refusedDelete = envStore.apply(['env.keys'], 'deleted')
+  assert.equal(refusedDelete.ok, false, 'env.keys cannot be deleted')
+  if (!refusedDelete.ok) {
+    assert.match(refusedDelete.message, /env\.keys/)
+    assert.match(refusedDelete.message, /always on/)
+    assert.match(refusedDelete.message, /not to have one/)
+    assert.doesNotMatch(refusedDelete.message, /Z1_TOOL_CREATOR=0/, 'no lever that does not work')
+  }
+
+  const refusedOff = envStore.apply(['env.keys'], 'disabled')
+  assert.equal(refusedOff.ok, false, 'env.keys cannot be turned off either')
+  if (!refusedOff.ok) {
+    assert.match(refusedOff.message, /cannot be deleted or turned off/)
+    assert.match(refusedOff.message, /only way to remove it is not to have one/)
+  }
+  // Refused means the overlay was never written: the tool stays enabled.
+  assert.equal(record('env.keys')?.state, 'enabled')
+  assert.deepEqual(envStore.current.enabled.map((row) => row.name), ['read', 'env.keys'])
+
+  process.env['Z1_TOOLS_FILE'] = file
+}
+
 console.log('tool-state tests passed')

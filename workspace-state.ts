@@ -116,5 +116,8 @@ export function ownStateText(options: {
     root === '' || identity !== undefined
       ? '- The todo list is changed with `todo.write` when this turn has it, never by editing `.z1/todos.json`.'
       : '- The todo list is changed with `todo.write` when this turn has it, never by editing `.z1/todos.json`. The user switches transcripts with `/sessions`.',
+    // A model that does not know the tool exists edits `.env` by hand, which is
+    // the one file where a stray rewrite loses a secret nothing else holds.
+    '- Project keys live in `.env` and are managed with `env.keys` (list, set, unset, check, scan); do not edit that file by hand.',
   ].join('\n')
 }

@@ -45,10 +45,24 @@ export type ToolSchema = Awaited<ReturnType<ToolService['list']>>[number]
  * next start is noise, not a decision.
  *
  * `tool.create` mirrors `TOOL_CREATE_NAME` in `@z1/tool-creator`; the engine
- * adds it only when `Z1_TOOL_CREATOR` is on. Host schemas such as `subagent`
- * are system by construction and are added from the constructor argument.
+ * adds it only when `Z1_TOOL_CREATOR` is on. `env.keys` mirrors
+ * `ENV_KEYS_TOOL_NAME` in `@z1/env-keys`, which the bootstrap composes into
+ * every run that has a workspace. Host schemas such as `subagent` are system by
+ * construction and are added from the constructor argument.
  */
-const SYSTEM_TOOL_NAMES: ReadonlySet<string> = new Set(['tool.create'])
+const SYSTEM_TOOL_NAMES: ReadonlySet<string> = new Set(['tool.create', 'env.keys'])
+
+/**
+ * The system tools that are not only undeletable but **always on**: `off` is
+ * refused too, because the tool is composed into every run rather than restored
+ * from a declaration the next start would read.
+ *
+ * `env.keys` manages the `.env` file a run's keys come from. Hiding it from the
+ * model would not remove the file, it would only send the next person back to
+ * hand-editing a secret the tool exists to keep out of source files — so the
+ * only lever left is the one the refusal states: a run without a workspace.
+ */
+const ALWAYS_ON_TOOL_NAMES: ReadonlySet<string> = new Set(['env.keys'])
 
 export interface ToolRecord {
   readonly name: string
@@ -298,19 +312,36 @@ export class ToolState {
   apply(names: readonly string[], state: ToolMode): ToolSetResult {
     const targets = [...names]
     if (targets.length === 0) return { ok: false, message: 'tools · nothing to change' }
-    if (state === 'deleted') {
-      // A system tool is recreated by its host on the next start, so a tombstone
-      // is either ignored or silently resurrected. Refuse, and name the two
-      // levers that do work: turn it off, or switch its source off.
-      const systemNames = this.#systemNames()
-      const system = targets.filter((name) => systemNames.has(name))
-      if (system.length > 0) {
-        const which = system.join(', ')
+    if (state === 'deleted' || state === 'disabled') {
+      // The always-on tools are refused first, and for both states: no mode
+      // removes them, so naming a lever that does not work (`off`, a tombstone)
+      // would be worse than the truth — the tool exists whenever a run has a
+      // workspace.
+      const alwaysOn = targets.filter((name) => ALWAYS_ON_TOOL_NAMES.has(name))
+      if (alwaysOn.length > 0) {
+        const which = alwaysOn.join(', ')
+        const one = alwaysOn.length === 1
         return {
           ok: false,
           message:
-            `tools · ${which} ${system.length === 1 ? 'is a' : 'are'} system tool${system.length === 1 ? '' : 's'}: it cannot be deleted · ` +
-            '/tools off hides it from the agent · Z1_TOOL_CREATOR=0 removes tool.create entirely',
+            `tools · ${which} ${one ? 'is' : 'are'} always on: ${one ? 'it' : 'they'} cannot be deleted or turned off · ` +
+            `${which} is composed into every run that has a workspace, so the only way to remove it is not to have one`,
+        }
+      }
+      if (state === 'deleted') {
+        // A system tool is recreated by its host on the next start, so a
+        // tombstone is either ignored or silently resurrected. Refuse, and name
+        // the two levers that do work: turn it off, or switch its source off.
+        const systemNames = this.#systemNames()
+        const system = targets.filter((name) => systemNames.has(name))
+        if (system.length > 0) {
+          const which = system.join(', ')
+          return {
+            ok: false,
+            message:
+              `tools · ${which} ${system.length === 1 ? 'is a' : 'are'} system tool${system.length === 1 ? '' : 's'}: it cannot be deleted · ` +
+              '/tools off hides it from the agent · Z1_TOOL_CREATOR=0 removes tool.create entirely',
+          }
         }
       }
     }

@@ -358,6 +358,13 @@ interface ToolMenuItem {
   state: ToolState
   /** False for a tombstone whose module is no longer installed. */
   installed: boolean
+  /**
+   * True for a tool the host owns (`tool.create`, `env.keys`). The row says so,
+   * because the list is where a person decides: a tool that cannot be deleted
+   * (or, for `env.keys`, not even turned off) must not look like the others and
+   * refuse only after the keypress. See `SYSTEM_TOOL_NAMES` in `tool-state.ts`.
+   */
+  system: boolean
 }
 
 type ToolMenuAction = 'toggle' | 'delete'
@@ -1593,11 +1600,17 @@ class Composer {
       const name = padTo(fit(item.name, nameWidth), nameWidth)
       const label = selected ? bold(cyan(name)) : name
       const missing = item.installed ? '' : dim(' (not installed)')
+      // The same marker the numbered `/tools` list prints: the row a person
+      // would try to delete says it cannot be, before they try.
+      const owned = item.system ? dim(' · system') : ''
       const description = (item.description.split('\n')[0] ?? '').trim()
-      const room = Math.max(0, columns - 2 - 4 - 3 - nameWidth - displayCells(missing) - 2)
+      const room = Math.max(
+        0,
+        columns - 2 - 4 - 3 - nameWidth - displayCells(missing) - displayCells(owned) - 2,
+      )
       const suffix = description.length > 0 ? `  ${dim(clip(description, room))}` : ''
       lines.push(
-        clip(`${pointer}${state}  ${label}${missing}${suffix}`, Math.max(1, columns - 1)),
+        clip(`${pointer}${state}  ${label}${missing}${owned}${suffix}`, Math.max(1, columns - 1)),
       )
     }
     return lines
@@ -5396,6 +5409,7 @@ const interactive = async (explicitModel: string | undefined, explicitView: View
       description: record.description,
       state: record.state,
       installed: record.installed,
+      system: record.system,
     }))
 
   /**
