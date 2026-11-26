@@ -4,7 +4,7 @@
  * The SDK's core prompt says "reply in the user's language", and with a strong
  * model that is enough. With a small, fast one it is not: a turn that asked for
  * a tool in Ukrainian was answered in English, because the surrounding prompt,
- * the 29 tool descriptions and the tool's own output were all English and the
+ * the 28 tool descriptions and the tool's own output were all English and the
  * answer was long and technical. "The user's language" is an abstraction the
  * model has to resolve; naming it outright — twice, in one short line — costs
  * about thirty tokens and removes the resolution step entirely.

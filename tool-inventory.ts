@@ -72,7 +72,7 @@ const NO_TOOLS_RULE =
   'Before your first action, check the request against what you have. If it needs any tool — creating or editing a file, running a command, reading a page — say so in your first sentence, name the tool you would need, and ask the user to enable it with /tools. Do not explore first, do not promise the result, and do not paste the content as a substitute unless the user asks for it.'
 
 /**
- * The no-markup rule. The fail-fast rule above still let a 0-of-27 session
+ * The no-markup rule. The fail-fast rule above still let a 0-of-28 session
  * answer with raw provider syntax — `<|DSML| calls>`, `<invoke>`, `parameter`
  * rows — which the terminal rendered verbatim. Naming the shapes keeps the
  * model from imitating a call it cannot make, and the last sentence gives it

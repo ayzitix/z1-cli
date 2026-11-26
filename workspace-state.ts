@@ -15,7 +15,7 @@
  *
  * The prohibition covers *changing* those directories, not reading them. A
  * model asked "what session is this?" must be able to look, and since
- * `z1-tools` 0.1.5 allows `read` there again (search still hides the store from
+ * `z1-tools` 0.1.9 allows `read` there again (search still hides the store from
  * `glob`/`grep`/`list`/`tree`), an over-broad rule only taught it to recite the
  * rule and send the user to `/sessions`. So the section also states the chat's
  * own identity when the caller knows it, and the answer costs no file read.
@@ -114,7 +114,7 @@ export function ownStateText(options: {
     describe,
     // `/sessions` is already named by the identity line; repeating it is noise.
     root === '' || identity !== undefined
-      ? '- The todo list is changed with `todo.write`, never by editing `.z1/todos.json`.'
-      : '- The todo list is changed with `todo.write`, never by editing `.z1/todos.json`. The user switches transcripts with `/sessions`.',
+      ? '- The todo list is changed with `todo.write` when this turn has it, never by editing `.z1/todos.json`.'
+      : '- The todo list is changed with `todo.write` when this turn has it, never by editing `.z1/todos.json`. The user switches transcripts with `/sessions`.',
   ].join('\n')
 }
